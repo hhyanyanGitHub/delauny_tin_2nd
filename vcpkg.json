@@ -1,0 +1,9 @@
+{
+  "name": "dterrain",
+  "version-string": "0.1.0",
+  "description": "Dynamic 2.5D Delaunay terrain triangulation DLL",
+  "dependencies": [
+    "cgal"
+  ]
+}
+

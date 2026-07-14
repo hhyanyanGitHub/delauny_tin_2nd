@@ -1,0 +1,10 @@
+/build/
+/dist/
+/.agents/
+/.codex/
+/.vs/
+/out/
+__pycache__/
+*.pyc
+*.dtin
+*.user

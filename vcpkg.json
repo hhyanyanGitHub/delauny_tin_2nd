@@ -1,8 +1,20 @@
 {
   "name": "dterrain",
-  "version-string": "0.3.0",
+  "version-string": "0.4.0",
   "description": "Dynamic 2.5D terrain TIN, GRID and contour processing DLL",
   "dependencies": [
     "cgal"
-  ]
+  ],
+  "features": {
+    "gdal": {
+      "description": "GeoTIFF/COG raster and GeoPackage contour exchange",
+      "dependencies": [
+        {
+          "name": "gdal",
+          "default-features": false,
+          "features": ["sqlite3"]
+        }
+      ]
+    }
+  }
 }

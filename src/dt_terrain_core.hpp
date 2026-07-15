@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace dt {
@@ -32,12 +34,15 @@ public:
     double nodata() const noexcept { return options_.nodata_value; }
     const double* transform() const noexcept { return options_.geo_transform; }
     const std::vector<double>& values() const noexcept { return values_; }
+    const std::string& crs_wkt() const noexcept { return crs_wkt_; }
+    void set_crs_wkt(std::string crs_wkt) { crs_wkt_ = std::move(crs_wkt); }
     bool is_nodata(double value) const noexcept;
     dt_point3 point(uint64_t column, uint64_t row, double z) const noexcept;
 
 private:
     dt_grid_create_options options_{};
     std::vector<double> values_;
+    std::string crs_wkt_;
     uint64_t generation_ = 1;
 
     size_t offset(uint64_t column, uint64_t row) const;
@@ -54,6 +59,7 @@ struct ContourLine {
 class ContourSet final {
 public:
     std::vector<ContourLine> lines;
+    std::string crs_wkt;
 
     dt_contour_info info() const;
     void save_text(const char* file_name) const;

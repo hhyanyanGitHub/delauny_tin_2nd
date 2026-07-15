@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.3 新增的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.4 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -12,8 +12,13 @@ X = gt[0] + column * gt[1] + row * gt[2]
 Y = gt[3] + column * gt[4] + row * gt[5]
 ```
 
-这里的变换描述“节点位置”，不是 GDAL 的像元左上角语义。接入 GDAL 时，栅格
-像元中心与节点 GRID 之间将由适配层明确转换。变换必须有限且可逆。
+这里的变换描述“节点位置”，不是 GDAL 的像元左上角语义。GDAL 适配层把像元
+中心映射为 GRID 节点，导入导出自动转换半像元偏移。变换必须有限且可逆。
+
+TIN、GRID 和等高线句柄都可保存可选 CRS WKT。使用 `dt_set_crs_wkt()`、
+`dt_grid_set_crs_wkt()`、`dt_contours_set_crs_wkt()` 设置；对应 getter 采用先查询
+所需字节数、再写入调用方缓冲区的方式。TIN→GRID/等高线、GRID→TIN/等高线会
+传播 CRS，但不执行重投影。
 
 `dt_grid_read_window()`、`dt_grid_write_window()` 支持局部窗口；`row_stride`
 以 `double` 个数计，零表示紧密排列。GRID 句柄由 `dt_grid_destroy()` 释放。

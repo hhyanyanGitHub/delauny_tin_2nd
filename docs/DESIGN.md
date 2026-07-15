@@ -16,6 +16,8 @@ CGAL Delaunay hierarchy ---- Boost face R-tree
 DTIN / DTMESH / XYZ 持久化
       |
 GRID / Contour / Async Task（v0.3）
+      |
+可选 GDAL Adapter + CRS WKT（v0.4）
 ```
 
 核心是 2.5D 数据模型：CGAL 顶点位置只保存 XY，自定义顶点信息保存 Z 和稳定 ID。
@@ -26,6 +28,12 @@ v0.3 在 TIN 上方增加独立 `Grid` 和 `ContourSet` 数据对象。三者没
 通过显式转换函数连接，避免把“等高线反推地形”误表示为无损类型转换。耗时转换
 可由任务对象持有源数据共享生命周期，并通过协作取消停止。
 
+v0.4 将 CRS 作为 TIN、GRID、ContourSet 的 UTF-8 WKT 元数据保存，转换时传播，
+不参与几何计算。GDAL 适配器位于核心数据对象之外；关闭 `DT_WITH_GDAL` 时保留
+相同 C ABI 导出并返回 `DT_E_UNSUPPORTED`。GeoTIFF 角点 geotransform 与本库节点
+geotransform 在边界处做半像元中心换算。COG 使用 GDAL `CreateCopy`，GeoPackage
+等高线使用 `LineStringZ + elevation + closed` 模式。
+
 ## 并发
 
 每个上下文具有读写锁。当前安装的 GCC 14 MinGW 与 CGAL 6.0.1 的非平凡 TLS ABI
@@ -35,7 +43,7 @@ v0.3 在 TIN 上方增加独立 `Grid` 和 `ContourSet` 数据对象。三者没
 ## 已知限制
 
 - 尚未支持断裂线、边界和孔洞；
-- GRID 当前为内存连续 `double` 数组，尚未接入 GDAL 瓦片/外存；
+- GRID 当前为内存连续 `double` 数组；GDAL I/O 分行访问，但句柄本身尚未外存化；
 - GRID→TIN 仍是普通 Delaunay，NoData 空洞只能拒绝或由调用方显式允许桥接；
 - 当前等高线不输出完全水平平台的边界；
 - `.dtin` v1 保存点集并在加载时重建，不保存逐面拓扑；`.dtmesh` 保存显式

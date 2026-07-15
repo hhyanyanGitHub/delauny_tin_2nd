@@ -1,6 +1,10 @@
 #include "dt_core.hpp"
+#include "dt_gdal_api.h"
 #include "dt_task_api.h"
 #include "dt_terrain_core.hpp"
+#if DT_WITH_GDAL
+#include "dt_gdal_io.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -139,6 +143,18 @@ bool task_finished(int32_t state) noexcept {
            state == DT_TASK_CANCELLED;
 }
 
+dt_status copy_utf8_string(const std::string& value, char* buffer,
+                           size_t buffer_size, size_t* required_size) {
+    const size_t required = value.size() + 1;
+    if (required_size) *required_size = required;
+    if (!buffer) return buffer_size == 0 ? DT_OK : DT_E_INVALID_ARGUMENT;
+    if (buffer_size == 0) return DT_E_INVALID_ARGUMENT;
+    const size_t copied = std::min(buffer_size - 1, value.size());
+    std::memcpy(buffer, value.data(), copied);
+    buffer[copied] = '\0';
+    return buffer_size >= required ? DT_OK : DT_E_INVALID_ARGUMENT;
+}
+
 void finish_task(dt_task_t& task, int32_t state, dt_status status,
                  const char* error = nullptr) {
     {
@@ -195,6 +211,135 @@ dt_task_handle start_task(int32_t result_kind, Function&& function) {
 
 extern "C" {
 
+dt_status DT_CALL dt_gdal_initialize(void) {
+    return guarded([&] {
+#if DT_WITH_GDAL
+        dt::gdal_initialize();
+#else
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_gdal_is_driver_available(const char* driver_name,
+                                               int32_t* output_available) {
+    if (output_available) *output_available = 0;
+    return guarded([&] {
+        if (!output_available) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_available is null");
+        }
+#if DT_WITH_GDAL
+        *output_available = dt::gdal_driver_available(driver_name) ? 1 : 0;
+#else
+        (void)driver_name;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_grid_load_gdal_raster(
+    const char* utf8_file_name, const dt_gdal_raster_load_options* options,
+    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        dt_gdal_raster_load_options actual{};
+        actual.struct_size = sizeof(actual);
+        if (options) {
+            validate_options(options, "dt_gdal_raster_load_options");
+            actual = *options;
+        }
+#if DT_WITH_GDAL
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::grid_load_gdal(utf8_file_name, actual);
+        *output_grid = result.release();
+#else
+        (void)utf8_file_name;
+        (void)actual;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_grid_save_gdal_raster(
+    dt_grid_handle grid, const char* utf8_file_name,
+    const dt_gdal_raster_save_options* options) {
+    return guarded([&] {
+        dt_gdal_raster_save_options actual{};
+        actual.struct_size = sizeof(actual);
+        if (options) {
+            validate_options(options, "dt_gdal_raster_save_options");
+            actual = *options;
+        }
+#if DT_WITH_GDAL
+        dt::grid_save_gdal(require_grid(grid), utf8_file_name, actual);
+#else
+        (void)grid;
+        (void)utf8_file_name;
+        (void)actual;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_contours_load_gdal_vector(
+    const char* utf8_file_name, const dt_gdal_contour_load_options* options,
+    dt_contour_handle* output_contours) {
+    if (output_contours) *output_contours = nullptr;
+    return guarded([&] {
+        if (!output_contours) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_contours is null");
+        }
+        dt_gdal_contour_load_options actual{};
+        actual.struct_size = sizeof(actual);
+        if (options) {
+            validate_options(options, "dt_gdal_contour_load_options");
+            actual = *options;
+        }
+#if DT_WITH_GDAL
+        auto result = std::make_unique<dt_contour_set_t>();
+        result->contours = dt::contours_load_gdal(utf8_file_name, actual);
+        *output_contours = result.release();
+#else
+        (void)utf8_file_name;
+        (void)actual;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_contours_save_gdal_vector(
+    dt_contour_handle contours, const char* utf8_file_name,
+    const dt_gdal_contour_save_options* options) {
+    return guarded([&] {
+        dt_gdal_contour_save_options actual{};
+        actual.struct_size = sizeof(actual);
+        if (options) {
+            validate_options(options, "dt_gdal_contour_save_options");
+            actual = *options;
+        }
+#if DT_WITH_GDAL
+        dt::contours_save_gdal(require_contours(contours), utf8_file_name,
+                               actual);
+#else
+        (void)contours;
+        (void)utf8_file_name;
+        (void)actual;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
 void DT_CALL dt_get_version(uint32_t* major, uint32_t* minor, uint32_t* patch) {
     if (major) *major = DT_VERSION_MAJOR;
     if (minor) *minor = DT_VERSION_MINOR;
@@ -226,6 +371,26 @@ dt_status DT_CALL dt_grid_get_info(dt_grid_handle grid,
             throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_info is null");
         }
         *output_info = require_grid(grid).info();
+    });
+}
+
+dt_status DT_CALL dt_grid_set_crs_wkt(dt_grid_handle grid,
+                                       const char* utf8_crs_wkt) {
+    return guarded([&] {
+        require_grid(grid).set_crs_wkt(utf8_crs_wkt ? utf8_crs_wkt : "");
+    });
+}
+
+dt_status DT_CALL dt_grid_get_crs_wkt(dt_grid_handle grid, char* buffer,
+                                       size_t buffer_size,
+                                       size_t* required_size) {
+    return guarded([&] {
+        const auto value = require_grid(grid).crs_wkt();
+        const dt_status status =
+            copy_utf8_string(value, buffer, buffer_size, required_size);
+        if (status != DT_OK) {
+            throw dt::Exception(status, "CRS output buffer is too small");
+        }
     });
 }
 
@@ -288,7 +453,9 @@ dt_status DT_CALL dt_tin_from_grid(dt_grid_handle grid,
     return guarded([&] {
         validate_options(options, "dt_grid_to_tin_options");
         auto points = dt::points_from_grid(require_grid(grid), *options);
-        require_context(output_tin).build(points.data(), points.size(), nullptr);
+        auto& destination = require_context(output_tin);
+        destination.build(points.data(), points.size(), nullptr);
+        destination.set_crs_wkt(require_grid(grid).crs_wkt());
     });
 }
 
@@ -363,6 +530,27 @@ dt_status DT_CALL dt_contours_get_line(dt_contour_handle contours,
     });
 }
 
+dt_status DT_CALL dt_contours_set_crs_wkt(dt_contour_handle contours,
+                                           const char* utf8_crs_wkt) {
+    return guarded([&] {
+        require_contours(contours).crs_wkt =
+            utf8_crs_wkt ? utf8_crs_wkt : "";
+    });
+}
+
+dt_status DT_CALL dt_contours_get_crs_wkt(dt_contour_handle contours,
+                                           char* buffer, size_t buffer_size,
+                                           size_t* required_size) {
+    return guarded([&] {
+        const auto value = require_contours(contours).crs_wkt;
+        const dt_status status =
+            copy_utf8_string(value, buffer, buffer_size, required_size);
+        if (status != DT_OK) {
+            throw dt::Exception(status, "CRS output buffer is too small");
+        }
+    });
+}
+
 dt_status DT_CALL dt_contours_save_text(dt_contour_handle contours,
                                         const char* utf8_file_name) {
     return guarded(
@@ -429,6 +617,7 @@ dt_status DT_CALL dt_tin_from_grid_async(
                                         "terrain operation was cancelled");
                 }
                 destination->build(points.data(), points.size(), nullptr);
+                destination->set_crs_wkt(source->crs_wkt());
                 task.progress.store(1.0);
             });
     });
@@ -849,6 +1038,26 @@ dt_status DT_CALL dt_query_result_get_view(dt_query_result result,
 
 void DT_CALL dt_release_query_result(dt_query_result result) {
     delete result;
+}
+
+dt_status DT_CALL dt_set_crs_wkt(dt_handle handle,
+                                  const char* utf8_crs_wkt) {
+    return guarded([&] {
+        require_context(handle).set_crs_wkt(utf8_crs_wkt ? utf8_crs_wkt : "");
+    });
+}
+
+dt_status DT_CALL dt_get_crs_wkt(dt_handle handle, char* buffer,
+                                  size_t buffer_size,
+                                  size_t* required_size) {
+    return guarded([&] {
+        const auto value = require_context(handle).crs_wkt();
+        const dt_status status =
+            copy_utf8_string(value, buffer, buffer_size, required_size);
+        if (status != DT_OK) {
+            throw dt::Exception(status, "CRS output buffer is too small");
+        }
+    });
 }
 
 dt_status DT_CALL dt_get_last_error(char* buffer, size_t buffer_size,

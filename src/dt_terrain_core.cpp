@@ -598,6 +598,7 @@ std::unique_ptr<Grid> grid_from_tin(Context& tin,
               create.geo_transform);
     create.nodata_value = options.nodata_value;
     auto grid = std::make_unique<Grid>(create);
+    grid->set_crs_wkt(tin.crs_wkt());
     std::vector<double> row(static_cast<size_t>(create.width),
                             create.nodata_value);
     for (uint64_t y = 0; y < create.height; ++y) {
@@ -704,6 +705,7 @@ std::unique_ptr<ContourSet> contours_from_tin(
     });
     const auto levels = make_levels(zmin, zmax, options);
     auto output = std::make_unique<ContourSet>();
+    output->crs_wkt = tin.crs_wkt();
     if (levels.empty()) return output;
     const double extent = std::max(xmax - xmin, ymax - ymin);
     const double tolerance = options.stitch_tolerance > 0.0
@@ -756,6 +758,7 @@ std::unique_ptr<ContourSet> contours_from_grid(
     if (!finite(zmin)) throw Exception(DT_E_EMPTY, "GRID has no valid values");
     const auto levels = make_levels(zmin, zmax, options);
     auto output = std::make_unique<ContourSet>();
+    output->crs_wkt = grid.crs_wkt();
     if (levels.empty()) return output;
     const auto grid_info = grid.info();
     const double extent = std::max(grid_info.bounds.xmax - grid_info.bounds.xmin,

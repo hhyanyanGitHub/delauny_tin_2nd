@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define DT_VERSION_MAJOR 0
-#define DT_VERSION_MINOR 3
+#define DT_VERSION_MINOR 4
 #define DT_VERSION_PATCH 0
 
 typedef int32_t dt_status;
@@ -198,6 +198,14 @@ DT_API void DT_CALL dt_release_edit_result(dt_edit_result result);
 DT_API dt_status DT_CALL dt_query_result_get_view(dt_query_result result,
                                                   dt_query_result_view* output_view);
 DT_API void DT_CALL dt_release_query_result(dt_query_result result);
+
+/* CRS is optional UTF-8 OGC WKT metadata. The getter reports the required
+   byte count including the trailing NUL. */
+DT_API dt_status DT_CALL dt_set_crs_wkt(dt_handle handle,
+                                        const char* utf8_crs_wkt);
+DT_API dt_status DT_CALL dt_get_crs_wkt(dt_handle handle, char* buffer,
+                                        size_t buffer_size,
+                                        size_t* required_size);
 
 /* Returns the required byte count including the trailing NUL in required_size. */
 DT_API dt_status DT_CALL dt_get_last_error(char* buffer, size_t buffer_size,

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -15,8 +15,20 @@ option(DT_BUILD_TESTS "Build automated tests" ON)
 option(DT_BUILD_EXAMPLES "Build example programs" ON)
 option(DT_BUILD_BENCHMARKS "Build benchmark programs" OFF)
 option(DT_BUILD_GUI "Build native Windows GUI demonstration" ON)
+option(DT_WITH_GDAL "Enable GDAL raster/vector exchange APIs" OFF)
+
+if(MINGW)
+    get_filename_component(DT_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+endif()
 
 find_package(CGAL CONFIG REQUIRED)
+if(DT_WITH_GDAL)
+    find_package(GDAL CONFIG REQUIRED)
+    if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+        file(GLOB DT_GDAL_RUNTIME_DLLS
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/*.dll")
+    endif()
+endif()
 
 add_library(dterrain SHARED
     src/dt_api.cpp
@@ -25,7 +37,8 @@ add_library(dterrain SHARED
     src/dt_legacy.cpp)
 
 target_compile_features(dterrain PUBLIC cxx_std_17)
-target_compile_definitions(dterrain PRIVATE DT_BUILD_DLL)
+target_compile_definitions(dterrain PRIVATE DT_BUILD_DLL
+    DT_WITH_GDAL=$<BOOL:${DT_WITH_GDAL}>)
 target_include_directories(dterrain
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -33,6 +46,50 @@ target_include_directories(dterrain
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dterrain PRIVATE CGAL::CGAL)
+if(DT_WITH_GDAL)
+    target_sources(dterrain PRIVATE src/dt_gdal_io.cpp)
+    target_link_libraries(dterrain PRIVATE GDAL::GDAL)
+    if(DT_GDAL_RUNTIME_DLLS)
+        add_custom_command(TARGET dterrain POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${DT_GDAL_RUNTIME_DLLS} $<TARGET_FILE_DIR:dterrain>
+            COMMAND_EXPAND_LISTS
+            VERBATIM)
+        install(FILES ${DT_GDAL_RUNTIME_DLLS}
+                DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+    if(MINGW)
+        unset(DT_GCC_RUNTIME_DLL CACHE)
+        unset(DT_STDCXX_RUNTIME_DLL CACHE)
+        find_file(DT_GCC_RUNTIME_DLL libgcc_s_seh-1.dll
+                  PATHS "${DT_MINGW_BIN_DIR}" NO_DEFAULT_PATH)
+        find_file(DT_STDCXX_RUNTIME_DLL libstdc++-6.dll
+                  PATHS "${DT_MINGW_BIN_DIR}" NO_DEFAULT_PATH)
+        foreach(DT_RUNTIME_DLL IN ITEMS DT_GCC_RUNTIME_DLL DT_STDCXX_RUNTIME_DLL)
+            if(${DT_RUNTIME_DLL})
+                add_custom_command(TARGET dterrain POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${${DT_RUNTIME_DLL}}" "$<TARGET_FILE_DIR:dterrain>"
+                    VERBATIM)
+                install(FILES "${${DT_RUNTIME_DLL}}"
+                        DESTINATION ${CMAKE_INSTALL_BINDIR})
+            endif()
+        endforeach()
+    endif()
+    if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+        find_path(DT_PROJ_DATA_DIR proj.db
+            PATHS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/proj"
+            NO_DEFAULT_PATH)
+        if(DT_PROJ_DATA_DIR)
+            add_custom_command(TARGET dterrain POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "${DT_PROJ_DATA_DIR}" "$<TARGET_FILE_DIR:dterrain>/share/proj"
+                VERBATIM)
+            install(DIRECTORY "${DT_PROJ_DATA_DIR}/"
+                    DESTINATION "${CMAKE_INSTALL_BINDIR}/share/proj")
+        endif()
+    endif()
+endif()
 
 if(MSVC)
     target_compile_options(dterrain PRIVATE /W4 /permissive- /EHsc)
@@ -47,7 +104,6 @@ else()
 endif()
 
 if(MINGW)
-    get_filename_component(DT_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
     find_file(DT_WINPTHREAD_DLL libwinpthread-1.dll PATHS "${DT_MINGW_BIN_DIR}"
               NO_DEFAULT_PATH)
     if(DT_WINPTHREAD_DLL)
@@ -85,6 +141,8 @@ if(DT_BUILD_TESTS)
     enable_testing()
     add_executable(dterrain_tests tests/test_dt.cpp)
     target_compile_features(dterrain_tests PRIVATE cxx_std_17)
+    target_compile_definitions(dterrain_tests PRIVATE
+        DT_WITH_GDAL=$<BOOL:${DT_WITH_GDAL}>)
     target_link_libraries(dterrain_tests PRIVATE dterrain)
     add_test(NAME dterrain_tests COMMAND dterrain_tests)
 endif()
@@ -97,6 +155,12 @@ if(DT_BUILD_EXAMPLES)
     add_executable(dterrain_conversion examples/terrain_conversion.cpp)
     target_compile_features(dterrain_conversion PRIVATE cxx_std_17)
     target_link_libraries(dterrain_conversion PRIVATE dterrain)
+
+    if(DT_WITH_GDAL)
+        add_executable(dterrain_gdal_exchange examples/gdal_exchange.cpp)
+        target_compile_features(dterrain_gdal_exchange PRIVATE cxx_std_17)
+        target_link_libraries(dterrain_gdal_exchange PRIVATE dterrain)
+    endif()
 endif()
 
 if(DT_BUILD_BENCHMARKS)
@@ -121,7 +185,7 @@ install(TARGETS dterrain
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES include/dt_api.h include/dt_terrain_api.h include/dt_task_api.h
-              include/dt_legacy.hpp
+              include/dt_gdal_api.h include/dt_legacy.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES README.md DESTINATION .)
 install(DIRECTORY docs DESTINATION .)

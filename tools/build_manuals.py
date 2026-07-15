@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 TODAY = date(2026, 7, 15).isoformat()
 
 BLUE = "2E74B5"
@@ -426,7 +426,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.3.0：已提供普通 Delaunay TIN、GRID、TIN/GRID 等高线和异步转换任务。GDAL 地理格式、约束线、外边界、孔洞、约束 Delaunay 和三维 GUI 属于后续阶段。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.4.0：已提供普通 Delaunay TIN、GRID、TIN/GRID 等高线、异步转换任务、CRS WKT，以及可选 GeoTIFF/COG/GeoPackage 交换。约束线、外边界、孔洞、约束 Delaunay 和三维 GUI 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
@@ -439,13 +439,13 @@ def build_developer_manual():
     m.cover("DEVELOPER REFERENCE")
     add_document_control(
         m,
-        "架构、构建部署、稳定 C ABI、GRID/等高线转换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
+        "架构、构建部署、稳定 C ABI、GRID/等高线转换、GDAL 格式交换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
         [
             "首次集成：重点阅读第 3、4、7 章。",
             "地形转换：重点阅读第 4.6 章和第 6 章。",
             "兼容既有系统：重点阅读第 5 章的 12 个 Legacy 接口。",
             "大数据量使用：重点阅读第 8 章的内存与查询策略。",
-            "文件交换：重点阅读第 6 章的 XYZ、DTMESH 和 DTIN。",
+            "文件交换：重点阅读第 4.7 章和第 6 章。",
         ],
     )
 
@@ -461,6 +461,7 @@ def build_developer_manual():
         "双精度 GRID、仿射节点坐标、NoData、窗口读写和 DGRID 文本往返。",
         "TIN→GRID、GRID→TIN，以及 TIN/GRID→等高线和 DCONTOUR 文本往返。",
         "耗时转换的异步任务、进度、等待、协作取消和结果提取。",
+        "TIN/GRID/等高线 CRS WKT 元数据，以及可选 GeoTIFF/COG/GeoPackage 交换。",
         "推荐的稳定 C ABI 与原需求 12 个 C++ 接口兼容层。",
     ):
         m.bullet(text)
@@ -473,7 +474,7 @@ def build_developer_manual():
             ("最近距离", "最近顶点和删除最近点都使用 XY 平面欧氏距离。"),
             ("高程更新", "dt_update_vertex_z() 只改变 Z，不改变网格拓扑。"),
             ("事务性", "批量建网和文件加载失败时保留原三角网。"),
-            ("转换边界", "等高线是派生表达；0.3 尚未实现等高线反推 TIN/GRID。"),
+            ("转换边界", "等高线是派生表达；0.4 尚未实现等高线反推 TIN/GRID。"),
         ],
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
@@ -484,7 +485,7 @@ def build_developer_manual():
     m.h2("2.1 分层结构")
     m.code("""调用系统 / GUI
         |
-稳定 C ABI + Terrain API + Task API + Legacy 兼容层
+稳定 C ABI + Terrain API + Task API + GDAL API + Legacy 兼容层
         |
 上下文、错误处理、结果句柄
         |
@@ -494,7 +495,8 @@ CGAL Delaunay hierarchy ---- Boost R-tree
         |
 DTIN / DTMESH / XYZ / DGRID / DCONTOUR 持久化
         |
-GRID <---- 转换引擎 ----> TIN ----> 等高线""")
+GRID <---- 转换引擎 ----> TIN ----> 等高线
+  \\------------- 可选 GDAL Adapter -------------/""")
     m.para("CGAL 顶点几何只保存 XY，自定义顶点信息保存 uint64_t 稳定 ID 和 Z。Boost R-tree 保存有限三角形的 XY 包围盒与面句柄。局部编辑时先移除旧面索引项，再加入新面，因此不需要每次重建全局范围索引。")
     m.h2("2.2 关键技术选择")
     m.table(
@@ -690,7 +692,32 @@ if (info.state == DT_TASK_SUCCEEDED) {
 }
 dt_task_destroy(task);""")
 
-    m.new_page()
+    m.h2("4.7 CRS 与 GDAL 格式交换")
+    m.para("dt_gdal_api.h 是可选适配层。默认 DT_WITH_GDAL=OFF 时函数仍然导出，但返回 DT_E_UNSUPPORTED；启用后可导入导出 GeoTIFF/COG GRID 和 GeoPackage 等高线。TIN、GRID 与等高线的 CRS 以 UTF-8 WKT 保存并在转换时传播，当前不执行坐标重投影。")
+    m.code("""#include "dt_gdal_api.h"
+
+dt_gdal_raster_save_options save{};
+save.struct_size = sizeof(save);
+save.driver_name = "COG";
+const char* co[] = {"COMPRESS=DEFLATE", nullptr};
+save.creation_options = co;
+dt_grid_save_gdal_raster(grid, "terrain.tif", &save);
+
+dt_grid_handle loaded = nullptr;
+dt_grid_load_gdal_raster("terrain.tif", nullptr, &loaded);
+dt_grid_destroy(loaded);""")
+    m.table(
+        ["对象", "格式/驱动", "保真内容"],
+        [
+            ("GRID", "GTiff / COG", "double 高程、NoData、仿射变换、CRS WKT"),
+            ("等高线", "GPKG", "LineStringZ、elevation、closed、CRS WKT"),
+            ("坐标换算", "GDAL ↔ GRID", "像元角点与节点中心自动进行半像元偏移"),
+        ],
+        [2000, 2500, 4860],
+        [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    m.callout("部署", "启用 GDAL 的便携目录必须携带构建目录复制出的 GDAL、PROJ、SQLite、GeoTIFF 等运行时 DLL，以及 DLL 同级 share/proj/proj.db。COG 使用 CreateCopy，会比普通 GTiff 需要更多临时内存/存储。", "gold")
+
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
     legacy_rows = [
@@ -762,6 +789,8 @@ TRIANGLES 2
     m.para("DGRID 1 保存 SIZE、FLAGS、六参数 GEOTRANSFORM、NODATA 和按行优先排列的 VALUES。该格式用于测试、研究和简单交换；当前变换描述节点位置，不等同于 GDAL 像元左上角语义。")
     m.h2("6.5 DCONTOUR 等高线文本")
     m.para("DCONTOUR 1 由 LINES 计数和若干 LINE 记录组成。每条 LINE 保存等高值、闭合标志、点数及 XYZ 顶点。逐线视图中的点数组只在等高线句柄释放前有效。")
+    m.h2("6.6 GeoTIFF、COG 与 GeoPackage")
+    m.para("启用 DT_WITH_GDAL 后，dt_grid_load/save_gdal_raster 读写 GDAL 单波段高程栅格；dt_contours_load/save_gdal_vector 读写等高线矢量层。普通 GeoTIFF 逐行写入；COG 按驱动要求通过临时数据集 CreateCopy；GeoPackage 输出 LineStringZ 和 elevation/closed 字段。")
 
     m.h1("7 错误、内存与线程")
     m.h2("7.1 状态码")
@@ -833,7 +862,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
     m.h2("9.1 自动化测试")
     m.code("""cmake --build build --config Release --parallel 4
 ctest --test-dir build --output-on-failure""")
-    m.para("测试覆盖生命周期、批量建网、最近点、点定位、范围查询、动态插入/删除、高程更新、DTIN 往返、XYZ 导入、DTMESH 往返、TIN/GRID 转换、等高线拼接、DGRID/DCONTOUR 往返、异步成功与失败任务及随机编辑序列。")
+    m.para("测试覆盖生命周期、批量建网、最近点、点定位、范围查询、动态插入/删除、高程更新、DTIN 往返、XYZ 导入、DTMESH 往返、TIN/GRID 转换、CRS 传播、等高线拼接、DGRID/DCONTOUR 往返、异步任务及随机编辑序列。GDAL 构建还执行 GTiff、COG、GPKG 驱动探测和真实文件往返。")
     m.h2("9.2 集成验收清单")
     for text in (
         "DLL、导入库、头文件和运行库均为相同架构。",
@@ -854,13 +883,15 @@ ctest --test-dir build --output-on-failure""")
         ("全图查询内存大", "缩小 dt_bounds2 范围，按视口或瓦片分批查询。"),
         ("Z 改变后面没有变化", "这是设计行为：Delaunay 只使用 XY，Z 更新不改变拓扑。"),
         ("插入点失败", "检查有限坐标、重复 XY、初始化状态和 dt_get_last_error()。"),
+        ("GDAL 接口不支持", "重新配置 DT_WITH_GDAL=ON，并确认 GDAL::GDAL 可被 CMake 找到。"),
+        ("GDAL 版 DLL 无法加载", "将构建目录复制出的 GDAL/PROJ/SQLite/GeoTIFF 等依赖 DLL 与 dterrain.dll 放在同目录。"),
     ]
     m.table(["现象", "处理"], faq, [2600, 6760],
             [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT])
 
     m.h1("11 许可证与后续路线")
     m.para("当前后端使用 CGAL 2D Triangulations 包。该包采用 GPL 或商业许可双重模式；本工程定位为研究和演示用途。对外分发、闭源集成或用途改变前，应再次核查 CGAL 及依赖许可。")
-    m.para("下一阶段计划接入 GDAL/PROJ，实现 GeoTIFF/COG GRID 和 GeoPackage 等高线交换；随后增加折线约束、地形外边界、孔洞、约束顶点保护规则和约束数据文件块。稳定 C ABI 不暴露 CGAL 类型，可在保持现有调用方兼容的前提下扩展。")
+    m.para("当前已完成可选 GDAL/PROJ 数据交换层。下一阶段将增加折线约束、地形外边界、孔洞、约束顶点保护规则和约束数据文件块；随后建设 Qt/VTK 三维图层、拾取与漫游。稳定 C ABI 不暴露 CGAL/GDAL 类型，可在保持现有调用方兼容的前提下扩展。")
 
     path = OUTPUT / "dterrain_DLL开发使用手册.docx"
     m.save(path)
@@ -888,7 +919,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、动态插入删除、编辑影响显示和文件交换。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.3 功能边界", "DLL 已增加 GRID、TIN/GRID 等高线和异步转换 API；当前 Win32/GDI 演示程序仍以二维 TIN 操作为主，尚未加入 GRID/等高线图层和三维漫游。", "gold")
+    m.callout("0.4 功能边界", "DLL 已增加 GRID、TIN/GRID 等高线、异步转换、CRS WKT 和可选 GDAL 格式交换 API；当前 Win32/GDI 演示程序仍以二维 TIN 操作为主，尚未加入 GRID/等高线图层和三维漫游。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],

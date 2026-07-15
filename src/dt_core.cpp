@@ -162,6 +162,7 @@ struct Context::State {
     std::vector<VertexHandle> vertex_by_id{VertexHandle()};
     dt_vertex_id next_vertex_id = 1;
     uint64_t generation = 0;
+    std::string crs_wkt;
 };
 
 Context::Context() : state_(std::make_unique<State>()) {}
@@ -698,6 +699,16 @@ bool Context::validate(bool verbose) const {
     std::lock_guard<std::recursive_mutex> cgal_lock(g_cgal_mutex);
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return state_->triangulation.is_valid(verbose);
+}
+
+void Context::set_crs_wkt(std::string crs_wkt) {
+    std::unique_lock lock(mutex_);
+    state_->crs_wkt = std::move(crs_wkt);
+}
+
+std::string Context::crs_wkt() const {
+    std::shared_lock lock(mutex_);
+    return state_->crs_wkt;
 }
 
 void Context::save(const char* file_name) const {

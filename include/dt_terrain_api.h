@@ -102,6 +102,11 @@ DT_API dt_status DT_CALL dt_grid_create(
 DT_API void DT_CALL dt_grid_destroy(dt_grid_handle grid);
 DT_API dt_status DT_CALL dt_grid_get_info(
     dt_grid_handle grid, dt_grid_info* output_info);
+DT_API dt_status DT_CALL dt_grid_set_crs_wkt(
+    dt_grid_handle grid, const char* utf8_crs_wkt);
+DT_API dt_status DT_CALL dt_grid_get_crs_wkt(
+    dt_grid_handle grid, char* buffer, size_t buffer_size,
+    size_t* required_size);
 
 /* row_stride is measured in doubles; zero means width. */
 DT_API dt_status DT_CALL dt_grid_read_window(
@@ -142,6 +147,11 @@ DT_API dt_status DT_CALL dt_contours_get_info(
 DT_API dt_status DT_CALL dt_contours_get_line(
     dt_contour_handle contours, uint64_t line_index,
     dt_contour_line_view* output_line);
+DT_API dt_status DT_CALL dt_contours_set_crs_wkt(
+    dt_contour_handle contours, const char* utf8_crs_wkt);
+DT_API dt_status DT_CALL dt_contours_get_crs_wkt(
+    dt_contour_handle contours, char* buffer, size_t buffer_size,
+    size_t* required_size);
 
 /* DCONTOUR 1 stores one LINE record followed by its XYZ vertices. */
 DT_API dt_status DT_CALL dt_contours_save_text(

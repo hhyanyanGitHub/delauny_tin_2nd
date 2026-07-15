@@ -102,6 +102,8 @@ public:
         const std::function<void(const dt_triangle3&)>& visitor) const;
     dt_statistics statistics() const;
     bool validate(bool verbose) const;
+    void set_crs_wkt(std::string crs_wkt);
+    std::string crs_wkt() const;
 
     void save(const char* utf8_file_name) const;
     dt_bounds2 load(const char* utf8_file_name);

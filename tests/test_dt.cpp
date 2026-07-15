@@ -1,4 +1,5 @@
 #include "dt_api.h"
+#include "dt_gdal_api.h"
 #include "dt_legacy.hpp"
 #include "dt_task_api.h"
 #include "dt_terrain_api.h"
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
@@ -234,7 +236,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 3 && patch == 0);
+    assert(major == 0 && minor == 4 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");
@@ -242,6 +244,8 @@ void test_grid_and_contours() {
         {0.0, 0.0, 0.0}, {1.0, 0.0, 1.0},
         {1.0, 1.0, 2.0}, {0.0, 1.0, 1.0}};
     require_ok(dt_build(plane, plane_points, 4, nullptr), "terrain build plane");
+    const char* test_crs = "LOCAL_CS[\"dterrain test\",UNIT[\"metre\",1]]";
+    require_ok(dt_set_crs_wkt(plane, test_crs), "set TIN CRS");
 
     dt_tin_to_grid_options raster_options{};
     raster_options.struct_size = sizeof(raster_options);
@@ -254,6 +258,13 @@ void test_grid_and_contours() {
     dt_grid_handle grid = nullptr;
     require_ok(dt_grid_from_tin(plane, &raster_options, &grid),
                "dt_grid_from_tin");
+    size_t crs_size = 0;
+    require_ok(dt_grid_get_crs_wkt(grid, nullptr, 0, &crs_size),
+               "GRID CRS size");
+    std::vector<char> crs(crs_size);
+    require_ok(dt_grid_get_crs_wkt(grid, crs.data(), crs.size(), nullptr),
+               "GRID CRS");
+    assert(std::string(crs.data()) == test_crs);
 
     dt_grid_info grid_info{};
     require_ok(dt_grid_get_info(grid, &grid_info), "dt_grid_get_info");
@@ -309,6 +320,81 @@ void test_grid_and_contours() {
     require_ok(dt_contours_get_info(grid_contours, &contour_info),
                "GRID contour info");
     assert(contour_info.line_count >= 3);
+
+#if DT_WITH_GDAL
+    require_ok(dt_gdal_initialize(), "GDAL initialize");
+    int32_t available = 0;
+    require_ok(dt_gdal_is_driver_available("GTiff", &available),
+               "GTiff driver query");
+    assert(available == 1);
+    require_ok(dt_gdal_is_driver_available("COG", &available),
+               "COG driver query");
+    assert(available == 1);
+    require_ok(dt_gdal_is_driver_available("GPKG", &available),
+               "GPKG driver query");
+    assert(available == 1);
+
+    const char* tiff_file = "dterrain_test_grid.tif";
+    const char* tiff_options[] = {"TILED=YES", "COMPRESS=DEFLATE", nullptr};
+    dt_gdal_raster_save_options raster_save{};
+    raster_save.struct_size = sizeof(raster_save);
+    raster_save.driver_name = "GTiff";
+    raster_save.creation_options = tiff_options;
+    require_ok(dt_grid_save_gdal_raster(grid, tiff_file, &raster_save),
+               "save GeoTIFF");
+    dt_grid_handle gdal_grid = nullptr;
+    require_ok(dt_grid_load_gdal_raster(tiff_file, nullptr, &gdal_grid),
+               "load GeoTIFF");
+    dt_grid_info gdal_info{};
+    require_ok(dt_grid_get_info(gdal_grid, &gdal_info), "GeoTIFF info");
+    assert(gdal_info.width == 3 && gdal_info.height == 3);
+    for (int i = 0; i < 6; ++i) {
+        assert(std::abs(gdal_info.geo_transform[i] -
+                        grid_info.geo_transform[i]) < 1e-12);
+    }
+    double gdal_values[9]{};
+    require_ok(dt_grid_read_window(gdal_grid, 0, 0, 3, 3, gdal_values, 3),
+               "GeoTIFF values");
+    for (size_t i = 0; i < 9; ++i) assert(close(values[i], gdal_values[i]));
+    require_ok(dt_grid_get_crs_wkt(gdal_grid, nullptr, 0, &crs_size),
+               "GeoTIFF CRS size");
+    assert(crs_size > 1);
+    dt_grid_destroy(gdal_grid);
+    std::remove(tiff_file);
+
+    const char* cog_file = "dterrain_test_grid_cog.tif";
+    dt_gdal_raster_save_options cog_save{};
+    cog_save.struct_size = sizeof(cog_save);
+    cog_save.driver_name = "COG";
+    require_ok(dt_grid_save_gdal_raster(grid, cog_file, &cog_save),
+               "save COG");
+    require_ok(dt_grid_load_gdal_raster(cog_file, nullptr, &gdal_grid),
+               "load COG");
+    require_ok(dt_grid_get_info(gdal_grid, &gdal_info), "COG info");
+    assert(gdal_info.width == 3 && gdal_info.height == 3);
+    dt_grid_destroy(gdal_grid);
+    std::remove(cog_file);
+
+    const char* gpkg_file = "dterrain_test_contours.gpkg";
+    dt_gdal_contour_save_options contour_save{};
+    contour_save.struct_size = sizeof(contour_save);
+    require_ok(dt_contours_save_gdal_vector(grid_contours, gpkg_file,
+                                             &contour_save),
+               "save contour GeoPackage");
+    dt_contour_handle gdal_contours = nullptr;
+    require_ok(dt_contours_load_gdal_vector(gpkg_file, nullptr,
+                                             &gdal_contours),
+               "load contour GeoPackage");
+    dt_contour_info gdal_contour_info{};
+    require_ok(dt_contours_get_info(gdal_contours, &gdal_contour_info),
+               "GeoPackage contour info");
+    assert(gdal_contour_info.line_count == contour_info.line_count);
+    assert(gdal_contour_info.vertex_count == contour_info.vertex_count);
+    dt_contours_destroy(gdal_contours);
+    std::remove(gpkg_file);
+#else
+    assert(dt_gdal_initialize() == DT_E_UNSUPPORTED);
+#endif
 
     const char* contour_file = "dterrain_test_contours.dcontour";
     require_ok(dt_contours_save_text(grid_contours, contour_file),

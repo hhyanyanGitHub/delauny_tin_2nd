@@ -4,6 +4,7 @@
 #include <commdlg.h>
 
 #include "dt_api.h"
+#include "terrain_3d.hpp"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,7 @@ namespace {
 constexpr int kToolbarHeight = 48;
 constexpr int kStatusHeight = 28;
 constexpr size_t kMaxDrawTriangles = 45000;
+constexpr size_t kMaxDrawTriangles3d = 18000;
 
 enum CommandId {
     ID_GENERATE_100K = 100,
@@ -35,10 +37,14 @@ enum CommandId {
     ID_FULL_EXTENT,
     ID_IMPORT_POINTS,
     ID_SAVE,
-    ID_LOAD
+    ID_LOAD,
+    ID_VIEW_3D,
+    ID_Z_EXAGGERATION
 };
 
 enum class Mode { Insert, Delete, Query, ZoomBox };
+enum class ViewMode { Map2D, Terrain3D };
+enum class Drag3D { None, Orbit, Pan };
 
 std::wstring utf8_to_wide(const char* text) {
     if (!text || !*text) return {};
@@ -115,37 +121,55 @@ public:
             return 0;
         case WM_LBUTTONDOWN:
             if (GET_Y_LPARAM(lparam) >= kToolbarHeight) {
-                if (mode_ == Mode::ZoomBox)
+                SetFocus(hwnd_);
+                if (view_mode_ == ViewMode::Terrain3D)
+                    begin_drag3d(Drag3D::Orbit, GET_X_LPARAM(lparam),
+                                 GET_Y_LPARAM(lparam));
+                else if (mode_ == Mode::ZoomBox)
                     begin_box_zoom(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
                 else
                     on_left_click(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
             }
             return 0;
         case WM_LBUTTONUP:
-            if (box_zooming_)
+            if (drag3d_ != Drag3D::None)
+                end_drag3d();
+            else if (box_zooming_)
                 end_box_zoom(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
             return 0;
         case WM_RBUTTONDOWN:
         case WM_MBUTTONDOWN:
-            begin_pan(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            SetFocus(hwnd_);
+            if (view_mode_ == ViewMode::Terrain3D)
+                begin_drag3d(Drag3D::Pan, GET_X_LPARAM(lparam),
+                             GET_Y_LPARAM(lparam));
+            else
+                begin_pan(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
             return 0;
         case WM_MOUSEMOVE:
-            if (panning_) pan_to(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            if (drag3d_ != Drag3D::None)
+                drag3d_to(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            else if (panning_) pan_to(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
             else if (box_zooming_)
                 update_box_zoom(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
             return 0;
         case WM_RBUTTONUP:
         case WM_MBUTTONUP:
+            if (drag3d_ != Drag3D::None) end_drag3d();
             panning_ = false;
-            ReleaseCapture();
+            if (GetCapture() == hwnd_) ReleaseCapture();
             return 0;
         case WM_MOUSEWHEEL: {
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             ScreenToClient(hwnd_, &point);
-            zoom(point.x, point.y, GET_WHEEL_DELTA_WPARAM(wparam));
+            if (view_mode_ == ViewMode::Terrain3D)
+                zoom3d(GET_WHEEL_DELTA_WPARAM(wparam));
+            else
+                zoom(point.x, point.y, GET_WHEEL_DELTA_WPARAM(wparam));
             return 0;
         }
         case WM_KEYDOWN:
+            if (view_mode_ == ViewMode::Terrain3D && handle_key3d(wparam)) return 0;
             if (wparam == VK_ESCAPE && box_zooming_) {
                 cancel_box_zoom();
                 action_text_ = L"已取消框选放大";
@@ -164,6 +188,7 @@ private:
     HWND hwnd_ = nullptr;
     dt_handle mesh_ = nullptr;
     Mode mode_ = Mode::Query;
+    ViewMode view_mode_ = ViewMode::Map2D;
     dt_bounds2 view_{0.0, 0.0, 1.0, 1.0};
     bool view_valid_ = false;
     bool cache_valid_ = false;
@@ -185,6 +210,19 @@ private:
     POINT box_start_{};
     POINT box_end_{};
     std::vector<HWND> controls_;
+    HWND view_button_ = nullptr;
+    HWND exaggeration_button_ = nullptr;
+    dterrain::viewer3d::Camera camera_{};
+    Drag3D drag3d_ = Drag3D::None;
+    POINT drag3d_last_{};
+    bool camera_needs_reset_ = true;
+    double model_center_x_ = 0.0;
+    double model_center_y_ = 0.0;
+    double model_center_z_ = 0.0;
+    double model_xy_scale_ = 1.0;
+    double z_exaggeration_ = 1.0;
+    double mesh_zmin_ = 0.0;
+    double mesh_zmax_ = 1.0;
 
     RECT canvas_rect() const {
         RECT rect{};
@@ -214,6 +252,11 @@ private:
         controls_.push_back(make_button(hwnd_, ID_IMPORT_POINTS, L"导入XYZ"));
         controls_.push_back(make_button(hwnd_, ID_SAVE, L"保存网格"));
         controls_.push_back(make_button(hwnd_, ID_LOAD, L"打开网格"));
+        view_button_ = make_button(hwnd_, ID_VIEW_3D, L"切换3D");
+        controls_.push_back(view_button_);
+        exaggeration_button_ = make_button(hwnd_, ID_Z_EXAGGERATION, L"高程×1.0");
+        controls_.push_back(exaggeration_button_);
+        EnableWindow(exaggeration_button_, FALSE);
         layout_controls();
     }
 
@@ -268,6 +311,7 @@ private:
             clear_overlays();
             view_valid_ = false;
             cache_valid_ = false;
+            camera_needs_reset_ = true;
             action_text_ = L"三角网已清空";
             InvalidateRect(hwnd_, nullptr, FALSE);
         }
@@ -298,6 +342,7 @@ private:
             return;
         }
         fit_view_to_bounds(stats.bounds, 1.08);
+        camera_needs_reset_ = true;
     }
 
     void invalidate_mesh_cache() {
@@ -425,6 +470,110 @@ private:
         invalidate_mesh_cache();
     }
 
+    void begin_drag3d(Drag3D drag, int x, int y) {
+        if (!view_valid_ || y < kToolbarHeight) return;
+        drag3d_ = drag;
+        drag3d_last_ = {x, y};
+        SetCapture(hwnd_);
+    }
+
+    void drag3d_to(int x, int y) {
+        const int dx = x - drag3d_last_.x;
+        const int dy = y - drag3d_last_.y;
+        drag3d_last_ = {x, y};
+        if (drag3d_ == Drag3D::Orbit) {
+            camera_.orbit(-static_cast<double>(dx) * 0.008,
+                          static_cast<double>(dy) * 0.006);
+            action_text_ = L"3D 环视：左键拖动，右键平移，滚轮缩放";
+        } else if (drag3d_ == Drag3D::Pan) {
+            const double scale = camera_.distance * 0.0018;
+            dterrain::viewer3d::pan(camera_, -dx * scale, dy * scale);
+            action_text_ = L"3D 视点已平移";
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void end_drag3d() {
+        drag3d_ = Drag3D::None;
+        if (GetCapture() == hwnd_) ReleaseCapture();
+    }
+
+    void zoom3d(int delta) {
+        if (!view_valid_) return;
+        camera_.dolly(delta > 0 ? 0.82 : 1.22);
+        action_text_ = L"3D 相机距离已调整";
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    bool handle_key3d(WPARAM key) {
+        const double step = std::max(0.025, camera_.distance * 0.035);
+        bool handled = true;
+        switch (key) {
+        case 'W':
+        case VK_UP: dterrain::viewer3d::roam_xy(camera_, step, 0.0); break;
+        case 'S':
+        case VK_DOWN: dterrain::viewer3d::roam_xy(camera_, -step, 0.0); break;
+        case 'A':
+        case VK_LEFT: dterrain::viewer3d::roam_xy(camera_, 0.0, -step); break;
+        case 'D':
+        case VK_RIGHT: dterrain::viewer3d::roam_xy(camera_, 0.0, step); break;
+        case 'Q': camera_.target.z += step; break;
+        case 'E': camera_.target.z -= step; break;
+        case VK_HOME: reset_camera3d(); break;
+        case VK_ADD:
+        case VK_OEM_PLUS: change_exaggeration(1); break;
+        case VK_SUBTRACT:
+        case VK_OEM_MINUS: change_exaggeration(-1); break;
+        case VK_ESCAPE: end_drag3d(); break;
+        default: handled = false; break;
+        }
+        if (handled) {
+            action_text_ = L"3D 漫游：WASD/方向键移动，Q/E 升降，Home 复位";
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return handled;
+    }
+
+    void toggle_view_mode() {
+        end_drag3d();
+        cancel_box_zoom();
+        if (view_mode_ == ViewMode::Map2D) {
+            view_mode_ = ViewMode::Terrain3D;
+            reset_view();
+            SetWindowTextW(view_button_, L"切换2D");
+            EnableWindow(exaggeration_button_, TRUE);
+            action_text_ = L"已进入 3D：左键环视，右键平移，滚轮缩放，WASD 漫游";
+        } else {
+            view_mode_ = ViewMode::Map2D;
+            reset_view();
+            SetWindowTextW(view_button_, L"切换3D");
+            EnableWindow(exaggeration_button_, FALSE);
+            action_text_ = L"已返回 2D 编辑视图";
+        }
+        SetFocus(hwnd_);
+        invalidate_mesh_cache();
+    }
+
+    void change_exaggeration(int direction) {
+        constexpr std::array<double, 7> levels{0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0};
+        size_t nearest = 0;
+        for (size_t i = 1; i < levels.size(); ++i)
+            if (std::abs(levels[i] - z_exaggeration_) <
+                std::abs(levels[nearest] - z_exaggeration_)) nearest = i;
+        if (direction > 0 && nearest + 1 < levels.size()) ++nearest;
+        if (direction < 0 && nearest > 0) --nearest;
+        z_exaggeration_ = levels[nearest];
+        std::wostringstream label;
+        label << L"高程×" << std::fixed << std::setprecision(1) << z_exaggeration_;
+        SetWindowTextW(exaggeration_button_, label.str().c_str());
+        std::wostringstream status;
+        status << L"垂直夸张已设为 " << std::fixed << std::setprecision(1)
+               << z_exaggeration_ << L" 倍";
+        action_text_ = status.str();
+        SetFocus(hwnd_);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
     POINT clamp_to_canvas(int x, int y) const {
         const RECT canvas = canvas_rect();
         return {std::clamp<LONG>(x, canvas.left, canvas.right - 1),
@@ -515,6 +664,158 @@ private:
         dt_release_query_result(result);
         const auto end = std::chrono::steady_clock::now();
         last_query_ms_ = std::chrono::duration<double, std::milli>(end - begin).count();
+    }
+
+    void update_model_metrics() {
+        if (triangles_.empty()) {
+            model_center_x_ = model_center_y_ = model_center_z_ = 0.0;
+            model_xy_scale_ = 1.0;
+            mesh_zmin_ = 0.0;
+            mesh_zmax_ = 1.0;
+            return;
+        }
+        double xmin = std::numeric_limits<double>::max();
+        double ymin = xmin;
+        double zmin = xmin;
+        double xmax = std::numeric_limits<double>::lowest();
+        double ymax = xmax;
+        double zmax = xmax;
+        for (const auto& triangle : triangles_) {
+            for (const auto& vertex : triangle.vertex) {
+                xmin = std::min(xmin, vertex.point.x);
+                ymin = std::min(ymin, vertex.point.y);
+                zmin = std::min(zmin, vertex.point.z);
+                xmax = std::max(xmax, vertex.point.x);
+                ymax = std::max(ymax, vertex.point.y);
+                zmax = std::max(zmax, vertex.point.z);
+            }
+        }
+        model_center_x_ = (xmin + xmax) * 0.5;
+        model_center_y_ = (ymin + ymax) * 0.5;
+        model_center_z_ = (zmin + zmax) * 0.5;
+        model_xy_scale_ = std::max({(xmax - xmin) * 0.5,
+                                    (ymax - ymin) * 0.5, 1.0e-12});
+        mesh_zmin_ = zmin;
+        mesh_zmax_ = zmax > zmin ? zmax : zmin + 1.0;
+    }
+
+    void reset_camera3d() {
+        update_model_metrics();
+        camera_ = dterrain::viewer3d::Camera{};
+        camera_.distance = 3.2;
+        camera_needs_reset_ = false;
+    }
+
+    dterrain::viewer3d::Vec3 normalized_point(const dt_point3& point) const {
+        return {(point.x - model_center_x_) / model_xy_scale_,
+                (point.y - model_center_y_) / model_xy_scale_,
+                (point.z - model_center_z_) / model_xy_scale_ * z_exaggeration_};
+    }
+
+    struct ProjectedTriangle3d {
+        POINT point[3]{};
+        double depth = 0.0;
+        size_t color_band = 0;
+    };
+
+    bool project_to_canvas(const dterrain::viewer3d::Vec3& point,
+                           const RECT& canvas, POINT& screen,
+                           double& depth) const {
+        const double width = static_cast<double>(std::max(1L, canvas.right - canvas.left));
+        const double height = static_cast<double>(std::max(1L, canvas.bottom - canvas.top));
+        const auto projected = dterrain::viewer3d::project(
+            point, camera_, width / height);
+        if (!projected.visible || std::abs(projected.x) > 3.0 ||
+            std::abs(projected.y) > 3.0) return false;
+        const double sx = canvas.left + (projected.x + 1.0) * 0.5 * width;
+        const double sy = canvas.top + (1.0 - projected.y) * 0.5 * height;
+        constexpr double limit = 1000000.0;
+        screen = {static_cast<LONG>(std::clamp(sx, -limit, limit)),
+                  static_cast<LONG>(std::clamp(sy, -limit, limit))};
+        depth = projected.depth;
+        return true;
+    }
+
+    void draw_axes3d(HDC dc, const RECT& canvas) const {
+        const std::array<dterrain::viewer3d::Vec3, 4> axis_points{
+            dterrain::viewer3d::Vec3{-1.0, -1.0, -0.02},
+            dterrain::viewer3d::Vec3{-0.62, -1.0, -0.02},
+            dterrain::viewer3d::Vec3{-1.0, -0.62, -0.02},
+            dterrain::viewer3d::Vec3{-1.0, -1.0, 0.36}};
+        POINT screen[4]{};
+        double depth = 0.0;
+        for (size_t i = 0; i < axis_points.size(); ++i)
+            if (!project_to_canvas(axis_points[i], canvas, screen[i], depth)) return;
+        const std::array<COLORREF, 3> colors{
+            RGB(244, 94, 94), RGB(93, 220, 126), RGB(88, 160, 255)};
+        for (size_t i = 0; i < colors.size(); ++i) {
+            HPEN pen = CreatePen(PS_SOLID, 3, colors[i]);
+            const auto old_pen = SelectObject(dc, pen);
+            POINT line[2]{screen[0], screen[i + 1]};
+            Polyline(dc, line, 2);
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        }
+    }
+
+    void draw_mesh3d(HDC dc, const RECT& canvas) {
+        if (triangles_.empty()) return;
+        if (camera_needs_reset_) reset_camera3d();
+        const size_t step = std::max<size_t>(1,
+            (triangles_.size() + kMaxDrawTriangles3d - 1) /
+            kMaxDrawTriangles3d);
+        std::vector<ProjectedTriangle3d> projected;
+        projected.reserve((triangles_.size() + step - 1) / step);
+        const auto light = dterrain::viewer3d::normalized(
+            dterrain::viewer3d::Vec3{-0.35, -0.45, 0.82});
+        for (size_t i = 0; i < triangles_.size(); i += step) {
+            const auto& triangle = triangles_[i];
+            const auto a = normalized_point(triangle.vertex[0].point);
+            const auto b = normalized_point(triangle.vertex[1].point);
+            const auto c = normalized_point(triangle.vertex[2].point);
+            ProjectedTriangle3d item{};
+            double depth[3]{};
+            if (!project_to_canvas(a, canvas, item.point[0], depth[0]) ||
+                !project_to_canvas(b, canvas, item.point[1], depth[1]) ||
+                !project_to_canvas(c, canvas, item.point[2], depth[2])) continue;
+            item.depth = (depth[0] + depth[1] + depth[2]) / 3.0;
+            const double z = (triangle.vertex[0].point.z +
+                              triangle.vertex[1].point.z +
+                              triangle.vertex[2].point.z) / 3.0;
+            const double z_ratio = std::clamp((z - mesh_zmin_) /
+                                              (mesh_zmax_ - mesh_zmin_), 0.0, 1.0);
+            const auto normal = dterrain::viewer3d::normalized(
+                dterrain::viewer3d::cross(b - a, c - a));
+            const double lighting = 0.58 + 0.42 * std::abs(
+                dterrain::viewer3d::dot(normal, light));
+            item.color_band = std::min<size_t>(9, static_cast<size_t>(
+                std::clamp(z_ratio * 8.0 + (lighting - 0.58) * 3.0,
+                           0.0, 9.0)));
+            projected.push_back(item);
+        }
+        std::sort(projected.begin(), projected.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.depth > right.depth;
+                  });
+        constexpr std::array<COLORREF, 10> palette{
+            RGB(31, 72, 112), RGB(35, 94, 125), RGB(39, 116, 126),
+            RGB(50, 135, 111), RGB(76, 150, 91), RGB(111, 158, 78),
+            RGB(149, 157, 77), RGB(178, 151, 94), RGB(198, 176, 128),
+            RGB(225, 220, 190)};
+        std::array<HBRUSH, palette.size()> brushes{};
+        for (size_t i = 0; i < palette.size(); ++i)
+            brushes[i] = CreateSolidBrush(palette[i]);
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(34, 43, 47));
+        const auto old_pen = SelectObject(dc, pen);
+        for (const auto& triangle : projected) {
+            const auto old_brush = SelectObject(dc, brushes[triangle.color_band]);
+            Polygon(dc, triangle.point, 3);
+            SelectObject(dc, old_brush);
+        }
+        SelectObject(dc, old_pen);
+        DeleteObject(pen);
+        for (HBRUSH brush : brushes) DeleteObject(brush);
+        draw_axes3d(dc, canvas);
     }
 
     void draw_triangle_set(HDC dc, const std::vector<dt_triangle3>& source,
@@ -645,13 +946,25 @@ private:
         const int saved = SaveDC(dc);
         IntersectClipRect(dc, canvas.left, canvas.top, canvas.right, canvas.bottom);
         ensure_cache();
-        draw_mesh(dc);
-        draw_triangle_set(dc, removed_triangles_, RGB(245, 68, 70), 2);
-        draw_segment_set(dc, boundary_edges_, RGB(255, 210, 50), 3);
-        draw_triangle_set(dc, added_triangles_, RGB(60, 220, 100), 2);
-        draw_segment_set(dc, added_edges_, RGB(50, 255, 130), 3);
-        draw_highlight(dc);
-        draw_box_zoom(dc);
+        if (view_mode_ == ViewMode::Terrain3D) {
+            draw_mesh3d(dc, canvas);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(218, 228, 235));
+            RECT help = canvas;
+            help.left += 12;
+            help.top += 10;
+            DrawTextW(dc,
+                      L"3D：左键环视｜右/中键平移｜滚轮缩放｜WASD/方向键漫游｜Q/E升降｜+/-垂直夸张｜Home复位",
+                      -1, &help, DT_LEFT | DT_TOP | DT_SINGLELINE);
+        } else {
+            draw_mesh(dc);
+            draw_triangle_set(dc, removed_triangles_, RGB(245, 68, 70), 2);
+            draw_segment_set(dc, boundary_edges_, RGB(255, 210, 50), 3);
+            draw_triangle_set(dc, added_triangles_, RGB(60, 220, 100), 2);
+            draw_segment_set(dc, added_edges_, RGB(50, 255, 130), 3);
+            draw_highlight(dc);
+            draw_box_zoom(dc);
+        }
         RestoreDC(dc, saved);
 
         RECT status = client;
@@ -668,11 +981,18 @@ private:
                               mode_ == Mode::Delete ? L"删除" :
                               mode_ == Mode::ZoomBox ? L"框选放大" : L"查询";
         std::wostringstream text;
-        text << L"  模式: " << mode << L" | 顶点: " << stats.vertex_count
+        text << L"  视图: "
+             << (view_mode_ == ViewMode::Terrain3D ? L"3D" : L"2D")
+             << L" | 模式: " << mode << L" | 顶点: " << stats.vertex_count
              << L" | 三角形: " << stats.finite_triangle_count
              << L" | 当前窗口: " << triangles_.size()
-             << L" | 查询: " << std::fixed << std::setprecision(3)
-             << last_query_ms_ << L" ms | " << action_text_;
+             << (view_mode_ == ViewMode::Terrain3D ? L" | 高程×" : L" | 查询: ")
+             << std::fixed << std::setprecision(
+                    view_mode_ == ViewMode::Terrain3D ? 1 : 3)
+             << (view_mode_ == ViewMode::Terrain3D ? z_exaggeration_ : last_query_ms_)
+             << (view_mode_ == ViewMode::Terrain3D ? L"" : L" ms")
+             << L" | "
+             << action_text_;
         DrawTextW(dc, text.str().c_str(), -1, &status,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         EndPaint(hwnd_, &ps);
@@ -780,20 +1100,35 @@ private:
         case ID_GENERATE_1M: generate(1000000); break;
         case ID_CLEAR: clear_mesh(); break;
         case ID_MODE_INSERT:
+            if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             mode_ = Mode::Insert; action_text_ = L"单击网格位置插入地形点"; break;
         case ID_MODE_DELETE:
+            if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             mode_ = Mode::Delete; action_text_ = L"单击位置删除最近顶点"; break;
         case ID_MODE_QUERY:
+            if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             mode_ = Mode::Query; action_text_ = L"单击查询最近顶点和覆盖三角形"; break;
         case ID_MODE_ZOOM_BOX:
+            if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             cancel_box_zoom();
             mode_ = Mode::ZoomBox;
             action_text_ = L"按住左键拖出矩形，松开后放大并适屏";
             break;
-        case ID_FULL_EXTENT: reset_view(); invalidate_mesh_cache(); break;
+        case ID_FULL_EXTENT:
+            if (view_mode_ == ViewMode::Terrain3D) {
+                reset_camera3d();
+                action_text_ = L"3D 相机已适屏复位";
+            } else {
+                reset_view();
+                invalidate_mesh_cache();
+                action_text_ = L"二维视图已显示全图";
+            }
+            break;
         case ID_IMPORT_POINTS: import_points_file(); break;
         case ID_SAVE: save_file(); break;
         case ID_LOAD: load_file(); break;
+        case ID_VIEW_3D: toggle_view_mode(); break;
+        case ID_Z_EXAGGERATION: change_exaggeration(1); break;
         default: break;
         }
         InvalidateRect(hwnd_, nullptr, FALSE);

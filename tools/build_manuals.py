@@ -20,8 +20,8 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.2.0"
-TODAY = date(2026, 7, 14).isoformat()
+VERSION = "0.3.0"
+TODAY = date(2026, 7, 15).isoformat()
 
 BLUE = "2E74B5"
 DARK_BLUE = "1F4D78"
@@ -161,6 +161,7 @@ class Manual:
         self.short_title = short_title
         self.subtitle = subtitle
         self.audience = audience
+        self._number_counter = 0
         self._configure_document()
 
     def _configure_document(self):
@@ -298,12 +299,15 @@ class Manual:
         self.doc.add_page_break()
 
     def h1(self, text):
+        self._number_counter = 0
         return self.doc.add_paragraph(text, style="Heading 1")
 
     def h2(self, text):
+        self._number_counter = 0
         return self.doc.add_paragraph(text, style="Heading 2")
 
     def h3(self, text):
+        self._number_counter = 0
         return self.doc.add_paragraph(text, style="Heading 3")
 
     def para(self, text="", bold_prefix=None):
@@ -325,8 +329,11 @@ class Manual:
         return p
 
     def number(self, text):
-        p = self.doc.add_paragraph(style="List Number")
-        r = p.add_run(text)
+        self._number_counter += 1
+        p = self.doc.add_paragraph()
+        p.paragraph_format.left_indent = Inches(0.28)
+        p.paragraph_format.first_line_indent = Inches(-0.20)
+        r = p.add_run(f"{self._number_counter}.  {text}")
         set_run_font(r)
         return p
 
@@ -419,22 +426,23 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应普通 Delaunay TIN 版本 0.2.0。约束线、外边界、孔洞和约束 Delaunay 为后续扩展，不属于当前已交付能力。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.3.0：已提供普通 Delaunay TIN、GRID、TIN/GRID 等高线和异步转换任务。GDAL 地理格式、约束线、外边界、孔洞、约束 Delaunay 和三维 GUI 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
     m = Manual(
         "dterrain 动态地形三角网 DLL\n开发与使用手册",
         "DLL 开发与使用手册",
-        "面向测绘地形建模的批量建网、动态编辑与空间查询",
+        "面向测绘地形建模的 TIN、GRID、等高线转换、动态编辑与空间查询",
         "C/C++ 集成人员、算法研究人员、测试与运维人员",
     )
     m.cover("DEVELOPER REFERENCE")
     add_document_control(
         m,
-        "架构、构建部署、稳定 C ABI、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
+        "架构、构建部署、稳定 C ABI、GRID/等高线转换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
         [
             "首次集成：重点阅读第 3、4、7 章。",
+            "地形转换：重点阅读第 4.6 章和第 6 章。",
             "兼容既有系统：重点阅读第 5 章的 12 个 Legacy 接口。",
             "大数据量使用：重点阅读第 8 章的内存与查询策略。",
             "文件交换：重点阅读第 6 章的 XYZ、DTMESH 和 DTIN。",
@@ -450,6 +458,9 @@ def build_developer_manual():
         "返回编辑前后受影响三角形、边界边、删除边与新增边。",
         "最近顶点、点定位、矩形范围三角形查询、统计与完整校验。",
         "DTIN 二进制保存加载，以及 DTMESH 可读文本三角网交换。",
+        "双精度 GRID、仿射节点坐标、NoData、窗口读写和 DGRID 文本往返。",
+        "TIN→GRID、GRID→TIN，以及 TIN/GRID→等高线和 DCONTOUR 文本往返。",
+        "耗时转换的异步任务、进度、等待、协作取消和结果提取。",
         "推荐的稳定 C ABI 与原需求 12 个 C++ 接口兼容层。",
     ):
         m.bullet(text)
@@ -462,17 +473,18 @@ def build_developer_manual():
             ("最近距离", "最近顶点和删除最近点都使用 XY 平面欧氏距离。"),
             ("高程更新", "dt_update_vertex_z() 只改变 Z，不改变网格拓扑。"),
             ("事务性", "批量建网和文件加载失败时保留原三角网。"),
+            ("转换边界", "等高线是派生表达；0.3 尚未实现等高线反推 TIN/GRID。"),
         ],
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.callout("适用边界", "当前版本不处理断裂线、外边界、孔洞及强制约束边；这些能力计划由后续约束 Delaunay 后端提供。", "gold")
+    m.callout("适用边界", "GRID→TIN 当前重建普通 Delaunay；遇到 NoData 默认拒绝，显式允许时可能跨空洞构网。严格边界、孔洞和强制约束边计划由后续约束 Delaunay 后端提供。", "gold")
 
     m.h1("2 架构与数据模型")
     m.h2("2.1 分层结构")
     m.code("""调用系统 / GUI
         |
-稳定 C ABI + Legacy 兼容层
+稳定 C ABI + Terrain API + Task API + Legacy 兼容层
         |
 上下文、错误处理、结果句柄
         |
@@ -480,7 +492,9 @@ CGAL Delaunay hierarchy ---- Boost R-tree
         |                         |
 顶点稳定 ID / Z              范围相交查询
         |
-DTIN / DTMESH / XYZ 持久化""")
+DTIN / DTMESH / XYZ / DGRID / DCONTOUR 持久化
+        |
+GRID <---- 转换引擎 ----> TIN ----> 等高线""")
     m.para("CGAL 顶点几何只保存 XY，自定义顶点信息保存 uint64_t 稳定 ID 和 Z。Boost R-tree 保存有限三角形的 XY 包围盒与面句柄。局部编辑时先移除旧面索引项，再加入新面，因此不需要每次重建全局范围索引。")
     m.h2("2.2 关键技术选择")
     m.table(
@@ -490,6 +504,8 @@ DTIN / DTMESH / XYZ 持久化""")
             ("Delaunay_triangulation_2", "二维 Delaunay 拓扑", "Z 不进入三角剖分判定。"),
             ("Triangulation_hierarchy_2", "分层点定位", "有利于动态插入和空间定位。"),
             ("Boost R-tree", "面包围盒索引", "加速当前视口和矩形范围查询。"),
+            ("Terrain Core", "GRID 与等高线转换", "不向 DLL 外暴露 C++ 容器和 CGAL 类型。"),
+            ("Task Runtime", "后台转换任务", "保持源对象生命周期并提供协作取消。"),
         ],
         [2400, 2500, 4460],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
@@ -528,6 +544,8 @@ cmake --install build --prefix dist""")
         [
             ("dterrain.dll", "是", "动态库实现。"),
             ("dt_api.h", "开发期", "推荐的稳定 C ABI。"),
+            ("dt_terrain_api.h", "开发期", "GRID、等高线和同步转换接口。"),
+            ("dt_task_api.h", "按需", "异步转换任务接口。"),
             ("dt_legacy.hpp", "按需", "12 个原始接口兼容声明。"),
             ("libgmp-10.dll", "MinGW 包", "CGAL/GMP 运行库。"),
             ("libwinpthread-1.dll", "MinGW 包", "线程运行库。"),
@@ -617,6 +635,8 @@ dt_release_query_result(result);""")
             ("dt_save_mesh_text", "DTMESH 1", "保存顶点、稳定 ID 和显式三角形。"),
             ("dt_load_mesh_text", "DTMESH 1", "重建并逐面验证 Delaunay 拓扑。"),
             ("dt_save / dt_load", "DTIN v1", "紧凑二进制点集保存加载。"),
+            ("dt_grid_save/load_text", "DGRID 1", "规则高程节点文本往返。"),
+            ("dt_contours_save/load_text", "DCONTOUR 1", "等高折线文本往返。"),
         ],
         [3200, 1800, 4360],
         [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
@@ -628,6 +648,47 @@ if (s != DT_OK) {
     char error[512]{};
     dt_get_last_error(error, sizeof(error), nullptr);
 }""")
+
+    m.h2("4.6 GRID、等高线与异步转换")
+    m.para("新增接口分别位于 dt_terrain_api.h 和 dt_task_api.h。GRID 节点采用六参数仿射变换定位；TIN→GRID 在覆盖三角面上进行分片线性插值，凸包外写入 NoData。")
+    m.code("""dt_tin_to_grid_options options{};
+options.struct_size = sizeof(options);
+options.width = 1001;
+options.height = 1001;
+options.geo_transform[0] = xmin;
+options.geo_transform[1] = (xmax - xmin) / 1000.0;
+options.geo_transform[3] = ymin;
+options.geo_transform[5] = (ymax - ymin) / 1000.0;
+options.nodata_value = -9999.0;
+
+dt_grid_handle grid = nullptr;
+dt_grid_from_tin(mesh, &options, &grid);
+dt_grid_destroy(grid);""")
+    m.table(
+        ["接口组", "主要功能", "释放方式"],
+        [
+            ("dt_grid_*", "GRID 创建、信息、窗口读写、文本往返", "dt_grid_destroy"),
+            ("dt_*_from_*", "TIN/GRID 同步转换和等高线生成", "按输出句柄释放"),
+            ("dt_task_*", "异步启动、进度、等待、取消、结果提取", "dt_task_destroy"),
+            ("dt_contours_*", "等高线信息、逐线视图和文本往返", "dt_contours_destroy"),
+        ],
+        [2300, 4700, 2360],
+        [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER],
+    )
+    m.callout("NoData", "GRID→TIN 遇到 NoData 默认返回 DT_E_UNSUPPORTED。DT_GRID_TO_TIN_ALLOW_NODATA_BRIDGING 只适合调用方明确接受跨空洞三角化的场景。", "gold")
+    m.code("""dt_task_handle task = nullptr;
+dt_grid_from_tin_async(mesh, &options, &task);
+int32_t completed = 0;
+dt_task_wait(task, UINT32_MAX, &completed);
+
+dt_task_info info{};
+dt_task_get_info(task, &info);
+if (info.state == DT_TASK_SUCCEEDED) {
+    dt_grid_handle result = nullptr;
+    dt_task_get_grid_result(task, &result);
+    dt_grid_destroy(result);
+}
+dt_task_destroy(task);""")
 
     m.new_page()
     m.h1("5 原 12 个接口兼容层")
@@ -697,6 +758,10 @@ TRIANGLES 2
         m.bullet(text)
     m.h2("6.3 DTIN v1")
     m.para("DTIN v1 保存顶点 ID 和 XYZ，加载时重建有效 Delaunay 网。对于共圆点集，重建后可能选择另一条同样合法的对角线，因此 DTIN v1 不承诺逐面拓扑完全一致。需要文本可读和逐面校验时使用 DTMESH。")
+    m.h2("6.4 DGRID 规则高程节点文本")
+    m.para("DGRID 1 保存 SIZE、FLAGS、六参数 GEOTRANSFORM、NODATA 和按行优先排列的 VALUES。该格式用于测试、研究和简单交换；当前变换描述节点位置，不等同于 GDAL 像元左上角语义。")
+    m.h2("6.5 DCONTOUR 等高线文本")
+    m.para("DCONTOUR 1 由 LINES 计数和若干 LINE 记录组成。每条 LINE 保存等高值、闭合标志、点数及 XYZ 顶点。逐线视图中的点数组只在等高线句柄释放前有效。")
 
     m.h1("7 错误、内存与线程")
     m.h2("7.1 状态码")
@@ -712,6 +777,9 @@ TRIANGLES 2
         ("DT_E_CORRUPTED_DATA", "文件格式、计数或拓扑校验失败"),
         ("DT_E_STALE_QUERY", "结果与当前 generation 不一致"),
         ("DT_E_INTERNAL", "未分类内部异常"),
+        ("DT_E_UNSUPPORTED", "当前后端不支持所请求语义，例如未允许的 NoData 空洞"),
+        ("DT_E_CANCELLED", "异步地形任务收到协作取消请求"),
+        ("DT_E_LIMIT_EXCEEDED", "GRID、等高层或文本对象数量超过安全限制"),
     ]
     m.table(["状态", "说明"], status_rows, [3200, 6160],
             [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT])
@@ -727,6 +795,9 @@ dt_get_last_error(message, sizeof(message), &required);""")
             ("dt_handle", "dt_create", "dt_destroy"),
             ("dt_edit_result", "插入/删除接口", "dt_release_edit_result"),
             ("dt_query_result", "dt_query_triangles", "dt_release_query_result"),
+            ("dt_grid_handle", "GRID 创建/加载/转换", "dt_grid_destroy"),
+            ("dt_contour_handle", "等高线生成/加载", "dt_contours_destroy"),
+            ("dt_task_handle", "异步转换启动", "dt_task_destroy"),
             ("Legacy double*", "兼容层", "不得释放；立即复制"),
         ],
         [2500, 3100, 3760],
@@ -762,7 +833,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
     m.h2("9.1 自动化测试")
     m.code("""cmake --build build --config Release --parallel 4
 ctest --test-dir build --output-on-failure""")
-    m.para("测试覆盖生命周期、批量建网、最近点、点定位、范围查询、动态插入/删除、高程更新、DTIN 往返、XYZ 导入、DTMESH 往返及随机编辑序列。")
+    m.para("测试覆盖生命周期、批量建网、最近点、点定位、范围查询、动态插入/删除、高程更新、DTIN 往返、XYZ 导入、DTMESH 往返、TIN/GRID 转换、等高线拼接、DGRID/DCONTOUR 往返、异步成功与失败任务及随机编辑序列。")
     m.h2("9.2 集成验收清单")
     for text in (
         "DLL、导入库、头文件和运行库均为相同架构。",
@@ -789,7 +860,7 @@ ctest --test-dir build --output-on-failure""")
 
     m.h1("11 许可证与后续路线")
     m.para("当前后端使用 CGAL 2D Triangulations 包。该包采用 GPL 或商业许可双重模式；本工程定位为研究和演示用途。对外分发、闭源集成或用途改变前，应再次核查 CGAL 及依赖许可。")
-    m.para("后续约束 Delaunay 阶段计划增加折线约束、地形外边界、孔洞、约束顶点保护规则和约束数据文件块。稳定 C ABI 不暴露 CGAL 类型，可在保持现有调用方兼容的前提下扩展。")
+    m.para("下一阶段计划接入 GDAL/PROJ，实现 GeoTIFF/COG GRID 和 GeoPackage 等高线交换；随后增加折线约束、地形外边界、孔洞、约束顶点保护规则和约束数据文件块。稳定 C ABI 不暴露 CGAL 类型，可在保持现有调用方兼容的前提下扩展。")
 
     path = OUTPUT / "dterrain_DLL开发使用手册.docx"
     m.save(path)
@@ -817,6 +888,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、动态插入删除、编辑影响显示和文件交换。它不依赖 Qt 等 GUI 框架。")
+    m.callout("0.3 功能边界", "DLL 已增加 GRID、TIN/GRID 等高线和异步转换 API；当前 Win32/GDI 演示程序仍以二维 TIN 操作为主，尚未加入 GRID/等高线图层和三维漫游。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -834,7 +906,6 @@ def build_gui_manual():
     m.h2("1.2 启动后的默认状态")
     m.para("程序启动时会自动生成约 10 万个模拟地形点并构网。画布显示按高程分级着色的三角形线框，状态栏给出当前模式、顶点数、三角形数、当前窗口查询数量和耗时。")
 
-    m.new_page()
     m.h1("2 五分钟上手")
     m.callout("目标", "导入示例 XYZ，浏览局部地形，查询一个顶点，插入和删除点，最后保存文本三角网。", "gray")
     steps = [
@@ -894,7 +965,6 @@ def build_gui_manual():
     ):
         m.bullet(text)
 
-    m.new_page()
     m.h1("5 导入 XYZ 散点并自动构网")
     m.h2("5.1 支持格式")
     m.para("每个有效行包含 x、y、z 三个有限数值。支持空格、制表符、逗号和分号分隔；支持空行、整行 # 注释和行尾注释。文件扩展名可为 .xyz、.txt 或 .csv。")
@@ -996,7 +1066,6 @@ def build_gui_manual():
     ):
         m.number(step)
 
-    m.new_page()
     m.h1("9 大数据量演示建议")
     m.para("DLL 对当前视口执行精确范围查询。为了避免 GDI 在全图绘制数十万条线段时阻塞，GUI 在当前视口结果超过约 45,000 个三角形时等间隔抽样绘制；状态栏的“当前窗口”仍显示完整查询数量。")
     m.h2("9.1 百万级点操作顺序")
@@ -1036,6 +1105,8 @@ def build_gui_manual():
     ):
         m.bullet(text)
     m.callout("推荐演示路线", "导入示例 XYZ → 框选放大 → 查询最近顶点 → 插入一点 → 删除一点 → 保存 DTMESH → 清空 → 重新打开。", "blue")
+    m.h2("11.1 后续 GUI 升级")
+    m.para("计划中的 Qt/VTK 三维演示程序将增加 TIN、GRID、等高线图层树、垂直夸张、分层设色、拾取测量、自由飞行和贴地漫游。该功能未包含在当前 dterrain_demo.exe 中，避免把路线图误写成已交付操作。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

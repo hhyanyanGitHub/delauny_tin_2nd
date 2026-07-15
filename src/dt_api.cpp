@@ -1,14 +1,22 @@
 #include "dt_core.hpp"
+#include "dt_task_api.h"
+#include "dt_terrain_core.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 struct dt_context_t {
-    dt::Context context;
+    std::shared_ptr<dt::Context> context = std::make_shared<dt::Context>();
 };
 
 struct dt_edit_result_t {
@@ -17,6 +25,28 @@ struct dt_edit_result_t {
 
 struct dt_query_result_t {
     dt::QueryData data;
+};
+
+struct dt_grid_t {
+    std::shared_ptr<dt::Grid> grid;
+};
+
+struct dt_contour_set_t {
+    std::shared_ptr<dt::ContourSet> contours;
+};
+
+struct dt_task_t {
+    std::mutex mutex;
+    std::condition_variable completed;
+    std::thread worker;
+    std::atomic<double> progress{0.0};
+    std::atomic<bool> cancellation_requested{false};
+    int32_t state = DT_TASK_PENDING;
+    int32_t result_kind = DT_TASK_RESULT_NONE;
+    dt_status result_status = DT_OK;
+    std::string error;
+    std::shared_ptr<dt::Grid> grid_result;
+    std::shared_ptr<dt::ContourSet> contour_result;
 };
 
 namespace {
@@ -56,8 +86,109 @@ dt_status guarded(Function&& function) noexcept {
 }
 
 dt::Context& require_context(dt_handle handle) {
-    if (!handle) throw dt::Exception(DT_E_NOT_INITIALIZED, "invalid context handle");
+    if (!handle || !handle->context) {
+        throw dt::Exception(DT_E_NOT_INITIALIZED, "invalid context handle");
+    }
+    return *handle->context;
+}
+
+dt_task_t& require_task(dt_task_handle handle) {
+    if (!handle) throw dt::Exception(DT_E_NOT_INITIALIZED, "invalid task handle");
+    return *handle;
+}
+
+std::shared_ptr<dt::Context> require_context_shared(dt_handle handle) {
+    require_context(handle);
     return handle->context;
+}
+
+dt::Grid& require_grid(dt_grid_handle handle) {
+    if (!handle || !handle->grid) {
+        throw dt::Exception(DT_E_NOT_INITIALIZED, "invalid grid handle");
+    }
+    return *handle->grid;
+}
+
+std::shared_ptr<dt::Grid> require_grid_shared(dt_grid_handle handle) {
+    require_grid(handle);
+    return handle->grid;
+}
+
+dt::ContourSet& require_contours(dt_contour_handle handle) {
+    if (!handle || !handle->contours) {
+        throw dt::Exception(DT_E_NOT_INITIALIZED, "invalid contour handle");
+    }
+    return *handle->contours;
+}
+
+template <class T>
+void validate_options(const T* options, const char* name) {
+    if (!options) {
+        throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                            std::string(name) + " is null");
+    }
+    if (options->struct_size != 0 && options->struct_size < sizeof(T)) {
+        throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                            std::string(name) +
+                                " has an incompatible struct_size");
+    }
+}
+
+bool task_finished(int32_t state) noexcept {
+    return state == DT_TASK_SUCCEEDED || state == DT_TASK_FAILED ||
+           state == DT_TASK_CANCELLED;
+}
+
+void finish_task(dt_task_t& task, int32_t state, dt_status status,
+                 const char* error = nullptr) {
+    {
+        std::lock_guard<std::mutex> lock(task.mutex);
+        task.state = state;
+        task.result_status = status;
+        task.error = error ? error : "";
+        if (state == DT_TASK_SUCCEEDED) task.progress.store(1.0);
+    }
+    task.completed.notify_all();
+}
+
+template <class Function>
+dt_task_handle start_task(int32_t result_kind, Function&& function) {
+    auto task = std::make_unique<dt_task_t>();
+    task->result_kind = result_kind;
+    dt_task_t* raw = task.get();
+    raw->worker = std::thread(
+        [raw, function = std::forward<Function>(function)]() mutable {
+            {
+                std::lock_guard<std::mutex> lock(raw->mutex);
+                raw->state = DT_TASK_RUNNING;
+            }
+            try {
+                if (raw->cancellation_requested.load()) {
+                    throw dt::Exception(DT_E_CANCELLED,
+                                        "terrain operation was cancelled");
+                }
+                function(*raw);
+                if (raw->cancellation_requested.load()) {
+                    throw dt::Exception(DT_E_CANCELLED,
+                                        "terrain operation was cancelled");
+                }
+                finish_task(*raw, DT_TASK_SUCCEEDED, DT_OK);
+            } catch (const dt::Exception& error) {
+                finish_task(*raw,
+                            error.status() == DT_E_CANCELLED ? DT_TASK_CANCELLED
+                                                            : DT_TASK_FAILED,
+                            error.status(), error.what());
+            } catch (const std::bad_alloc&) {
+                finish_task(*raw, DT_TASK_FAILED, DT_E_OUT_OF_MEMORY,
+                            "memory allocation failed");
+            } catch (const std::exception& error) {
+                finish_task(*raw, DT_TASK_FAILED, DT_E_INTERNAL, error.what());
+            } catch (...) {
+                finish_task(*raw, DT_TASK_FAILED, DT_E_INTERNAL,
+                            "unknown internal error");
+            }
+        });
+    return task.release();
 }
 
 } // namespace
@@ -68,6 +199,434 @@ void DT_CALL dt_get_version(uint32_t* major, uint32_t* minor, uint32_t* patch) {
     if (major) *major = DT_VERSION_MAJOR;
     if (minor) *minor = DT_VERSION_MINOR;
     if (patch) *patch = DT_VERSION_PATCH;
+}
+
+dt_status DT_CALL dt_grid_create(const dt_grid_create_options* options,
+                                 dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_create_options");
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = std::make_unique<dt::Grid>(*options);
+        *output_grid = result.release();
+    });
+}
+
+void DT_CALL dt_grid_destroy(dt_grid_handle grid) {
+    delete grid;
+}
+
+dt_status DT_CALL dt_grid_get_info(dt_grid_handle grid,
+                                   dt_grid_info* output_info) {
+    return guarded([&] {
+        if (!output_info) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_info is null");
+        }
+        *output_info = require_grid(grid).info();
+    });
+}
+
+dt_status DT_CALL dt_grid_read_window(dt_grid_handle grid, uint64_t column,
+                                      uint64_t row, uint64_t width,
+                                      uint64_t height, double* output_values,
+                                      uint64_t row_stride) {
+    return guarded([&] {
+        require_grid(grid).read_window(column, row, width, height, output_values,
+                                       row_stride);
+    });
+}
+
+dt_status DT_CALL dt_grid_write_window(dt_grid_handle grid, uint64_t column,
+                                       uint64_t row, uint64_t width,
+                                       uint64_t height, const double* values,
+                                       uint64_t row_stride) {
+    return guarded([&] {
+        require_grid(grid).write_window(column, row, width, height, values,
+                                        row_stride);
+    });
+}
+
+dt_status DT_CALL dt_grid_save_text(dt_grid_handle grid,
+                                    const char* utf8_file_name) {
+    return guarded([&] { require_grid(grid).save_text(utf8_file_name); });
+}
+
+dt_status DT_CALL dt_grid_load_text(const char* utf8_file_name,
+                                    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::Grid::load_text(utf8_file_name);
+        *output_grid = result.release();
+    });
+}
+
+dt_status DT_CALL dt_grid_from_tin(dt_handle tin,
+                                   const dt_tin_to_grid_options* options,
+                                   dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_tin_to_grid_options");
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::grid_from_tin(require_context(tin), *options);
+        *output_grid = result.release();
+    });
+}
+
+dt_status DT_CALL dt_tin_from_grid(dt_grid_handle grid,
+                                   const dt_grid_to_tin_options* options,
+                                   dt_handle output_tin) {
+    return guarded([&] {
+        validate_options(options, "dt_grid_to_tin_options");
+        auto points = dt::points_from_grid(require_grid(grid), *options);
+        require_context(output_tin).build(points.data(), points.size(), nullptr);
+    });
+}
+
+dt_status DT_CALL dt_contours_from_tin(dt_handle tin,
+                                       const dt_contour_options* options,
+                                       dt_contour_handle* output_contours) {
+    if (output_contours) *output_contours = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_contour_options");
+        if (!output_contours) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_contours is null");
+        }
+        auto result = std::make_unique<dt_contour_set_t>();
+        result->contours =
+            dt::contours_from_tin(require_context(tin), *options);
+        *output_contours = result.release();
+    });
+}
+
+dt_status DT_CALL dt_contours_from_grid(dt_grid_handle grid,
+                                        const dt_contour_options* options,
+                                        dt_contour_handle* output_contours) {
+    if (output_contours) *output_contours = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_contour_options");
+        if (!output_contours) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_contours is null");
+        }
+        auto result = std::make_unique<dt_contour_set_t>();
+        result->contours =
+            dt::contours_from_grid(require_grid(grid), *options);
+        *output_contours = result.release();
+    });
+}
+
+void DT_CALL dt_contours_destroy(dt_contour_handle contours) {
+    delete contours;
+}
+
+dt_status DT_CALL dt_contours_get_info(dt_contour_handle contours,
+                                       dt_contour_info* output_info) {
+    return guarded([&] {
+        if (!output_info) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_info is null");
+        }
+        *output_info = require_contours(contours).info();
+    });
+}
+
+dt_status DT_CALL dt_contours_get_line(dt_contour_handle contours,
+                                       uint64_t line_index,
+                                       dt_contour_line_view* output_line) {
+    return guarded([&] {
+        if (!output_line) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_line is null");
+        }
+        auto& lines = require_contours(contours).lines;
+        if (line_index >= lines.size()) {
+            throw dt::Exception(DT_E_NOT_FOUND,
+                                "contour line index is out of range");
+        }
+        const auto& line = lines[static_cast<size_t>(line_index)];
+        dt_contour_line_view view{};
+        view.struct_size = sizeof(view);
+        view.flags = line.flags;
+        view.elevation = line.elevation;
+        view.points = line.points.data();
+        view.point_count = line.points.size();
+        *output_line = view;
+    });
+}
+
+dt_status DT_CALL dt_contours_save_text(dt_contour_handle contours,
+                                        const char* utf8_file_name) {
+    return guarded(
+        [&] { require_contours(contours).save_text(utf8_file_name); });
+}
+
+dt_status DT_CALL dt_contours_load_text(const char* utf8_file_name,
+                                        dt_contour_handle* output_contours) {
+    if (output_contours) *output_contours = nullptr;
+    return guarded([&] {
+        if (!output_contours) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_contours is null");
+        }
+        auto result = std::make_unique<dt_contour_set_t>();
+        result->contours = dt::ContourSet::load_text(utf8_file_name);
+        *output_contours = result.release();
+    });
+}
+
+dt_status DT_CALL dt_grid_from_tin_async(
+    dt_handle tin, const dt_tin_to_grid_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_tin_to_grid_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto context = require_context_shared(tin);
+        const auto copied_options = *options;
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID,
+            [context, copied_options](dt_task_t& task) {
+                task.grid_result = dt::grid_from_tin(
+                    *context, copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+            });
+    });
+}
+
+dt_status DT_CALL dt_tin_from_grid_async(
+    dt_grid_handle grid, const dt_grid_to_tin_options* options,
+    dt_handle output_tin, dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_to_tin_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto source = require_grid_shared(grid);
+        const auto destination = require_context_shared(output_tin);
+        const auto copied_options = *options;
+        *output_task = start_task(
+            DT_TASK_RESULT_NONE,
+            [source, destination, copied_options](dt_task_t& task) {
+                auto points = dt::points_from_grid(
+                    *source, copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+                if (task.cancellation_requested.load()) {
+                    throw dt::Exception(DT_E_CANCELLED,
+                                        "terrain operation was cancelled");
+                }
+                destination->build(points.data(), points.size(), nullptr);
+                task.progress.store(1.0);
+            });
+    });
+}
+
+dt_status DT_CALL dt_contours_from_tin_async(
+    dt_handle tin, const dt_contour_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_contour_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto context = require_context_shared(tin);
+        auto copied_options = *options;
+        std::vector<double> levels;
+        if (options->level_count != 0) {
+            if (!options->levels) {
+                throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                    "contour levels pointer is null");
+            }
+            if (options->level_count > 1000000ULL) {
+                throw dt::Exception(DT_E_LIMIT_EXCEEDED,
+                                    "too many contour levels");
+            }
+            levels.assign(options->levels,
+                          options->levels + options->level_count);
+        }
+        *output_task = start_task(
+            DT_TASK_RESULT_CONTOURS,
+            [context, copied_options, levels = std::move(levels)](
+                dt_task_t& task) mutable {
+                copied_options.levels = levels.empty() ? nullptr : levels.data();
+                task.contour_result = dt::contours_from_tin(
+                    *context, copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+            });
+    });
+}
+
+dt_status DT_CALL dt_contours_from_grid_async(
+    dt_grid_handle grid, const dt_contour_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_contour_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto source = require_grid_shared(grid);
+        auto copied_options = *options;
+        std::vector<double> levels;
+        if (options->level_count != 0) {
+            if (!options->levels) {
+                throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                    "contour levels pointer is null");
+            }
+            if (options->level_count > 1000000ULL) {
+                throw dt::Exception(DT_E_LIMIT_EXCEEDED,
+                                    "too many contour levels");
+            }
+            levels.assign(options->levels,
+                          options->levels + options->level_count);
+        }
+        *output_task = start_task(
+            DT_TASK_RESULT_CONTOURS,
+            [source, copied_options, levels = std::move(levels)](
+                dt_task_t& task) mutable {
+                copied_options.levels = levels.empty() ? nullptr : levels.data();
+                task.contour_result = dt::contours_from_grid(
+                    *source, copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+            });
+    });
+}
+
+dt_status DT_CALL dt_task_get_info(dt_task_handle task,
+                                   dt_task_info* output_info) {
+    return guarded([&] {
+        if (!output_info) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_info is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        dt_task_info info{};
+        info.struct_size = sizeof(info);
+        info.state = required.state;
+        info.result_kind = required.result_kind;
+        info.result_status = required.result_status;
+        info.progress = required.progress.load();
+        info.cancellation_requested =
+            required.cancellation_requested.load() ? 1 : 0;
+        *output_info = info;
+    });
+}
+
+dt_status DT_CALL dt_task_wait(dt_task_handle task,
+                               uint32_t timeout_milliseconds,
+                               int32_t* completed) {
+    if (completed) *completed = 0;
+    return guarded([&] {
+        if (!completed) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "completed is null");
+        }
+        auto& required = require_task(task);
+        std::unique_lock<std::mutex> lock(required.mutex);
+        const auto predicate = [&] { return task_finished(required.state); };
+        bool done = false;
+        if (timeout_milliseconds == UINT32_MAX) {
+            required.completed.wait(lock, predicate);
+            done = true;
+        } else {
+            done = required.completed.wait_for(
+                lock, std::chrono::milliseconds(timeout_milliseconds), predicate);
+        }
+        *completed = done ? 1 : 0;
+    });
+}
+
+dt_status DT_CALL dt_task_request_cancel(dt_task_handle task) {
+    return guarded([&] { require_task(task).cancellation_requested.store(true); });
+}
+
+dt_status DT_CALL dt_task_get_grid_result(dt_task_handle task,
+                                          dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        if (required.state != DT_TASK_SUCCEEDED || !required.grid_result) {
+            throw dt::Exception(DT_E_NOT_FOUND,
+                                "task has no completed GRID result");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = required.grid_result;
+        *output_grid = result.release();
+    });
+}
+
+dt_status DT_CALL dt_task_get_contour_result(
+    dt_task_handle task, dt_contour_handle* output_contours) {
+    if (output_contours) *output_contours = nullptr;
+    return guarded([&] {
+        if (!output_contours) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_contours is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        if (required.state != DT_TASK_SUCCEEDED || !required.contour_result) {
+            throw dt::Exception(DT_E_NOT_FOUND,
+                                "task has no completed contour result");
+        }
+        auto result = std::make_unique<dt_contour_set_t>();
+        result->contours = required.contour_result;
+        *output_contours = result.release();
+    });
+}
+
+dt_status DT_CALL dt_task_get_error(dt_task_handle task, char* buffer,
+                                    size_t buffer_size, size_t* required_size) {
+    return guarded([&] {
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        const size_t needed = required.error.size() + 1;
+        if (required_size) *required_size = needed;
+        if (!buffer) {
+            if (buffer_size != 0) {
+                throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                    "buffer is null but buffer_size is nonzero");
+            }
+            return;
+        }
+        if (buffer_size == 0) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "buffer_size is zero");
+        }
+        const size_t copied = std::min(buffer_size - 1, required.error.size());
+        std::memcpy(buffer, required.error.data(), copied);
+        buffer[copied] = '\0';
+        if (buffer_size < needed) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "task error buffer is too small");
+        }
+    });
+}
+
+void DT_CALL dt_task_destroy(dt_task_handle task) {
+    if (!task) return;
+    task->cancellation_requested.store(true);
+    if (task->worker.joinable()) task->worker.join();
+    delete task;
 }
 
 dt_status DT_CALL dt_create(const dt_options* options, dt_handle* out_handle) {

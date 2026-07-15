@@ -12,6 +12,9 @@ dt_destroy(mesh);
 每个 `dt_handle` 对应一个独立三角网。函数不会把 C++ 异常传出 DLL。失败时可调用
 `dt_get_last_error()` 获取当前线程的错误文本。
 
+0.3 版本新增的 GRID、等高线、转换和任务接口分别位于
+`dt_terrain_api.h`、`dt_task_api.h`，详见 [TERRAIN_API.md](TERRAIN_API.md)。
+
 ## 批量构建
 
 ```cpp

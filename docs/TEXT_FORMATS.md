@@ -37,3 +37,38 @@ TRIANGLES 2
 - `dt_load_mesh_text()` 先从顶点重建 Delaunay，再逐面检查索引、重复面、面数和
   Delaunay 拓扑；不匹配时返回 `DT_E_CORRUPTED_DATA`，原三角网保持不变；
 - 当前格式用于普通 Delaunay TIN。后续约束 Delaunay 将通过新格式版本增加约束段。
+
+## DGRID 规则高程节点文本
+
+```text
+DGRID 1
+SIZE 3 2
+FLAGS 1
+GEOTRANSFORM 500000 10 0 3200000 0 10
+NODATA -9999
+VALUES
+100 101 102
+103 104 -9999
+END
+```
+
+- `SIZE` 为列数和行数；
+- `FLAGS` 的位 0 表示启用 NoData；
+- `GEOTRANSFORM` 按节点索引映射 XY，定义见 `TERRAIN_API.md`；
+- `VALUES` 按行优先保存高程，共 `width * height` 个；
+- `dt_grid_load_text()` 先完整校验并构建新句柄，不修改其他 GRID。
+
+## DCONTOUR 等高线文本
+
+```text
+DCONTOUR 1
+LINES 1
+LINE 105 0 3
+500000 3200000 105
+500010 3200005 105
+500020 3200010 105
+END
+```
+
+`LINE` 后依次是等高值、标志和顶点数。标志位 0 表示闭合线；每个顶点保存 XYZ，
+其中 Z 应等于该线的等高值。

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -21,6 +21,7 @@ find_package(CGAL CONFIG REQUIRED)
 add_library(dterrain SHARED
     src/dt_api.cpp
     src/dt_core.cpp
+    src/dt_terrain_core.cpp
     src/dt_legacy.cpp)
 
 target_compile_features(dterrain PUBLIC cxx_std_17)
@@ -92,6 +93,10 @@ if(DT_BUILD_EXAMPLES)
     add_executable(dterrain_console examples/console_demo.cpp)
     target_compile_features(dterrain_console PRIVATE cxx_std_17)
     target_link_libraries(dterrain_console PRIVATE dterrain)
+
+    add_executable(dterrain_conversion examples/terrain_conversion.cpp)
+    target_compile_features(dterrain_conversion PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_conversion PRIVATE dterrain)
 endif()
 
 if(DT_BUILD_BENCHMARKS)
@@ -115,7 +120,8 @@ install(TARGETS dterrain
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(FILES include/dt_api.h include/dt_legacy.hpp
+install(FILES include/dt_api.h include/dt_terrain_api.h include/dt_task_api.h
+              include/dt_legacy.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES README.md DESTINATION .)
 install(DIRECTORY docs DESTINATION .)

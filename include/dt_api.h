@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define DT_VERSION_MAJOR 0
-#define DT_VERSION_MINOR 2
+#define DT_VERSION_MINOR 3
 #define DT_VERSION_PATCH 0
 
 typedef int32_t dt_status;
@@ -38,7 +38,10 @@ enum dt_status_code {
     DT_E_OUT_OF_MEMORY = 7,
     DT_E_CORRUPTED_DATA = 8,
     DT_E_STALE_QUERY = 9,
-    DT_E_INTERNAL = 10
+    DT_E_INTERNAL = 10,
+    DT_E_UNSUPPORTED = 11,
+    DT_E_CANCELLED = 12,
+    DT_E_LIMIT_EXCEEDED = 13
 };
 
 enum dt_location_type {

@@ -14,11 +14,17 @@ CGAL Delaunay hierarchy ---- Boost face R-tree
 顶点 ID / Z                 范围相交查询
       |
 DTIN / DTMESH / XYZ 持久化
+      |
+GRID / Contour / Async Task（v0.3）
 ```
 
 核心是 2.5D 数据模型：CGAL 顶点位置只保存 XY，自定义顶点信息保存 Z 和稳定 ID。
 面不复制 XYZ。R-tree 保存面 XY 包围盒和 CGAL 面句柄；编辑前删除旧面索引项，
 编辑后只插入新增面。
+
+v0.3 在 TIN 上方增加独立 `Grid` 和 `ContourSet` 数据对象。三者没有继承关系，
+通过显式转换函数连接，避免把“等高线反推地形”误表示为无损类型转换。耗时转换
+可由任务对象持有源数据共享生命周期，并通过协作取消停止。
 
 ## 并发
 
@@ -29,6 +35,9 @@ DTIN / DTMESH / XYZ 持久化
 ## 已知限制
 
 - 尚未支持断裂线、边界和孔洞；
+- GRID 当前为内存连续 `double` 数组，尚未接入 GDAL 瓦片/外存；
+- GRID→TIN 仍是普通 Delaunay，NoData 空洞只能拒绝或由调用方显式允许桥接；
+- 当前等高线不输出完全水平平台的边界；
 - `.dtin` v1 保存点集并在加载时重建，不保存逐面拓扑；`.dtmesh` 保存显式
   三角形并在打开时逐面验证，但当前仍只接受由这些顶点形成的 Delaunay 拓扑；
 - 范围查询结果尚未提供流式游标；

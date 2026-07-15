@@ -15,6 +15,7 @@
 #include <boost/geometry/index/rtree.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <stdexcept>
@@ -97,6 +98,8 @@ public:
     dt_vertex3 nearest(const dt_point3& query) const;
     dt_location_result locate(const dt_point3& query) const;
     std::unique_ptr<QueryData> query(const dt_bounds2& bounds) const;
+    void visit_triangles(
+        const std::function<void(const dt_triangle3&)>& visitor) const;
     dt_statistics statistics() const;
     bool validate(bool verbose) const;
 

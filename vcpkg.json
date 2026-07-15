@@ -1,9 +1,8 @@
 {
   "name": "dterrain",
-  "version-string": "0.1.0",
-  "description": "Dynamic 2.5D Delaunay terrain triangulation DLL",
+  "version-string": "0.3.0",
+  "description": "Dynamic 2.5D terrain TIN, GRID and contour processing DLL",
   "dependencies": [
     "cgal"
   ]
 }
-

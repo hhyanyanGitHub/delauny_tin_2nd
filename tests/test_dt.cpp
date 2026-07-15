@@ -1,5 +1,7 @@
 #include "dt_api.h"
 #include "dt_legacy.hpp"
+#include "dt_task_api.h"
+#include "dt_terrain_api.h"
 
 #include <cassert>
 #include <cmath>
@@ -229,12 +231,210 @@ void test_random_dynamic_sequence() {
     dt_destroy(mesh);
 }
 
+void test_grid_and_contours() {
+    uint32_t major = 0, minor = 0, patch = 0;
+    dt_get_version(&major, &minor, &patch);
+    assert(major == 0 && minor == 3 && patch == 0);
+
+    dt_handle plane = nullptr;
+    require_ok(dt_create(nullptr, &plane), "terrain create plane");
+    const dt_point3 plane_points[] = {
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 1.0},
+        {1.0, 1.0, 2.0}, {0.0, 1.0, 1.0}};
+    require_ok(dt_build(plane, plane_points, 4, nullptr), "terrain build plane");
+
+    dt_tin_to_grid_options raster_options{};
+    raster_options.struct_size = sizeof(raster_options);
+    raster_options.width = 3;
+    raster_options.height = 3;
+    raster_options.geo_transform[0] = 0.0;
+    raster_options.geo_transform[1] = 0.5;
+    raster_options.geo_transform[5] = 0.5;
+    raster_options.nodata_value = -9999.0;
+    dt_grid_handle grid = nullptr;
+    require_ok(dt_grid_from_tin(plane, &raster_options, &grid),
+               "dt_grid_from_tin");
+
+    dt_grid_info grid_info{};
+    require_ok(dt_grid_get_info(grid, &grid_info), "dt_grid_get_info");
+    assert(grid_info.width == 3 && grid_info.height == 3);
+    assert(grid_info.valid_value_count == 9);
+    double values[9]{};
+    require_ok(dt_grid_read_window(grid, 0, 0, 3, 3, values, 0),
+               "dt_grid_read_window");
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            assert(std::abs(values[row * 3 + column] -
+                            (static_cast<double>(row + column) * 0.5)) < 1e-10);
+        }
+    }
+
+    const char* grid_file = "dterrain_test_grid.dgrid";
+    require_ok(dt_grid_save_text(grid, grid_file), "dt_grid_save_text");
+    dt_grid_handle loaded_grid = nullptr;
+    require_ok(dt_grid_load_text(grid_file, &loaded_grid), "dt_grid_load_text");
+    double loaded_values[9]{};
+    require_ok(dt_grid_read_window(loaded_grid, 0, 0, 3, 3, loaded_values, 3),
+               "loaded grid window");
+    for (size_t i = 0; i < 9; ++i) assert(close(values[i], loaded_values[i]));
+    std::remove(grid_file);
+
+    dt_contour_options contour_options{};
+    contour_options.struct_size = sizeof(contour_options);
+    contour_options.interval = 0.5;
+    contour_options.base = 0.0;
+    dt_contour_handle tin_contours = nullptr;
+    require_ok(dt_contours_from_tin(plane, &contour_options, &tin_contours),
+               "dt_contours_from_tin");
+    dt_contour_info contour_info{};
+    require_ok(dt_contours_get_info(tin_contours, &contour_info),
+               "TIN contour info");
+    assert(contour_info.line_count >= 3);
+    assert(contour_info.vertex_count >= 6);
+    for (uint64_t i = 0; i < contour_info.line_count; ++i) {
+        dt_contour_line_view line{};
+        require_ok(dt_contours_get_line(tin_contours, i, &line),
+                   "TIN contour line");
+        assert(line.point_count >= 2);
+        for (uint64_t p = 0; p < line.point_count; ++p) {
+            assert(close(line.points[p].z, line.elevation));
+            assert(std::abs(line.points[p].x + line.points[p].y -
+                            line.elevation) < 1e-10);
+        }
+    }
+
+    dt_contour_handle grid_contours = nullptr;
+    require_ok(dt_contours_from_grid(grid, &contour_options, &grid_contours),
+               "dt_contours_from_grid");
+    require_ok(dt_contours_get_info(grid_contours, &contour_info),
+               "GRID contour info");
+    assert(contour_info.line_count >= 3);
+
+    const char* contour_file = "dterrain_test_contours.dcontour";
+    require_ok(dt_contours_save_text(grid_contours, contour_file),
+               "dt_contours_save_text");
+    dt_contour_handle loaded_contours = nullptr;
+    require_ok(dt_contours_load_text(contour_file, &loaded_contours),
+               "dt_contours_load_text");
+    dt_contour_info loaded_contour_info{};
+    require_ok(dt_contours_get_info(loaded_contours, &loaded_contour_info),
+               "loaded contour info");
+    assert(loaded_contour_info.line_count == contour_info.line_count);
+    assert(loaded_contour_info.vertex_count == contour_info.vertex_count);
+    std::remove(contour_file);
+
+    dt_handle grid_tin = nullptr;
+    require_ok(dt_create(nullptr, &grid_tin), "grid TIN create");
+    dt_grid_to_tin_options tin_options{};
+    tin_options.struct_size = sizeof(tin_options);
+    require_ok(dt_tin_from_grid(grid, &tin_options, grid_tin),
+               "dt_tin_from_grid");
+    dt_statistics statistics{};
+    require_ok(dt_get_statistics(grid_tin, &statistics), "grid TIN statistics");
+    assert(statistics.vertex_count == 9);
+    require_ok(dt_validate(grid_tin, 0), "grid TIN validate");
+
+    dt_grid_create_options nodata_options{};
+    nodata_options.struct_size = sizeof(nodata_options);
+    nodata_options.flags = DT_GRID_HAS_NODATA;
+    nodata_options.width = 2;
+    nodata_options.height = 2;
+    nodata_options.geo_transform[1] = 1.0;
+    nodata_options.geo_transform[5] = 1.0;
+    nodata_options.nodata_value = -9999.0;
+    dt_grid_handle nodata_grid = nullptr;
+    require_ok(dt_grid_create(&nodata_options, &nodata_grid),
+               "NoData grid create");
+    const double nodata_values[] = {0.0, 1.0, 1.0, -9999.0};
+    require_ok(dt_grid_write_window(nodata_grid, 0, 0, 2, 2, nodata_values, 2),
+               "NoData grid write");
+    assert(dt_tin_from_grid(nodata_grid, &tin_options, grid_tin) ==
+           DT_E_UNSUPPORTED);
+    tin_options.flags = DT_GRID_TO_TIN_ALLOW_NODATA_BRIDGING;
+    require_ok(dt_tin_from_grid(nodata_grid, &tin_options, grid_tin),
+               "NoData grid bridging");
+    require_ok(dt_get_statistics(grid_tin, &statistics),
+               "NoData grid TIN statistics");
+    assert(statistics.vertex_count == 3);
+
+    dt_task_handle grid_task = nullptr;
+    require_ok(dt_grid_from_tin_async(plane, &raster_options, &grid_task),
+               "async grid start");
+    /* The task retains the source context even after its public handle dies. */
+    dt_destroy(plane);
+    plane = nullptr;
+    int32_t completed = 0;
+    require_ok(dt_task_wait(grid_task, UINT32_MAX, &completed),
+               "async grid wait");
+    assert(completed == 1);
+    dt_task_info task_info{};
+    require_ok(dt_task_get_info(grid_task, &task_info), "async grid info");
+    assert(task_info.state == DT_TASK_SUCCEEDED);
+    assert(task_info.result_kind == DT_TASK_RESULT_GRID);
+    assert(close(task_info.progress, 1.0));
+    dt_grid_handle async_grid = nullptr;
+    require_ok(dt_task_get_grid_result(grid_task, &async_grid),
+               "async grid result");
+    require_ok(dt_grid_get_info(async_grid, &grid_info), "async grid metadata");
+    assert(grid_info.valid_value_count == 9);
+    dt_grid_destroy(async_grid);
+    dt_task_destroy(grid_task);
+
+    const double explicit_levels[] = {0.25, 0.75, 1.25, 1.75};
+    dt_contour_options async_contour_options{};
+    async_contour_options.struct_size = sizeof(async_contour_options);
+    async_contour_options.levels = explicit_levels;
+    async_contour_options.level_count = 4;
+    dt_task_handle contour_task = nullptr;
+    require_ok(dt_contours_from_grid_async(
+                   grid, &async_contour_options, &contour_task),
+               "async contour start");
+    require_ok(dt_task_wait(contour_task, UINT32_MAX, &completed),
+               "async contour wait");
+    require_ok(dt_task_get_info(contour_task, &task_info),
+               "async contour info");
+    assert(task_info.state == DT_TASK_SUCCEEDED);
+    dt_contour_handle async_contours = nullptr;
+    require_ok(dt_task_get_contour_result(contour_task, &async_contours),
+               "async contour result");
+    require_ok(dt_contours_get_info(async_contours, &contour_info),
+               "async contour metadata");
+    assert(contour_info.line_count == 4);
+    dt_contours_destroy(async_contours);
+    dt_task_destroy(contour_task);
+
+    dt_contour_options invalid_contours{};
+    invalid_contours.struct_size = sizeof(invalid_contours);
+    dt_task_handle failed_task = nullptr;
+    require_ok(dt_contours_from_grid_async(grid, &invalid_contours, &failed_task),
+               "failed task start");
+    require_ok(dt_task_wait(failed_task, UINT32_MAX, &completed),
+               "failed task wait");
+    require_ok(dt_task_get_info(failed_task, &task_info), "failed task info");
+    assert(task_info.state == DT_TASK_FAILED);
+    assert(task_info.result_status == DT_E_INVALID_ARGUMENT);
+    size_t error_size = 0;
+    require_ok(dt_task_get_error(failed_task, nullptr, 0, &error_size),
+               "failed task error size");
+    assert(error_size > 1);
+    dt_task_destroy(failed_task);
+
+    dt_grid_destroy(nodata_grid);
+    dt_destroy(grid_tin);
+    dt_contours_destroy(loaded_contours);
+    dt_contours_destroy(grid_contours);
+    dt_contours_destroy(tin_contours);
+    dt_grid_destroy(loaded_grid);
+    dt_grid_destroy(grid);
+}
+
 } // namespace
 
 int main() {
     test_v2_api();
     test_legacy_api();
     test_random_dynamic_sequence();
+    test_grid_and_contours();
     std::cout << "All dterrain tests passed.\n";
     return 0;
 }

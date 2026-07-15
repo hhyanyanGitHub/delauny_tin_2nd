@@ -648,6 +648,20 @@ std::unique_ptr<QueryData> Context::query(const dt_bounds2& bounds) const {
     return result;
 }
 
+void Context::visit_triangles(
+    const std::function<void(const dt_triangle3&)>& visitor) const {
+    if (!visitor) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "triangle visitor is empty");
+    }
+    std::lock_guard<std::recursive_mutex> cgal_lock(g_cgal_mutex);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (state_->triangulation.dimension() != 2) return;
+    for (auto face = state_->triangulation.finite_faces_begin();
+         face != state_->triangulation.finite_faces_end(); ++face) {
+        visitor(to_triangle(face));
+    }
+}
+
 dt_statistics Context::statistics() const {
     std::lock_guard<std::recursive_mutex> cgal_lock(g_cgal_mutex);
     std::shared_lock<std::shared_mutex> lock(mutex_);

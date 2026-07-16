@@ -67,6 +67,7 @@ enum CommandId {
     ID_CDT_FINISH,
     ID_CDT_CANCEL,
     ID_CDT_MOVE_VERTEX,
+    ID_CDT_REMOVE_VERTEX,
     ID_CDT_DELETE
 };
 
@@ -79,6 +80,7 @@ enum class Mode {
     CdtOuter,
     CdtHole,
     CdtMoveVertex,
+    CdtRemoveVertex,
     CdtDelete
 };
 enum class ViewMode { Map2D, Terrain3D };
@@ -410,6 +412,8 @@ private:
         AppendMenuW(cdt_edit_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_MOVE_VERTEX,
                     L"移动约束顶点（两次单击）");
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_REMOVE_VERTEX,
+                    L"删除约束顶点（单击）");
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DELETE,
                     L"选择删除约束");
 
@@ -880,6 +884,91 @@ private:
         action_text_ = text.str();
     }
 
+    void remove_cdt_vertex_at(int x, int y) {
+        if (constraint_lines_.empty()) {
+            action_text_ = L"当前没有可删除的约束顶点";
+            return;
+        }
+        const POINT clicked{x, y};
+        double best_distance = std::numeric_limits<double>::infinity();
+        dt_constraint_id best_id = 0;
+        size_t best_index = std::numeric_limits<size_t>::max();
+        for (const auto& line : constraint_lines_) {
+            for (size_t index = 0; index < line.points.size(); ++index) {
+                const POINT point = world_to_screen(line.points[index]);
+                const double dx = static_cast<double>(clicked.x - point.x);
+                const double dy = static_cast<double>(clicked.y - point.y);
+                const double distance = dx * dx + dy * dy;
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best_id = line.id;
+                    best_index = index;
+                }
+            }
+        }
+        constexpr double kPickRadius = 14.0;
+        if (best_id == 0 || best_distance > kPickRadius * kPickRadius) {
+            action_text_ = L"未选中约束顶点，请在白色折点附近单击";
+            return;
+        }
+
+        dt_cdt_vertex_usage usage{};
+        if (dt_cdt_get_constraint_vertex_usage(cdt_, best_id, best_index,
+                                               &usage) != DT_OK) {
+            action_text_ = L"查询约束顶点引用失败：" + last_error_text();
+            return;
+        }
+        uint32_t flags = 0;
+        if (usage.constraint_count > 1) {
+            std::wostringstream prompt;
+            prompt << L"该顶点被 " << usage.constraint_count
+                   << L" 条约束共同引用。\n\n"
+                   << L"是否仅从约束 ID=" << best_id
+                   << L" 中脱离此顶点？\n"
+                   << L"其他约束将保持不变。";
+            if (MessageBoxW(hwnd_, prompt.str().c_str(),
+                            L"共享约束顶点保护",
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                action_text_ = L"已取消删除共享约束顶点";
+                return;
+            }
+            flags |= DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH;
+        }
+
+        dt_edit_result effect = nullptr;
+        set_wait_cursor(true);
+        const dt_status status = dt_cdt_remove_constraint_vertex(
+            cdt_, best_id, best_index, flags, &effect);
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"删除约束顶点失败：" + last_error_text();
+            dt_release_edit_result(effect);
+            return;
+        }
+        uint64_t removed_count = 0;
+        uint64_t added_count = 0;
+        dt_edit_result_view effect_view{};
+        if (dt_edit_result_get_view(effect, &effect_view) == DT_OK) {
+            removed_count = effect_view.removed_triangle_count;
+            added_count = effect_view.added_triangle_count;
+        }
+        copy_effect(effect);
+        dt_release_edit_result(effect);
+        destroy_grid_layer();
+        destroy_contour_layer();
+        refresh_cdt_constraints();
+        show_cdt_ = true;
+        update_layer_menu();
+        invalidate_mesh_cache();
+        std::wostringstream text;
+        text << L"已删除约束 ID=" << best_id << L" 的第 "
+             << (best_index + 1) << L" 个点；影响旧面 " << removed_count
+             << L"，新面 " << added_count;
+        if (usage.constraint_count > 1) text << L"；其他共享约束保持不变";
+        if (usage.is_base_point != 0) text << L"；基础地形点仍保留";
+        action_text_ = text.str();
+    }
+
     void delete_cdt_constraint_at(int x, int y) {
         if (constraint_lines_.empty()) {
             action_text_ = L"当前没有可删除的约束";
@@ -932,6 +1021,8 @@ private:
             append_cdt_draft_point(world);
         } else if (mode_ == Mode::CdtMoveVertex) {
             move_cdt_vertex_at(x, y, world);
+        } else if (mode_ == Mode::CdtRemoveVertex) {
+            remove_cdt_vertex_at(x, y);
         } else if (mode_ == Mode::CdtDelete) {
             delete_cdt_constraint_at(x, y);
         } else if (mode_ == Mode::Insert) {
@@ -1474,7 +1565,8 @@ private:
             Polyline(dc, points.data(), static_cast<int>(points.size()));
             SelectObject(dc, old_pen);
         }
-        if (mode_ == Mode::CdtMoveVertex) {
+        if (mode_ == Mode::CdtMoveVertex ||
+            mode_ == Mode::CdtRemoveVertex) {
             HPEN point_pen = CreatePen(PS_SOLID, 1, RGB(28, 32, 38));
             HBRUSH point_brush = CreateSolidBrush(RGB(245, 245, 245));
             HBRUSH selected_brush = CreateSolidBrush(RGB(255, 238, 70));
@@ -1845,6 +1937,7 @@ private:
                               mode_ == Mode::CdtOuter ? L"绘制外边界" :
                               mode_ == Mode::CdtHole ? L"绘制孔洞" :
                               mode_ == Mode::CdtMoveVertex ? L"移动约束顶点" :
+                              mode_ == Mode::CdtRemoveVertex ? L"删除约束顶点" :
                               mode_ == Mode::CdtDelete ? L"删除约束" : L"查询";
         std::wostringstream text;
         text << L"  视图: "
@@ -2589,6 +2682,16 @@ private:
             show_cdt_ = true;
             update_layer_menu();
             action_text_ = L"先单击一个约束折点，再单击新位置；Esc 取消选择";
+            break;
+        case ID_CDT_REMOVE_VERTEX:
+            enter_2d_view();
+            cdt_draft_.clear();
+            reset_cdt_move_selection();
+            clear_overlays();
+            mode_ = Mode::CdtRemoveVertex;
+            show_cdt_ = true;
+            update_layer_menu();
+            action_text_ = L"单击白色约束顶点以删除；共享顶点会先请求确认";
             break;
         case ID_CDT_DELETE:
             enter_2d_view();

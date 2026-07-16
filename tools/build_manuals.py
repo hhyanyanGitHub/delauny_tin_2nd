@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 TODAY = date(2026, 7, 16).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.9.0：约束 Delaunay 已支持断裂线、外边界、孔洞、域内查询、DCDT 文本、TIN→CDT、域内高程采样、CDT→GRID/等高线，以及保持约束 ID 的原子几何更新与可选影响结果。GUI 已支持两次单击移动约束顶点并显示红/黄/绿影响区。百万点局部约束更新和生产级 GPU LOD 属于后续阶段。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.10.0：在 v0.9 稳定 ID 原子更新基础上，新增约束顶点引用查询、共享顶点默认保护、显式单约束脱离删除和 GUI 单击安全删除。百万点局部约束更新和生产级 GPU LOD 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
@@ -475,6 +475,7 @@ def build_developer_manual():
         "TIN/GRID/等高线 CRS WKT 元数据，以及可选 GeoTIFF/COG/GeoPackage 交换。",
         "独立 CDT 句柄、断裂线、外边界、孔洞、域内查询、约束增删与 DCDT 文本往返。",
         "保持约束 ID 和类型的原子几何更新；可选返回更新前后的完整域差异。",
+        "约束顶点引用查询、共享顶点默认保护和显式单约束脱离删除。",
         "普通 TIN→CDT、CDT 域内高程采样，以及保留外边界/孔洞的 GRID 和等高线派生。",
         "推荐的稳定 C ABI 与原需求 12 个 C++ 接口兼容层。",
     ):
@@ -493,7 +494,7 @@ def build_developer_manual():
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.callout("适用边界", "GRID→TIN 仍重建普通 Delaunay；严格边界和孔洞应使用独立 dt_cdt_handle。v0.9 约束新增、更新和删除均采用候选网全量重建，尚未达到百万点实时局部 CDT 编辑。", "gold")
+    m.callout("适用边界", "GRID→TIN 仍重建普通 Delaunay；严格边界和孔洞应使用独立 dt_cdt_handle。v0.10 约束新增、更新、顶点删除和整条删除均采用候选网全量重建，尚未达到百万点实时局部 CDT 编辑。", "gold")
 
     m.h1("2 架构与数据模型")
     m.h2("2.1 分层结构")
@@ -528,7 +529,6 @@ GRID <---- 转换引擎 ----> TIN ----> 等高线
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
     )
 
-    m.new_page()
     m.h1("3 获取、构建与部署")
     m.h2("3.1 依赖")
     m.table(
@@ -759,6 +759,13 @@ if (dt_cdt_update_constraint(cdt, boundary_id, 0,
     // view 中包含删除面、新增面、边界边、删除边和新增边。
     dt_release_edit_result(effect);
 }
+
+dt_cdt_vertex_usage usage{};
+dt_cdt_get_constraint_vertex_usage(cdt, boundary_id, 1, &usage);
+uint32_t remove_flags = usage.constraint_count > 1
+    ? DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH : 0;
+dt_cdt_remove_constraint_vertex(cdt, boundary_id, 1,
+                                remove_flags, nullptr);
 dt_grid_from_cdt(cdt, &grid_options, &grid);
 dt_contours_from_cdt(cdt, &contour_options, &contours);
 dt_cdt_save_text(cdt, "terrain.dcdt");
@@ -773,8 +780,9 @@ dt_cdt_destroy(cdt);""")
         [2600, 4300, 2460],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.para("dt_cdt_sample_height_xy() 只在有效域内插值；外边界以外和孔洞内部返回 DT_E_NOT_FOUND。dt_grid_from_cdt() 将这些位置写为 NoData，dt_contours_from_cdt() 只遍历域内三角形并继承 CRS。dt_cdt_update_constraint() 成功时保持约束 ID 与类型，失败时原几何和 generation 均不改变；output_effect 可为 nullptr。")
-    m.callout("性能与交叉", "v0.9 添加、更新或删除约束仍会在候选状态中完整重建 CDT，成功后原子替换。请求 output_effect 还会计算更新前后的完整域差异；仅需更新数据时应传 nullptr。未分段交叉必须先在交点处加入共享顶点，否则返回 DT_E_UNSUPPORTED。", "gold")
+    m.para("dt_cdt_get_constraint_vertex_usage() 报告指定点被多少条约束、多少个点序列位置引用，以及是否也是基础地形点。dt_cdt_remove_constraint_vertex() 默认拒绝共享顶点；显式传 DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH 时只从目标约束脱离，其他约束和基础点保持不变。删除后仍统一校验最小点数和拓扑，失败时 generation 不变。")
+    m.para("dt_cdt_sample_height_xy() 只在有效域内插值；外边界以外和孔洞内部返回 DT_E_NOT_FOUND。dt_grid_from_cdt() 将这些位置写为 NoData，dt_contours_from_cdt() 只遍历域内三角形并继承 CRS。更新和顶点删除的 output_effect 均可为 nullptr。")
+    m.callout("性能与交叉", "v0.10 添加、更新、顶点删除或整条删除约束仍会完整重建候选 CDT，成功后原子替换。请求 output_effect 还会计算完整域差异。未分段交叉必须先在交点处加入共享顶点，否则返回 DT_E_UNSUPPORTED。", "gold")
 
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
@@ -982,7 +990,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.9 功能边界", "当前程序已提供二维 TIN 编辑、三维 TIN 查看、TIN/GRID/等高线转换、DCDT 打开保存、单条约束交互绘制/移动/删除、CDT 影响区显示和 CDT→GRID/等高线。GeoTIFF/GeoPackage 菜单和生产级 GPU/LOD 尚未接入。", "gold")
+    m.callout("0.10 功能边界", "当前程序已提供二维/三维浏览、TIN/GRID/等高线转换、DCDT 打开保存、约束绘制、顶点移动、安全删除、整条删除和 CDT 影响区显示。GeoTIFF/GeoPackage 菜单和生产级 GPU/LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1017,6 +1025,7 @@ def build_gui_manual():
         "打开“数据交换→打开约束网 DCDT”，选择 sample_constraints.dcdt，观察孔洞和断裂线。",
         "打开“约束编辑→绘制断裂线”，在画布逐点单击，按 Enter 完成；用 Backspace 撤点、Esc 取消。",
         "选择“移动约束顶点（两次单击）”，第一次单击白色约束顶点使其变黄，第二次单击目标位置；观察红色旧面、黄色边界和绿色新增面/边。",
+        "选择“删除约束顶点（单击）”并拾取白色折点；共享顶点确认后只从当前约束脱离。",
         "执行“地形转换→约束网 → GRID”和“从约束网生成等高线”，确认孔洞区域保持空白。",
         "单击“查询模式”，在网格内单击；观察白色最近顶点和洋红色覆盖三角形。",
         "单击“插入模式”，在网格中单击；观察红色旧面、黄色边界和绿色新增面/边。",
@@ -1054,7 +1063,7 @@ def build_gui_manual():
         [
             ("地形转换", "TIN/GRID/CDT 相互派生，并从三类表面自动生成等高线。"),
             ("数据交换", "导入或导出 DGRID、DCONTOUR 和 DCDT 文本。"),
-            ("约束编辑", "绘制断裂线、外边界、孔洞；移动约束顶点，或拾取删除约束。"),
+            ("约束编辑", "绘制断裂线、外边界、孔洞；移动/安全删除顶点，或删除整条约束。"),
             ("图层", "分别显示或隐藏 TIN、GRID、等高线和约束 Delaunay。"),
         ],
         [2600, 6760],
@@ -1214,7 +1223,7 @@ def build_gui_manual():
     m.callout("格式边界", "GUI 当前只接入 DGRID/DCONTOUR 文本；DLL 已提供的 GeoTIFF/COG/GeoPackage 接口将在后续菜单中开放。", "gold")
     m.h2("8.4 DCDT 约束网")
     m.para("选择“数据交换→打开约束网 DCDT”可加载基础点、外边界、孔洞、断裂线和 CRS。域内网为紫色，外边界青色，孔洞洋红，断裂线橙色。sample_constraints.dcdt 可直接验证；“保存约束网 DCDT”执行完整文本往返。")
-    m.h2("8.5 交互绘制、移动与删除约束")
+    m.h2("8.5 交互绘制、移动与安全删除")
     for step in (
         "先打开 DCDT，或执行‘地形转换→从当前 TIN 创建约束网’。",
         "选择‘约束编辑→绘制断裂线/外边界/孔洞边界’，在二维画布逐点单击。",
@@ -1223,11 +1232,14 @@ def build_gui_manual():
         "选择‘移动约束顶点（两次单击）’后，第一次在白色约束顶点 14 像素范围内单击；选中点变为黄色。",
         "第二次在目标位置单击即可提交移动；按 Esc 取消已选顶点。成功后红色表示旧面，黄色表示影响边界，绿色表示新增面/边。",
         "若移动造成未分段交叉等非法拓扑，原约束保持不变，选中状态保留，可换一个目标位置重试或按 Esc 取消。",
+        "选择‘删除约束顶点（单击）’并单击白色折点；普通点直接删除并显示红/黄/绿影响。",
+        "共享顶点会显示引用约束数量并请求确认；确认后只从当前约束脱离，其他约束不变。基础地形点也始终保留。",
+        "删除后不足最小点数或产生非法拓扑时操作被拒绝，原约束和 generation 保持不变。",
         "选择‘选择删除约束’，在彩色约束线 14 像素范围内单击；删除外边界前先删除孔洞。",
         "约束改变后重新生成 GRID/等高线；程序会自动释放旧派生图层。",
     ):
         m.number(step)
-    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.9 单约束新增、更新和删除仍完整重建候选 CDT；移动还请求完整前后差异用于影响显示，大数据操作期间请等待鼠标恢复。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
+    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.10 单约束新增、更新、顶点删除和整条删除仍完整重建候选 CDT；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
     m.h2("8.6 往返验证")
     for step in (
         "保存当前网格。",
@@ -1269,6 +1281,8 @@ def build_gui_manual():
         ("外边界删除失败", "仍有孔洞依赖外边界；先删除孔洞约束，再删除外边界。"),
         ("约束提交失败", "检查点数、连续重合点和未分段交叉；失败时草图保留，可 Backspace 调整。"),
         ("约束顶点移动失败", "目标位置可能造成未分段交叉或非法边界；原约束不会改变，可再次单击其他位置，或按 Esc 取消。"),
+        ("共享顶点无法删除", "这是默认保护；GUI 会询问是否只从当前约束脱离。取消时所有约束不变，确认后其他约束仍保留该点。"),
+        ("约束顶点删除失败", "删除后可能少于最小点数或产生非法拓扑；原约束和基础地形点均不会被部分删除。"),
         ("框选后没有变化", "选框宽或高可能小于 8 像素；重新拖出更大矩形。"),
         ("无法退出框选", "单击“查询模式”等其他模式；拖动中可按 Esc。"),
         ("导入后旧网消失", "成功导入会整体替换当前网，这是设计行为；先保存需要保留的网格。"),
@@ -1290,14 +1304,15 @@ def build_gui_manual():
         "打开 sample_constraints.dcdt，隐藏普通 TIN 后确认孔洞为空、三类约束颜色正确。",
         "绘制一条断裂线并按 Enter 完成，再用选择删除约束验证拾取。",
         "移动一个约束顶点，确认约束 ID 不变，并检查红色旧面、黄色边界和绿色新增面/边。",
+        "删除一个普通约束顶点；若准备了共享点数据，再验证保护提示与单约束脱离。",
         "由 CDT 生成 GRID 和等高线，确认孔洞/域外没有有效 GRID 节点或跨越等高线。",
         "切换 3D，验证环视、滚轮缩放、WASD 漫游和垂直夸张，再返回 2D。",
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → 查询与编辑 → 从 TIN 创建 CDT → 绘制外边界/孔洞/断裂线 → 两次单击移动约束顶点并观察影响区 → CDT→GRID/等高线 → 约束拾取删除 → T/G/C/D 显隐 → 3D 漫游 → 分别保存四类文本。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → 从 TIN 创建 CDT → 绘制约束 → 移动顶点 → 安全删除顶点并观察影响区 → CDT→GRID/等高线 → 删除整条约束 → T/G/C/D 显隐 → 3D 漫游 → 保存文本。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付轻量三维 TIN 查看、TIN/GRID/CDT 派生转换、DCDT 约束图层、单约束交互编辑和完整前后差异影响显示。后续将把全量候选重建升级为真正的局部拓扑更新，并增加图层树与样式面板、GeoTIFF/GeoPackage 菜单、GPU 分块 LOD、拾取测量和贴地碰撞。")
+    m.para("当前已交付轻量三维查看、TIN/GRID/CDT 派生转换、DCDT 图层、约束顶点移动、安全删除和完整差异显示。后续将把全量候选重建升级为真正的局部拓扑更新，并增加图层树与样式面板、GeoTIFF/GeoPackage 菜单、GPU 分块 LOD、拾取测量和贴地碰撞。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

@@ -222,6 +222,69 @@ void test_cdt_api() {
     assert(dt_cdt_update_constraint(cdt, 999999, 0, moved_breakline, 3,
                                     nullptr) == DT_E_NOT_FOUND);
 
+    const dt_point3 shared_breakline[] = {
+        {1, 2.5, 109.5}, {1, 1, 105}};
+    dt_constraint_id shared_breakline_id = 0;
+    require_ok(dt_cdt_add_constraint(
+                   cdt, DT_CONSTRAINT_BREAKLINE, 0, shared_breakline, 2,
+                   &shared_breakline_id),
+               "add breakline with shared vertex");
+    dt_cdt_vertex_usage usage{};
+    require_ok(dt_cdt_get_constraint_vertex_usage(cdt, breakline_id, 1,
+                                                  &usage),
+               "shared constraint vertex usage");
+    assert(usage.struct_size == sizeof(usage));
+    assert(close(usage.point.x, 1.0) && close(usage.point.y, 2.5));
+    assert(usage.constraint_count == 2);
+    assert(usage.reference_count == 2);
+    assert(usage.is_base_point == 0);
+    require_ok(dt_cdt_get_constraint_vertex_usage(cdt, shared_breakline_id, 1,
+                                                  &usage),
+               "base point constraint usage");
+    assert(usage.constraint_count == 1);
+    assert(usage.is_base_point == 1);
+
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics before protected vertex removal");
+    const uint64_t generation_before_protected_remove = stats.generation;
+    assert(dt_cdt_remove_constraint_vertex(cdt, breakline_id, 1, 0,
+                                           nullptr) == DT_E_UNSUPPORTED);
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics after protected vertex removal");
+    assert(stats.generation == generation_before_protected_remove);
+
+    cdt_effect = nullptr;
+    require_ok(dt_cdt_remove_constraint_vertex(
+                   cdt, breakline_id, 1,
+                   DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH, &cdt_effect),
+               "detach shared vertex from selected constraint");
+    cdt_effect_view = {};
+    require_ok(dt_edit_result_get_view(cdt_effect, &cdt_effect_view),
+               "shared detach effect view");
+    assert(cdt_effect_view.removed_triangle_count > 0);
+    assert(cdt_effect_view.added_triangle_count > 0);
+    dt_release_edit_result(cdt_effect);
+    required_points = 0;
+    require_ok(dt_cdt_copy_constraint_points(cdt, breakline_id, nullptr, 0,
+                                             &required_points),
+               "point count after shared detach");
+    assert(required_points == 2);
+    require_ok(dt_cdt_get_constraint_vertex_usage(cdt, shared_breakline_id, 0,
+                                                  &usage),
+               "usage after shared detach");
+    assert(usage.constraint_count == 1 && usage.reference_count == 1);
+
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics before minimum point rejection");
+    const uint64_t generation_before_minimum_rejection = stats.generation;
+    assert(dt_cdt_remove_constraint_vertex(cdt, shared_breakline_id, 0, 0,
+                                           nullptr) == DT_E_INVALID_ARGUMENT);
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics after minimum point rejection");
+    assert(stats.generation == generation_before_minimum_rejection);
+    assert(dt_cdt_get_constraint_vertex_usage(cdt, breakline_id, 99,
+                                              &usage) == DT_E_NOT_FOUND);
+
     require_ok(dt_cdt_set_crs_wkt(cdt, "LOCAL_CS[\"CDT test\"]"),
                "set CDT CRS");
     const char* file_name = "dterrain_test_roundtrip.dcdt";
@@ -511,7 +574,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 9 && patch == 0);
+    assert(major == 0 && minor == 10 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");

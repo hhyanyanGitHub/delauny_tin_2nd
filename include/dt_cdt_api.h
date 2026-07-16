@@ -19,6 +19,13 @@ enum dt_constraint_flags {
     DT_CONSTRAINT_CLOSED = 1u << 0
 };
 
+enum dt_cdt_remove_vertex_flags {
+    /* By default a vertex referenced by multiple constraints is protected.
+       This flag removes only the selected constraint's reference while all
+       other constraints keep their shared vertex. */
+    DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH = 1u << 0
+};
+
 typedef struct dt_cdt_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -46,6 +53,16 @@ typedef struct dt_constraint_info {
     uint32_t reserved;
     uint64_t point_count;
 } dt_constraint_info;
+
+typedef struct dt_cdt_vertex_usage {
+    uint32_t struct_size;
+    uint32_t reserved;
+    dt_point3 point;
+    uint64_t constraint_count;
+    uint64_t reference_count;
+    uint32_t is_base_point;
+    uint32_t reserved2;
+} dt_cdt_vertex_usage;
 
 typedef struct dt_cdt_query_result_view {
     uint32_t struct_size;
@@ -83,6 +100,18 @@ DT_API dt_status DT_CALL dt_cdt_update_constraint(
     dt_cdt_handle cdt, dt_constraint_id constraint_id, uint32_t flags,
     const dt_point3* points, uint64_t point_count,
     dt_edit_result* output_effect);
+/* Reports how many distinct constraints and total point occurrences reference
+   the selected XY. is_base_point means removing the constraint reference does
+   not remove the underlying terrain point. */
+DT_API dt_status DT_CALL dt_cdt_get_constraint_vertex_usage(
+    dt_cdt_handle cdt, dt_constraint_id constraint_id, uint64_t point_index,
+    dt_cdt_vertex_usage* output_usage);
+/* Atomically removes one point occurrence from a constraint. Shared vertices
+   are protected unless DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH is set. The
+   candidate must still satisfy minimum point counts and topology rules. */
+DT_API dt_status DT_CALL dt_cdt_remove_constraint_vertex(
+    dt_cdt_handle cdt, dt_constraint_id constraint_id, uint64_t point_index,
+    uint32_t flags, dt_edit_result* output_effect);
 DT_API dt_status DT_CALL dt_cdt_remove_constraint(
     dt_cdt_handle cdt, dt_constraint_id constraint_id);
 

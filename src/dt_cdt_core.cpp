@@ -561,6 +561,92 @@ std::unique_ptr<EditData> CdtContext::update_constraint(
     return effect;
 }
 
+dt_cdt_vertex_usage CdtContext::constraint_vertex_usage(
+    dt_constraint_id id, uint64_t point_index) const {
+    if (id == 0) throw Exception(DT_E_INVALID_ARGUMENT, "constraint id is zero");
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto found = std::find_if(
+        state_->constraints.begin(), state_->constraints.end(),
+        [id](const CdtConstraint& constraint) { return constraint.id == id; });
+    if (found == state_->constraints.end()) {
+        throw Exception(DT_E_NOT_FOUND, "constraint id was not found");
+    }
+    if (point_index >= found->points.size()) {
+        throw Exception(DT_E_NOT_FOUND,
+                        "constraint point index is out of range");
+    }
+
+    const auto& point = found->points[static_cast<size_t>(point_index)];
+    dt_cdt_vertex_usage result{};
+    result.struct_size = sizeof(result);
+    result.point = point;
+    for (const auto& constraint : state_->constraints) {
+        bool referenced_by_constraint = false;
+        for (const auto& candidate : constraint.points) {
+            if (!same_xy(candidate, point)) continue;
+            ++result.reference_count;
+            referenced_by_constraint = true;
+        }
+        if (referenced_by_constraint) ++result.constraint_count;
+    }
+    result.is_base_point = std::any_of(
+        state_->base_points.begin(), state_->base_points.end(),
+        [&](const dt_point3& candidate) { return same_xy(candidate, point); })
+                               ? 1u
+                               : 0u;
+    return result;
+}
+
+std::unique_ptr<EditData> CdtContext::remove_constraint_vertex(
+    dt_constraint_id id, uint64_t point_index, uint32_t flags,
+    bool capture_effect) {
+    if (id == 0) throw Exception(DT_E_INVALID_ARGUMENT, "constraint id is zero");
+    if ((flags & ~DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH) != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown constraint vertex removal flags");
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto constraints = state_->constraints;
+    const auto found = std::find_if(
+        constraints.begin(), constraints.end(),
+        [id](const CdtConstraint& constraint) { return constraint.id == id; });
+    if (found == constraints.end()) {
+        throw Exception(DT_E_NOT_FOUND, "constraint id was not found");
+    }
+    if (point_index >= found->points.size()) {
+        throw Exception(DT_E_NOT_FOUND,
+                        "constraint point index is out of range");
+    }
+
+    const auto point = found->points[static_cast<size_t>(point_index)];
+    uint64_t constraint_count = 0;
+    for (const auto& constraint : constraints) {
+        if (std::any_of(constraint.points.begin(), constraint.points.end(),
+                        [&](const dt_point3& candidate) {
+                            return same_xy(candidate, point);
+                        })) {
+            ++constraint_count;
+        }
+    }
+    if (constraint_count > 1 &&
+        (flags & DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH) == 0) {
+        throw Exception(
+            DT_E_UNSUPPORTED,
+            "constraint vertex is shared; explicitly allow detaching only "
+            "the selected constraint reference");
+    }
+
+    found->points.erase(found->points.begin() +
+                        static_cast<size_t>(point_index));
+    auto next = make_state(state_->base_points, constraints,
+                           state_->next_constraint_id, state_->generation + 1,
+                           state_->crs_wkt);
+    auto effect = capture_effect ? make_edit_data(*state_, *next) : nullptr;
+    state_.swap(next);
+    return effect;
+}
+
 void CdtContext::remove_constraint(dt_constraint_id id) {
     if (id == 0) throw Exception(DT_E_INVALID_ARGUMENT, "constraint id is zero");
     std::unique_lock<std::shared_mutex> lock(mutex_);

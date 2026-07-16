@@ -1,6 +1,6 @@
 # 约束 Delaunay API
 
-本文说明 dterrain 0.9 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
+本文说明 dterrain 0.10 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
 改变普通 `dt_handle`、旧 12 接口或 TIN/GRID/等高线 API 的行为。
 
 ## 数据模型
@@ -31,6 +31,7 @@ dt_constraint_id id = 0;
 dt_cdt_add_constraint(cdt, DT_CONSTRAINT_BREAKLINE, 0,
                       ridge, ridge_count, &id);
 dt_cdt_update_constraint(cdt, id, 0, moved_ridge, moved_count, nullptr);
+dt_cdt_remove_constraint_vertex(cdt, id, 1, 0, nullptr);
 dt_cdt_remove_constraint(cdt, id);
 dt_cdt_destroy(cdt);
 ```
@@ -51,7 +52,25 @@ dt_cdt_destroy(cdt);
 结果必须用 `dt_release_edit_result()` 释放。传入 `NULL` 时不会执行影响差分，可减少
 大网更新的额外时间和内存。
 
-v0.9 仍以正确性为基线：添加、更新或删除约束会在候选状态中完整重建 CDT，成功后原子替换。
+### 共享顶点引用与受控删除
+
+`dt_cdt_get_constraint_vertex_usage()` 按约束 ID 和点序号查询选中 XY 的引用情况：
+
+- `constraint_count`：引用该 XY 的不同约束数量；
+- `reference_count`：所有约束点序列中的总出现次数；
+- `is_base_point`：该 XY 是否也是基础地形散点。
+
+`dt_cdt_remove_constraint_vertex()` 删除目标约束中的一个点出现。默认情况下，若该
+XY 被多条约束共同引用，函数返回 `DT_E_UNSUPPORTED`，原约束、generation 和拓扑
+保持不变。调用方确认只需要从当前约束脱离后，可传
+`DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH`；其他约束仍保留共享点。基础地形散点
+永远不会被此接口删除。
+
+删除后的点序列仍须满足开折线至少 2 点、闭合约束至少 3 点、无零长度边和无未分段
+交叉等规则。候选状态校验失败时操作原子回滚。`output_effect` 与约束更新接口相同，
+可选返回完整的新旧域差异。
+
+v0.10 仍以正确性为基线：添加、更新、顶点删除或整条删除约束会在候选状态中完整重建 CDT，成功后原子替换。
 这适合研究、文件交换和中等规模约束编辑；百万级实时局部约束编辑将在后续版本
 增加。
 
@@ -114,6 +133,6 @@ CRS 仅作为 UTF-8 WKT 元数据保存，不参与重投影。使用
 |---|---|
 | `dt_cdt_handle` | `dt_cdt_destroy()` |
 | `dt_cdt_query_result` | `dt_cdt_release_query_result()` |
-| `dt_edit_result`（约束更新可选结果） | `dt_release_edit_result()` |
+| `dt_edit_result`（约束更新/顶点删除可选结果） | `dt_release_edit_result()` |
 
 约束点通过调用方缓冲区复制，不存在跨 DLL 的释放责任。

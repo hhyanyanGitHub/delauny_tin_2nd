@@ -236,7 +236,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 5 && patch == 0);
+    assert(major == 0 && minor == 6 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");
@@ -514,6 +514,31 @@ void test_grid_and_contours() {
     dt_grid_destroy(grid);
 }
 
+void test_packaged_terrain_samples() {
+    const std::string root = DT_SOURCE_DIR;
+    dt_grid_handle grid = nullptr;
+    require_ok(dt_grid_load_text(
+                   (root + "/examples/sample_grid.dgrid").c_str(), &grid),
+               "load packaged GRID sample");
+    dt_grid_info grid_info{};
+    require_ok(dt_grid_get_info(grid, &grid_info), "packaged GRID info");
+    assert(grid_info.width == 5 && grid_info.height == 5);
+    assert(grid_info.valid_value_count == 25);
+    dt_grid_destroy(grid);
+
+    dt_contour_handle contours = nullptr;
+    require_ok(dt_contours_load_text(
+                   (root + "/examples/sample_contours.dcontour").c_str(),
+                   &contours),
+               "load packaged contour sample");
+    dt_contour_info contour_info{};
+    require_ok(dt_contours_get_info(contours, &contour_info),
+               "packaged contour info");
+    assert(contour_info.line_count == 2);
+    assert(contour_info.vertex_count == 10);
+    dt_contours_destroy(contours);
+}
+
 } // namespace
 
 int main() {
@@ -521,6 +546,7 @@ int main() {
     test_legacy_api();
     test_random_dynamic_sequence();
     test_grid_and_contours();
+    test_packaged_terrain_samples();
     std::cout << "All dterrain tests passed.\n";
     return 0;
 }

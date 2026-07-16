@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 TODAY = date(2026, 7, 16).isoformat()
 
 BLUE = "2E74B5"
@@ -426,7 +426,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.5.0：已提供普通 Delaunay TIN、GRID、TIN/GRID 等高线、异步转换任务、CRS WKT、可选 GeoTIFF/COG/GeoPackage 交换，以及 Win32 2D/3D 地形查看与漫游。约束线、外边界、孔洞、约束 Delaunay、GRID/等高线 GUI 图层和生产级 GPU LOD 属于后续阶段。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.6.0：已提供普通 Delaunay TIN、GRID、TIN/GRID 等高线、异步转换任务、CRS WKT、可选 GeoTIFF/COG/GeoPackage 交换，以及 Win32 2D/3D 地形查看、TIN/GRID/等高线图层与文本交换。约束线、外边界、孔洞、约束 Delaunay 和生产级 GPU LOD 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
@@ -474,7 +474,7 @@ def build_developer_manual():
             ("最近距离", "最近顶点和删除最近点都使用 XY 平面欧氏距离。"),
             ("高程更新", "dt_update_vertex_z() 只改变 Z，不改变网格拓扑。"),
             ("事务性", "批量建网和文件加载失败时保留原三角网。"),
-            ("转换边界", "等高线是派生表达；0.4 尚未实现等高线反推 TIN/GRID。"),
+        ("转换边界", "等高线是派生表达；当前尚未实现等高线反推 TIN/GRID。"),
         ],
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
@@ -891,7 +891,7 @@ ctest --test-dir build --output-on-failure""")
 
     m.h1("11 许可证与后续路线")
     m.para("当前后端使用 CGAL 2D Triangulations 包。该包采用 GPL 或商业许可双重模式；本工程定位为研究和演示用途。对外分发、闭源集成或用途改变前，应再次核查 CGAL 及依赖许可。")
-    m.para("当前已完成可选 GDAL/PROJ 数据交换层和轻量 Win32/GDI 三维 TIN 查看器，支持透视投影、环视、平移、缩放、键盘漫游与垂直夸张。下一阶段将增加折线约束、地形外边界、孔洞、约束顶点保护规则和约束数据文件块；生产级 GUI 再引入 GPU 分块 LOD、GRID/等高线图层、拾取测量和贴地碰撞。稳定 C ABI 不暴露 CGAL/GDAL 类型，可在保持现有调用方兼容的前提下扩展。")
+    m.para("当前已完成可选 GDAL/PROJ 数据交换层、轻量 Win32/GDI 三维 TIN 查看器，以及 TIN/GRID/等高线二维图层、转换和文本交换菜单。下一阶段将增加折线约束、地形外边界、孔洞、约束顶点保护规则和约束数据文件块；生产级 GUI 再引入 GPU 分块 LOD、GeoTIFF/GeoPackage 图层操作、拾取测量和贴地碰撞。稳定 C ABI 不暴露 CGAL/GDAL 类型，可在保持现有调用方兼容的前提下扩展。")
 
     path = OUTPUT / "dterrain_DLL开发使用手册.docx"
     m.save(path)
@@ -902,17 +902,18 @@ def build_gui_manual():
     m = Manual(
         "dterrain GUI 演示程序\n操作手册与入门教程",
         "GUI 操作入门教程",
-        "从 XYZ 散点导入到动态编辑、二维浏览、三维漫游与网格保存",
+        "从 XYZ 散点导入到动态编辑、TIN/GRID/等高线转换、三维漫游与数据保存",
         "首次使用者、演示人员、算法验证与测绘研究人员",
     )
     m.cover("QUICK START GUIDE")
     add_document_control(
         m,
-        "便携运行、五分钟上手、控件说明、XYZ 导入、2D/3D 浏览、查询编辑、网格保存打开和大数据使用建议。",
+        "便携运行、五分钟上手、控件与菜单、XYZ 导入、TIN/GRID/等高线图层、2D/3D 浏览、查询编辑和数据保存。",
         [
             "第一次体验：直接完成第 2 章的五分钟教程。",
             "已有 XYZ 数据：重点阅读第 5 章。",
             "三维地形展示：重点阅读第 4 章。",
+            "TIN/GRID/等高线转换与交换：重点阅读第 4.3 节和第 8 章。",
             "演示动态编辑：重点阅读第 7 章。",
             "百万级数据展示：重点阅读第 9 章。",
         ],
@@ -920,7 +921,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.5 功能边界", "当前程序已提供二维 TIN 编辑和轻量透视三维 TIN 查看，支持环视、平移、缩放、键盘漫游、分层设色与垂直夸张；尚未把 GRID、等高线、GeoTIFF/GeoPackage 做成 GUI 图层，也不替代生产级 GPU/LOD 渲染器。", "gold")
+    m.callout("0.6 功能边界", "当前程序已提供二维 TIN 编辑、透视三维 TIN 查看，以及 TIN/GRID/等高线二维图层、自动转换和 DGRID/DCONTOUR 文本交换。GeoTIFF/GeoPackage 尚未接入 GUI 菜单，本程序也不替代生产级 GPU/LOD 渲染器。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -930,6 +931,8 @@ def build_gui_manual():
             ("libgmp-10.dll", "CGAL/GMP 数值运行库。"),
             ("libwinpthread-1.dll", "MinGW 线程运行库。"),
             ("sample_data/sample_points.xyz", "随包提供的入门散点样例。"),
+            ("sample_data/sample_grid.dgrid", "随包提供的规则 GRID 文本样例。"),
+            ("sample_data/sample_contours.dcontour", "随包提供的等高线文本样例。"),
         ],
         [3700, 5660],
         [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
@@ -939,7 +942,7 @@ def build_gui_manual():
     m.para("程序启动时会自动生成约 10 万个模拟地形点并构网。画布显示按高程分级着色的三角形线框，状态栏给出当前模式、顶点数、三角形数、当前窗口查询数量和耗时。")
 
     m.h1("2 五分钟上手")
-    m.callout("目标", "导入示例 XYZ，浏览局部地形，查询一个顶点，插入和删除点，最后保存文本三角网。", "gray")
+    m.callout("目标", "导入示例 XYZ，浏览和编辑 TIN，生成 GRID 与等高线，体验三维漫游，最后保存数据。", "gray")
     steps = [
         "启动 dist/bin/dterrain_demo.exe，等待默认 10 万点网格显示完成。",
         "单击“导入XYZ”，选择 dist/sample_data/sample_points.xyz。导入成功后程序立即自动构网并全图适屏。",
@@ -947,6 +950,8 @@ def build_gui_manual():
         "单击“框选放大”，在画布中按住左键拖出矩形，松开后选区自动适配窗口。",
         "单击“切换3D”，左键拖动环视、滚轮拉近，再用 WASD 漫游；单击“高程×1.0”观察垂直夸张。",
         "单击“切换2D”返回二维编辑视图。",
+        "打开“地形转换”菜单，依次执行“TIN → GRID”和“从 GRID 生成等高线”，观察三类图层叠加。",
+        "打开“图层”菜单，分别隐藏和显示 TIN、GRID、等高线，再用“全图”恢复联合范围。",
         "单击“查询模式”，在网格内单击；观察白色最近顶点和洋红色覆盖三角形。",
         "单击“插入模式”，在网格中单击；观察红色旧面、黄色边界和绿色新增面/边。",
         "单击“删除模式”，在目标附近单击；程序删除 XY 最近顶点并显示局部变化。",
@@ -954,8 +959,9 @@ def build_gui_manual():
     ]
     for step in steps:
         m.number(step)
-    m.callout("完成标志", "状态栏显示新的顶点/三角形数量，保存后的 .dtmesh 可以重新打开，查询和编辑仍可继续。", "blue")
+    m.callout("完成标志", "状态栏图层标记显示 TGC，画布同时显示 GRID 高程着色、TIN 网线和等高线；保存后的 .dtmesh、.dgrid 或 .dcontour 可以重新打开。", "blue")
 
+    m.new_page()
     m.h1("3 界面组成")
     m.h2("3.1 顶部工具栏")
     control_rows = [
@@ -976,7 +982,18 @@ def build_gui_manual():
     m.table(["控件", "功能"], control_rows, [2600, 6760],
             [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT])
     m.h2("3.2 主画布与状态栏")
-    m.para("主画布绘制当前视口范围内的三角形。底部状态栏从左到右显示：2D/3D 视图、当前模式、顶点数、有限三角形数、当前窗口查询结果数、查询耗时或垂直夸张，以及最近一次操作说明。")
+    m.para("主画布绘制当前视口范围内的地形图层。底部状态栏从左到右显示：2D/3D 视图、当前模式、顶点数、有限三角形数、当前窗口查询结果数、查询耗时或垂直夸张、T/G/C 可见图层标记，以及最近一次操作说明。")
+    m.h2("3.3 菜单栏")
+    m.table(
+        ["菜单", "主要命令"],
+        [
+            ("地形转换", "TIN→GRID、GRID→TIN、从 TIN/GRID 自动生成等高线。"),
+            ("数据交换", "导入或导出 DGRID、DCONTOUR 文本。"),
+            ("图层", "分别显示或隐藏 TIN、GRID 高程着色和等高线。"),
+        ],
+        [2600, 6760],
+        [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
+    )
 
     m.h1("4 浏览与视图控制")
     m.table(
@@ -1001,6 +1018,7 @@ def build_gui_manual():
     ):
         m.bullet(text)
 
+    m.new_page()
     m.h2("4.2 三维查看与漫游")
     m.para("单击“切换3D”后，完整 TIN 以透视方式显示；红、绿、蓝短轴分别代表 X、Y、Z。三维只负责查看，选择查询、插入、删除或框选放大时会自动返回二维，防止把透视屏幕坐标误当作地形 XY。")
     m.table(
@@ -1019,6 +1037,20 @@ def build_gui_manual():
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
     m.callout("大坐标稳定性", "三维模型先减去数据中心并按 XY 范围归一化，再使用双精度相机与投影计算，可直接查看局部坐标或大数值投影坐标。", "blue")
+
+    m.h2("4.3 TIN、GRID 与等高线图层")
+    m.para("TIN→GRID 自动按 TIN 范围建立最长边 401 节点、保持 XY 比例的规则网；TIN/GRID→等高线会按高程范围选择 1、2、5×10ⁿ 系列的易读等高距，目标约 12 个级别。GRID→TIN 显式允许跳过 NoData 并跨空白区域构网，因此真正的孔洞和硬边界仍需后续 CDT。")
+    m.table(
+        ["图层", "二维显示", "数据变化规则"],
+        [
+            ("TIN", "高程分级网线和编辑效果", "重新建网或动态编辑会使派生 GRID/等高线失效。"),
+            ("GRID", "连续高程着色和青色边框", "GRID→TIN 保留源 GRID。"),
+            ("等高线", "黄色普通线与浅色加粗抽样线", "源 TIN/GRID 改变后应重新生成。"),
+        ],
+        [1600, 3000, 4760],
+        [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    m.callout("全图与显隐", "“全图”按所有可见二维图层的联合范围适屏。状态栏中的 T/G/C 分别表示当前可见且存在的 TIN、GRID、等高线。", "blue")
 
     m.h1("5 导入 XYZ 散点并自动构网")
     m.h2("5.1 支持格式")
@@ -1097,7 +1129,7 @@ def build_gui_manual():
     )
     m.callout("演示数据的 Z", "GUI 插入模式的高程来自内置模拟地形函数，不能手工输入。如果要插入真实指定 Z，请由调用系统使用 DLL 的 dt_insert_point()。", "gold")
 
-    m.h1("8 保存与打开三角网")
+    m.h1("8 保存与打开地形数据")
     m.h2("8.1 DTMESH 文本")
     m.para("保存扩展名为 .dtmesh 或 .txt 时，程序写出 DTMESH 1 文本，包含顶点 ID、XYZ 和显式三角形索引。打开时会重建 Delaunay 并逐面校验，适合研究、交换和人工检查。")
     m.h2("8.2 DTIN 二进制")
@@ -1111,7 +1143,10 @@ def build_gui_manual():
         [1700, 4700, 2960],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.h2("8.3 往返验证")
+    m.h2("8.3 DGRID 与 DCONTOUR 文本")
+    m.para("通过“数据交换”菜单可独立导入或导出 DGRID 规则高程节点文本和 DCONTOUR 等高线文本。导入这些图层不会删除现有 TIN，因此适合叠加检查。GRID 支持完整六参数仿射变换；旋转或错切数据会按实际三个角点映射显示。安装目录的 sample_data/sample_grid.dgrid 和 sample_contours.dcontour 可直接用于验证。")
+    m.callout("格式边界", "GUI 当前只接入 DGRID/DCONTOUR 文本；DLL 已提供的 GeoTIFF/COG/GeoPackage 接口将在后续菜单中开放。", "gold")
+    m.h2("8.4 往返验证")
     for step in (
         "保存当前网格。",
         "记录状态栏的顶点数和三角形数。",
@@ -1122,7 +1157,7 @@ def build_gui_manual():
         m.number(step)
 
     m.h1("9 大数据量演示建议")
-    m.para("DLL 对当前视口执行精确范围查询。为了避免 GDI 阻塞，二维线框超过约 45,000 个三角形时等间隔抽样；三维填充、描边和深度排序采用约 18,000 面固定预算。状态栏的“当前窗口”仍显示完整查询数量，显示抽样不会删减 DLL 网格数据。")
+    m.para("DLL 对当前视口执行精确范围查询。为了避免 GDI 阻塞，二维 TIN 线框预算约 45,000 面，三维填充与深度排序预算约 18,000 面，GRID 预览缓存最多 400 万值并缩放到不超过 512×512，等高线绘制预算约 20 万顶点。显示抽样不会删减 DLL 数据或文件导出内容。")
     m.h2("9.1 百万级点操作顺序")
     for text in (
         "先使用 10 万点确认功能和显示环境，再切换到 100 万点。",
@@ -1130,6 +1165,7 @@ def build_gui_manual():
         "先框选放大到局部，再进行查询或动态编辑。",
         "避免频繁全图复位；局部范围能显示更多真实三角形细节。",
         "三维全图展示优先使用默认抽样；需要生产级连续千万点渲染时应采用 GPU 分块 LOD。",
+        "超过 400 万节点的 GRID 可以保留和导出，但 GUI 不生成着色缓存或等高线。",
         "保存超大 DTMESH 前确认磁盘空间；需要紧凑存储时选 DTIN。",
     ):
         m.bullet(text)
@@ -1143,6 +1179,9 @@ def build_gui_manual():
         ("左键没有查询", "检查当前是否处于框选、插入、删除或三维视图。"),
         ("三维地形太平", "单击“高程×n”或按 + 提高垂直夸张。"),
         ("三维视点迷失", "按 Home 或单击“全图”恢复适屏相机。"),
+        ("图层菜单有勾但画面没有", "勾表示显示开关；还需先生成或导入对应 GRID/等高线数据。"),
+        ("编辑后 GRID 消失", "GRID/等高线是旧 TIN 的派生结果；TIN 改变后程序自动释放，需重新生成。"),
+        ("GRID→TIN 提示跨 NoData", "演示程序显式允许跨空白构网；真实孔洞和硬边界应等待 CDT 后端。"),
         ("框选后没有变化", "选框宽或高可能小于 8 像素；重新拖出更大矩形。"),
         ("无法退出框选", "单击“查询模式”等其他模式；拖动中可按 Esc。"),
         ("导入后旧网消失", "成功导入会整体替换当前网，这是设计行为；先保存需要保留的网格。"),
@@ -1159,13 +1198,15 @@ def build_gui_manual():
         "根据电脑性能选择 10 万或 100 万模拟数据。",
         "演示查询前切换到查询模式，演示编辑前明确红/黄/绿含义。",
         "使用框选放大展示局部细节，并用“全图”恢复。",
+        "依次生成 GRID 和等高线，用“图层”菜单验证 T/G/C 叠加与显隐。",
+        "至少导出一次 DGRID 和 DCONTOUR，并重新导入检查范围和数量。",
         "切换 3D，验证环视、滚轮缩放、WASD 漫游和垂直夸张，再返回 2D。",
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → 框选放大 → 查询与动态编辑 → 切换 3D 环视/漫游/垂直夸张 → 返回 2D → 保存 DTMESH → 清空 → 重新打开。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → 查询与动态编辑 → TIN→GRID → GRID 等高线 → T/G/C 图层显隐 → 3D 漫游 → 返回 2D → 分别保存 DTMESH、DGRID、DCONTOUR。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前轻量三维查看器已交付 TIN 分层设色、环视、平移、缩放、键盘漫游和垂直夸张。后续生产级 GUI 将增加 GRID/等高线图层树、GPU 分块 LOD、拾取测量、光照纹理、贴地碰撞和后台流式加载。")
+    m.para("当前已交付轻量三维 TIN 查看，以及二维 TIN/GRID/等高线图层、转换和文本交换。后续生产级 GUI 将增加真正的图层树与样式面板、GeoTIFF/COG/GeoPackage 菜单、GPU 分块 LOD、拾取测量、光照纹理、贴地碰撞和后台流式加载。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

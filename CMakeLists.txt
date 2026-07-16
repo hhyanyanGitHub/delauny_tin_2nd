@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.5.0
+    VERSION 0.6.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -142,7 +142,8 @@ if(DT_BUILD_TESTS)
     add_executable(dterrain_tests tests/test_dt.cpp)
     target_compile_features(dterrain_tests PRIVATE cxx_std_17)
     target_compile_definitions(dterrain_tests PRIVATE
-        DT_WITH_GDAL=$<BOOL:${DT_WITH_GDAL}>)
+        DT_WITH_GDAL=$<BOOL:${DT_WITH_GDAL}>
+        DT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(dterrain_tests PRIVATE dterrain)
     add_test(NAME dterrain_tests COMMAND dterrain_tests)
 
@@ -195,7 +196,9 @@ install(FILES include/dt_api.h include/dt_terrain_api.h include/dt_task_api.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES README.md DESTINATION .)
 install(DIRECTORY docs DESTINATION .)
-install(FILES examples/sample_points.xyz DESTINATION sample_data)
+install(FILES examples/sample_points.xyz examples/sample_grid.dgrid
+              examples/sample_contours.dcontour
+    DESTINATION sample_data)
 if(TARGET dterrain_demo)
     install(TARGETS dterrain_demo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

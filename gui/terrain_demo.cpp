@@ -4,6 +4,7 @@
 #include <commdlg.h>
 
 #include "dt_api.h"
+#include "dt_terrain_api.h"
 #include "terrain_3d.hpp"
 
 #include <algorithm>
@@ -25,6 +26,8 @@ constexpr int kToolbarHeight = 48;
 constexpr int kStatusHeight = 28;
 constexpr size_t kMaxDrawTriangles = 45000;
 constexpr size_t kMaxDrawTriangles3d = 18000;
+constexpr uint64_t kMaxGridPreviewValues = 4000000;
+constexpr uint64_t kMaxContourDrawVertices = 200000;
 
 enum CommandId {
     ID_GENERATE_100K = 100,
@@ -39,7 +42,18 @@ enum CommandId {
     ID_SAVE,
     ID_LOAD,
     ID_VIEW_3D,
-    ID_Z_EXAGGERATION
+    ID_Z_EXAGGERATION,
+    ID_TIN_TO_GRID = 200,
+    ID_GRID_TO_TIN,
+    ID_CONTOURS_FROM_TIN,
+    ID_CONTOURS_FROM_GRID,
+    ID_IMPORT_GRID,
+    ID_EXPORT_GRID,
+    ID_IMPORT_CONTOURS,
+    ID_EXPORT_CONTOURS,
+    ID_LAYER_TIN,
+    ID_LAYER_GRID,
+    ID_LAYER_CONTOURS
 };
 
 enum class Mode { Insert, Delete, Query, ZoomBox };
@@ -98,13 +112,18 @@ double jitter(uint64_t value) {
 class DemoApp {
 public:
     DemoApp() { dt_create(nullptr, &mesh_); }
-    ~DemoApp() { dt_destroy(mesh_); }
+    ~DemoApp() {
+        dt_contours_destroy(contours_);
+        dt_grid_destroy(grid_);
+        dt_destroy(mesh_);
+    }
 
     LRESULT handle(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         hwnd_ = window;
         switch (message) {
         case WM_CREATE:
             create_controls();
+            create_menus();
             generate(100000);
             return 0;
         case WM_COMMAND:
@@ -187,6 +206,8 @@ public:
 private:
     HWND hwnd_ = nullptr;
     dt_handle mesh_ = nullptr;
+    dt_grid_handle grid_ = nullptr;
+    dt_contour_handle contours_ = nullptr;
     Mode mode_ = Mode::Query;
     ViewMode view_mode_ = ViewMode::Map2D;
     dt_bounds2 view_{0.0, 0.0, 1.0, 1.0};
@@ -210,6 +231,18 @@ private:
     POINT box_start_{};
     POINT box_end_{};
     std::vector<HWND> controls_;
+    HMENU layer_menu_ = nullptr;
+    bool show_tin_ = true;
+    bool show_grid_ = true;
+    bool show_contours_ = true;
+    dt_grid_info grid_info_{};
+    std::vector<double> grid_values_;
+    std::vector<uint32_t> grid_preview_;
+    uint32_t grid_preview_width_ = 0;
+    uint32_t grid_preview_height_ = 0;
+    double grid_zmin_ = 0.0;
+    double grid_zmax_ = 1.0;
+    dt_contour_info contour_info_{};
     HWND view_button_ = nullptr;
     HWND exaggeration_button_ = nullptr;
     dterrain::viewer3d::Camera camera_{};
@@ -260,6 +293,58 @@ private:
         layout_controls();
     }
 
+    void create_menus() {
+        HMENU menu_bar = CreateMenu();
+        HMENU terrain_menu = CreatePopupMenu();
+        AppendMenuW(terrain_menu, MF_STRING, ID_TIN_TO_GRID,
+                    L"TIN → GRID（自动 401）");
+        AppendMenuW(terrain_menu, MF_STRING, ID_GRID_TO_TIN,
+                    L"GRID → TIN（允许跨 NoData）");
+        AppendMenuW(terrain_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(terrain_menu, MF_STRING, ID_CONTOURS_FROM_TIN,
+                    L"从 TIN 生成等高线（自动间隔）");
+        AppendMenuW(terrain_menu, MF_STRING, ID_CONTOURS_FROM_GRID,
+                    L"从 GRID 生成等高线（自动间隔）");
+
+        HMENU exchange_menu = CreatePopupMenu();
+        AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_GRID,
+                    L"导入 GRID 文本…");
+        AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_GRID,
+                    L"导出 GRID 文本…");
+        AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CONTOURS,
+                    L"导入等高线文本…");
+        AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_CONTOURS,
+                    L"导出等高线文本…");
+
+        layer_menu_ = CreatePopupMenu();
+        AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_TIN,
+                    L"TIN 三角网");
+        AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_GRID,
+                    L"GRID 高程着色");
+        AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_CONTOURS,
+                    L"等高线");
+
+        AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(terrain_menu),
+                    L"地形转换(&T)");
+        AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(exchange_menu),
+                    L"数据交换(&E)");
+        AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu_),
+                    L"图层(&L)");
+        SetMenu(hwnd_, menu_bar);
+    }
+
+    void update_layer_menu() const {
+        if (!layer_menu_) return;
+        CheckMenuItem(layer_menu_, ID_LAYER_TIN,
+                      MF_BYCOMMAND | (show_tin_ ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(layer_menu_, ID_LAYER_GRID,
+                      MF_BYCOMMAND | (show_grid_ ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(layer_menu_, ID_LAYER_CONTOURS,
+                      MF_BYCOMMAND | (show_contours_ ? MF_CHECKED : MF_UNCHECKED));
+        DrawMenuBar(hwnd_);
+    }
+
     void layout_controls() {
         int x = 6;
         for (size_t i = 0; i < controls_.size(); ++i) {
@@ -271,6 +356,27 @@ private:
 
     void set_wait_cursor(bool waiting) {
         SetCursor(LoadCursorW(nullptr, waiting ? IDC_WAIT : IDC_ARROW));
+    }
+
+    void destroy_grid_layer() {
+        dt_grid_destroy(grid_);
+        grid_ = nullptr;
+        grid_info_ = {};
+        grid_values_.clear();
+        grid_preview_.clear();
+        grid_preview_width_ = grid_preview_height_ = 0;
+    }
+
+    void destroy_contour_layer() {
+        dt_contours_destroy(contours_);
+        contours_ = nullptr;
+        contour_info_ = {};
+    }
+
+    void clear_derived_layers(bool clear_grid = true,
+                              bool clear_contours = true) {
+        if (clear_grid) destroy_grid_layer();
+        if (clear_contours) destroy_contour_layer();
     }
 
     void generate(uint64_t count) {
@@ -295,6 +401,9 @@ private:
             action_text_ = L"建网失败：" + last_error_text();
             return;
         }
+        show_tin_ = true;
+        update_layer_menu();
+        clear_derived_layers();
         clear_overlays();
         reset_view();
         const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
@@ -307,6 +416,7 @@ private:
 
     void clear_mesh() {
         if (dt_clear_handle(mesh_) == DT_OK) {
+            clear_derived_layers();
             triangles_.clear();
             clear_overlays();
             view_valid_ = false;
@@ -336,12 +446,37 @@ private:
     }
 
     void reset_view() {
+        bool found = false;
+        dt_bounds2 bounds{};
+        auto include = [&](const dt_bounds2& next) {
+            if (!found) {
+                bounds = next;
+                found = true;
+            } else {
+                bounds.xmin = std::min(bounds.xmin, next.xmin);
+                bounds.ymin = std::min(bounds.ymin, next.ymin);
+                bounds.xmax = std::max(bounds.xmax, next.xmax);
+                bounds.ymax = std::max(bounds.ymax, next.ymax);
+            }
+        };
         dt_statistics stats{};
-        if (dt_get_statistics(mesh_, &stats) != DT_OK || stats.vertex_count == 0) {
+        if (show_tin_ && dt_get_statistics(mesh_, &stats) == DT_OK &&
+            stats.vertex_count != 0) include(stats.bounds);
+        if (view_mode_ == ViewMode::Map2D && show_grid_ && grid_) {
+            grid_info_.struct_size = sizeof(grid_info_);
+            if (dt_grid_get_info(grid_, &grid_info_) == DT_OK)
+                include(grid_info_.bounds);
+        }
+        if (view_mode_ == ViewMode::Map2D && show_contours_ && contours_) {
+            contour_info_.struct_size = sizeof(contour_info_);
+            if (dt_contours_get_info(contours_, &contour_info_) == DT_OK &&
+                contour_info_.line_count != 0) include(contour_info_.bounds);
+        }
+        if (!found) {
             view_valid_ = false;
             return;
         }
-        fit_view_to_bounds(stats.bounds, 1.08);
+        fit_view_to_bounds(bounds, 1.08);
         camera_needs_reset_ = true;
     }
 
@@ -388,6 +523,9 @@ private:
             dt_edit_result effect = nullptr;
             const auto status = dt_insert_point(mesh_, &point, &id, &effect);
             if (status == DT_OK) {
+                show_tin_ = true;
+                update_layer_menu();
+                clear_derived_layers();
                 copy_effect(effect);
                 std::wostringstream text;
                 text << L"插入顶点 ID=" << id;
@@ -400,6 +538,9 @@ private:
             dt_edit_result effect = nullptr;
             const auto status = dt_delete_nearest_xy(mesh_, &world, &id, &effect);
             if (status == DT_OK) {
+                show_tin_ = true;
+                update_layer_menu();
+                clear_derived_layers();
                 copy_effect(effect);
                 std::wostringstream text;
                 text << L"删除最近顶点 ID=" << id;
@@ -538,6 +679,14 @@ private:
         end_drag3d();
         cancel_box_zoom();
         if (view_mode_ == ViewMode::Map2D) {
+            dt_statistics stats{};
+            if (dt_get_statistics(mesh_, &stats) != DT_OK || stats.dimension != 2) {
+                action_text_ = L"3D 视图需要有效的二维 TIN；可先执行 GRID→TIN";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            show_tin_ = true;
+            update_layer_menu();
             view_mode_ = ViewMode::Terrain3D;
             reset_view();
             SetWindowTextW(view_button_, L"切换2D");
@@ -647,6 +796,14 @@ private:
 
     void ensure_cache() {
         if (cache_valid_ || !view_valid_) return;
+        dt_statistics statistics{};
+        if (!show_tin_ || dt_get_statistics(mesh_, &statistics) != DT_OK ||
+            statistics.finite_triangle_count == 0) {
+            triangles_.clear();
+            cache_valid_ = true;
+            last_query_ms_ = 0.0;
+            return;
+        }
         const auto begin = std::chrono::steady_clock::now();
         dt_query_result result = nullptr;
         if (dt_query_triangles(mesh_, &view_, &result) != DT_OK) {
@@ -664,6 +821,179 @@ private:
         dt_release_query_result(result);
         const auto end = std::chrono::steady_clock::now();
         last_query_ms_ = std::chrono::duration<double, std::milli>(end - begin).count();
+    }
+
+    bool is_grid_nodata(double value) const {
+        if ((grid_info_.flags & DT_GRID_HAS_NODATA) == 0) return false;
+        return std::isnan(grid_info_.nodata_value)
+                   ? std::isnan(value)
+                   : value == grid_info_.nodata_value;
+    }
+
+    static uint32_t grid_pixel(double ratio) {
+        constexpr std::array<std::array<int, 3>, 8> colors{{
+            {28, 70, 110}, {32, 108, 132}, {48, 139, 115}, {84, 156, 88},
+            {135, 164, 76}, {180, 151, 84}, {204, 180, 125}, {232, 226, 199}}};
+        ratio = std::clamp(ratio, 0.0, 1.0);
+        const double scaled = ratio * static_cast<double>(colors.size() - 1);
+        const size_t first = static_cast<size_t>(scaled);
+        const size_t second = std::min(first + 1, colors.size() - 1);
+        const double blend = scaled - static_cast<double>(first);
+        auto channel = [&](size_t value) {
+            return static_cast<uint32_t>(std::lround(
+                colors[first][value] * (1.0 - blend) +
+                colors[second][value] * blend));
+        };
+        const uint32_t red = channel(0);
+        const uint32_t green = channel(1);
+        const uint32_t blue = channel(2);
+        return blue | (green << 8U) | (red << 16U);
+    }
+
+    bool refresh_grid_cache() {
+        grid_values_.clear();
+        grid_preview_.clear();
+        grid_preview_width_ = grid_preview_height_ = 0;
+        if (!grid_) return false;
+        grid_info_ = {};
+        grid_info_.struct_size = sizeof(grid_info_);
+        if (dt_grid_get_info(grid_, &grid_info_) != DT_OK) return false;
+        if (grid_info_.width == 0 || grid_info_.height == 0 ||
+            grid_info_.width > kMaxGridPreviewValues / grid_info_.height) {
+            return true;
+        }
+        const uint64_t count = grid_info_.width * grid_info_.height;
+        if (count > kMaxGridPreviewValues) return true;
+        grid_values_.resize(static_cast<size_t>(count));
+        if (dt_grid_read_window(grid_, 0, 0, grid_info_.width,
+                                grid_info_.height, grid_values_.data(),
+                                grid_info_.width) != DT_OK) {
+            grid_values_.clear();
+            return false;
+        }
+        grid_zmin_ = std::numeric_limits<double>::max();
+        grid_zmax_ = std::numeric_limits<double>::lowest();
+        for (double value : grid_values_) {
+            if (is_grid_nodata(value)) continue;
+            grid_zmin_ = std::min(grid_zmin_, value);
+            grid_zmax_ = std::max(grid_zmax_, value);
+        }
+        if (grid_zmax_ < grid_zmin_) {
+            grid_zmin_ = 0.0;
+            grid_zmax_ = 1.0;
+        } else if (grid_zmax_ == grid_zmin_) {
+            grid_zmax_ = grid_zmin_ + 1.0;
+        }
+        grid_preview_width_ = static_cast<uint32_t>(
+            std::min<uint64_t>(512, grid_info_.width));
+        grid_preview_height_ = static_cast<uint32_t>(
+            std::min<uint64_t>(512, grid_info_.height));
+        grid_preview_.resize(static_cast<size_t>(grid_preview_width_) *
+                             grid_preview_height_);
+        for (uint32_t row = 0; row < grid_preview_height_; ++row) {
+            const uint64_t source_row = grid_preview_height_ == 1 ? 0 :
+                static_cast<uint64_t>(row) * (grid_info_.height - 1) /
+                (grid_preview_height_ - 1);
+            for (uint32_t column = 0; column < grid_preview_width_; ++column) {
+                const uint64_t source_column = grid_preview_width_ == 1 ? 0 :
+                    static_cast<uint64_t>(column) * (grid_info_.width - 1) /
+                    (grid_preview_width_ - 1);
+                const double value = grid_values_[static_cast<size_t>(
+                    source_row * grid_info_.width + source_column)];
+                grid_preview_[static_cast<size_t>(row) * grid_preview_width_ +
+                              column] = is_grid_nodata(value)
+                                            ? 0x00191f24U
+                                            : grid_pixel((value - grid_zmin_) /
+                                                         (grid_zmax_ - grid_zmin_));
+            }
+        }
+        return true;
+    }
+
+    dt_point3 grid_world(uint64_t column, uint64_t row) const {
+        const double c = static_cast<double>(column);
+        const double r = static_cast<double>(row);
+        return {grid_info_.geo_transform[0] + c * grid_info_.geo_transform[1] +
+                    r * grid_info_.geo_transform[2],
+                grid_info_.geo_transform[3] + c * grid_info_.geo_transform[4] +
+                    r * grid_info_.geo_transform[5],
+                0.0};
+    }
+
+    void draw_grid(HDC dc) const {
+        if (!grid_ || !show_grid_ || grid_info_.width == 0 ||
+            grid_info_.height == 0) return;
+        const POINT corners[4]{world_to_screen(grid_world(0, 0)),
+            world_to_screen(grid_world(grid_info_.width - 1, 0)),
+            world_to_screen(grid_world(grid_info_.width - 1,
+                                       grid_info_.height - 1)),
+            world_to_screen(grid_world(0, grid_info_.height - 1))};
+        if (!grid_preview_.empty()) {
+            BITMAPINFO info{};
+            info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = static_cast<LONG>(grid_preview_width_);
+            info.bmiHeader.biHeight = -static_cast<LONG>(grid_preview_height_);
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            void* pixels = nullptr;
+            HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS,
+                                              &pixels, nullptr, 0);
+            if (bitmap && pixels) {
+                std::memcpy(pixels, grid_preview_.data(),
+                            grid_preview_.size() * sizeof(uint32_t));
+                HDC source = CreateCompatibleDC(dc);
+                const auto old_bitmap = SelectObject(source, bitmap);
+                POINT destination[3]{corners[0], corners[1], corners[3]};
+                SetStretchBltMode(dc, HALFTONE);
+                PlgBlt(dc, destination, source, 0, 0,
+                       static_cast<int>(grid_preview_width_),
+                       static_cast<int>(grid_preview_height_), nullptr, 0, 0);
+                SelectObject(source, old_bitmap);
+                DeleteDC(source);
+            }
+            if (bitmap) DeleteObject(bitmap);
+        }
+        HPEN pen = CreatePen(PS_SOLID, 2, RGB(81, 184, 232));
+        const auto old_pen = SelectObject(dc, pen);
+        POINT outline[5]{corners[0], corners[1], corners[2], corners[3], corners[0]};
+        Polyline(dc, outline, 5);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen);
+    }
+
+    void draw_contours(HDC dc) const {
+        if (!contours_ || !show_contours_ || contour_info_.line_count == 0) return;
+        const uint64_t point_step = std::max<uint64_t>(
+            1, (contour_info_.vertex_count + kMaxContourDrawVertices - 1) /
+                   kMaxContourDrawVertices);
+        const uint64_t line_step = std::max<uint64_t>(
+            1, (contour_info_.line_count + 19999) / 20000);
+        HPEN minor_pen = CreatePen(PS_SOLID, 1, RGB(255, 202, 73));
+        HPEN major_pen = CreatePen(PS_SOLID, 2, RGB(255, 242, 184));
+        for (uint64_t index = 0; index < contour_info_.line_count;
+             index += line_step) {
+            dt_contour_line_view line{};
+            line.struct_size = sizeof(line);
+            if (dt_contours_get_line(contours_, index, &line) != DT_OK ||
+                line.point_count < 2) continue;
+            std::vector<POINT> points;
+            points.reserve(static_cast<size_t>(line.point_count / point_step + 2));
+            for (uint64_t point = 0; point < line.point_count; point += point_step)
+                points.push_back(world_to_screen(line.points[point]));
+            if ((line.point_count - 1) % point_step != 0)
+                points.push_back(world_to_screen(line.points[line.point_count - 1]));
+            if ((line.flags & DT_CONTOUR_LINE_CLOSED) != 0 &&
+                (points.front().x != points.back().x ||
+                 points.front().y != points.back().y))
+                points.push_back(points.front());
+            const auto old_pen = SelectObject(
+                dc, (index / line_step) % 5 == 0 ? major_pen : minor_pen);
+            Polyline(dc, points.data(), static_cast<int>(points.size()));
+            SelectObject(dc, old_pen);
+        }
+        DeleteObject(minor_pen);
+        DeleteObject(major_pen);
     }
 
     void update_model_metrics() {
@@ -957,12 +1287,14 @@ private:
                       L"3D：左键环视｜右/中键平移｜滚轮缩放｜WASD/方向键漫游｜Q/E升降｜+/-垂直夸张｜Home复位",
                       -1, &help, DT_LEFT | DT_TOP | DT_SINGLELINE);
         } else {
-            draw_mesh(dc);
+            draw_grid(dc);
+            if (show_tin_) draw_mesh(dc);
             draw_triangle_set(dc, removed_triangles_, RGB(245, 68, 70), 2);
             draw_segment_set(dc, boundary_edges_, RGB(255, 210, 50), 3);
             draw_triangle_set(dc, added_triangles_, RGB(60, 220, 100), 2);
             draw_segment_set(dc, added_edges_, RGB(50, 255, 130), 3);
             draw_highlight(dc);
+            draw_contours(dc);
             draw_box_zoom(dc);
         }
         RestoreDC(dc, saved);
@@ -991,6 +1323,10 @@ private:
                     view_mode_ == ViewMode::Terrain3D ? 1 : 3)
              << (view_mode_ == ViewMode::Terrain3D ? z_exaggeration_ : last_query_ms_)
              << (view_mode_ == ViewMode::Terrain3D ? L"" : L" ms")
+             << L" | 图层:"
+             << (show_tin_ ? L"T" : L"-")
+             << (show_grid_ && grid_ ? L"G" : L"-")
+             << (show_contours_ && contours_ ? L"C" : L"-")
              << L" | "
              << action_text_;
         DrawTextW(dc, text.str().c_str(), -1, &status,
@@ -1037,6 +1373,9 @@ private:
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
         if (status == DT_OK) {
+            show_tin_ = true;
+            update_layer_menu();
+            clear_derived_layers();
             clear_overlays();
             reset_view();
             invalidate_mesh_cache();
@@ -1084,6 +1423,9 @@ private:
                                 : dt_load_mesh_text(mesh_, utf8.c_str(), nullptr);
         set_wait_cursor(false);
         if (status == DT_OK) {
+            show_tin_ = true;
+            update_layer_menu();
+            clear_derived_layers();
             clear_overlays();
             reset_view();
             action_text_ = L"已加载：" + file;
@@ -1094,6 +1436,302 @@ private:
         }
     }
 
+    void enter_2d_view() {
+        if (view_mode_ == ViewMode::Map2D) return;
+        view_mode_ = ViewMode::Map2D;
+        SetWindowTextW(view_button_, L"切换3D");
+        EnableWindow(exaggeration_button_, FALSE);
+        end_drag3d();
+    }
+
+    static double nice_interval(double range) {
+        if (!(range > 0.0) || !std::isfinite(range)) return 1.0;
+        const double raw = range / 12.0;
+        const double magnitude = std::pow(10.0, std::floor(std::log10(raw)));
+        const double normalized = raw / magnitude;
+        const double factor = normalized <= 1.0 ? 1.0 :
+                              normalized <= 2.0 ? 2.0 :
+                              normalized <= 5.0 ? 5.0 : 10.0;
+        return factor * magnitude;
+    }
+
+    bool tin_elevation_range(double& zmin, double& zmax) {
+        dt_statistics stats{};
+        if (dt_get_statistics(mesh_, &stats) != DT_OK || stats.dimension != 2) {
+            action_text_ = L"当前没有可生成等高线的二维 TIN";
+            return false;
+        }
+        show_tin_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        cache_valid_ = false;
+        ensure_cache();
+        if (triangles_.empty()) return false;
+        zmin = std::numeric_limits<double>::max();
+        zmax = std::numeric_limits<double>::lowest();
+        for (const auto& triangle : triangles_)
+            for (const auto& vertex : triangle.vertex) {
+                zmin = std::min(zmin, vertex.point.z);
+                zmax = std::max(zmax, vertex.point.z);
+            }
+        return zmax >= zmin;
+    }
+
+    void convert_tin_to_grid() {
+        dt_statistics stats{};
+        if (dt_get_statistics(mesh_, &stats) != DT_OK || stats.dimension != 2) {
+            action_text_ = L"TIN→GRID 失败：当前没有二维 TIN";
+            return;
+        }
+        const double x_range = stats.bounds.xmax - stats.bounds.xmin;
+        const double y_range = stats.bounds.ymax - stats.bounds.ymin;
+        if (!(x_range > 0.0) || !(y_range > 0.0)) {
+            action_text_ = L"TIN→GRID 失败：TIN 范围无效";
+            return;
+        }
+        dt_tin_to_grid_options options{};
+        options.struct_size = sizeof(options);
+        if (x_range >= y_range) {
+            options.width = 401;
+            options.height = std::max<uint64_t>(2, static_cast<uint64_t>(
+                std::llround(y_range / x_range * 400.0)) + 1);
+        } else {
+            options.height = 401;
+            options.width = std::max<uint64_t>(2, static_cast<uint64_t>(
+                std::llround(x_range / y_range * 400.0)) + 1);
+        }
+        options.geo_transform[0] = stats.bounds.xmin;
+        options.geo_transform[1] = x_range / static_cast<double>(options.width - 1);
+        options.geo_transform[3] = stats.bounds.ymin;
+        options.geo_transform[5] = y_range / static_cast<double>(options.height - 1);
+        options.nodata_value = -9999.0;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_grid_from_tin(mesh_, &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"TIN→GRID 失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        destroy_contour_layer();
+        grid_ = output;
+        show_grid_ = true;
+        update_layer_menu();
+        refresh_grid_cache();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"TIN→GRID 完成：" << grid_info_.width << L"×"
+             << grid_info_.height << L"，有效节点 "
+             << grid_info_.valid_value_count << L"，耗时 "
+             << std::fixed << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
+    void convert_grid_to_tin() {
+        if (!grid_) {
+            action_text_ = L"GRID→TIN 失败：请先生成或导入 GRID";
+            return;
+        }
+        dt_grid_to_tin_options options{};
+        options.struct_size = sizeof(options);
+        options.flags = DT_GRID_TO_TIN_ALLOW_NODATA_BRIDGING;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_tin_from_grid(grid_, &options, mesh_);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"GRID→TIN 失败：" + last_error_text();
+            return;
+        }
+        destroy_contour_layer();
+        clear_overlays();
+        show_tin_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        dt_statistics stats{};
+        dt_get_statistics(mesh_, &stats);
+        const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"GRID→TIN 完成：" << stats.vertex_count << L" 顶点，"
+             << stats.finite_triangle_count << L" 面，耗时 "
+             << std::fixed << std::setprecision(1) << ms
+             << L" ms（已允许跨 NoData，孔洞需 CDT）";
+        action_text_ = text.str();
+    }
+
+    void generate_contours(bool from_grid) {
+        double zmin = 0.0;
+        double zmax = 0.0;
+        if (from_grid) {
+            if (!grid_) {
+                action_text_ = L"生成等高线失败：请先生成或导入 GRID";
+                return;
+            }
+            if (grid_values_.empty() && !refresh_grid_cache()) {
+                action_text_ = L"读取 GRID 失败：" + last_error_text();
+                return;
+            }
+            if (grid_values_.empty()) {
+                action_text_ = L"GRID 超过演示程序 400 万节点缓存上限，未生成等高线";
+                return;
+            }
+            zmin = grid_zmin_;
+            zmax = grid_zmax_;
+        } else if (!tin_elevation_range(zmin, zmax)) {
+            return;
+        }
+        const double interval = nice_interval(zmax - zmin);
+        dt_contour_options options{};
+        options.struct_size = sizeof(options);
+        options.interval = interval;
+        options.base = std::floor(zmin / interval) * interval;
+        dt_contour_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = from_grid
+            ? dt_contours_from_grid(grid_, &options, &output)
+            : dt_contours_from_tin(mesh_, &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"生成等高线失败：" + last_error_text();
+            return;
+        }
+        destroy_contour_layer();
+        contours_ = output;
+        contour_info_ = {};
+        contour_info_.struct_size = sizeof(contour_info_);
+        dt_contours_get_info(contours_, &contour_info_);
+        show_contours_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << (from_grid ? L"GRID" : L"TIN") << L" 等高线完成：间隔 "
+             << std::setprecision(8) << interval << L"，"
+             << contour_info_.line_count << L" 条，"
+             << contour_info_.vertex_count << L" 点，耗时 "
+             << std::fixed << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
+    void import_grid_file() {
+        const auto file = choose_file(false, L"terrain.dgrid",
+            L"DGRID 规则网格 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dgrid");
+        if (file.empty()) return;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        const dt_status status = dt_grid_load_text(
+            wide_to_utf8(file.c_str()).c_str(), &output);
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"GRID 导入失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        grid_ = output;
+        show_grid_ = true;
+        update_layer_menu();
+        refresh_grid_cache();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        std::wostringstream text;
+        text << L"已导入 GRID：" << grid_info_.width << L"×"
+             << grid_info_.height << L"，有效节点 "
+             << grid_info_.valid_value_count;
+        if (grid_values_.empty()) text << L"（超过 400 万节点，仅保留数据层）";
+        action_text_ = text.str();
+    }
+
+    void export_grid_file() {
+        if (!grid_) {
+            action_text_ = L"没有可导出的 GRID";
+            return;
+        }
+        const auto file = choose_file(true, L"terrain.dgrid",
+            L"DGRID 规则网格 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dgrid");
+        if (file.empty()) return;
+        const dt_status status = dt_grid_save_text(
+            grid_, wide_to_utf8(file.c_str()).c_str());
+        action_text_ = status == DT_OK ? L"已导出 GRID：" + file
+                                       : L"GRID 导出失败：" + last_error_text();
+    }
+
+    void import_contour_file() {
+        const auto file = choose_file(false, L"terrain.dcontour",
+            L"DCONTOUR 等高线 (*.dcontour;*.txt)\0*.dcontour;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dcontour");
+        if (file.empty()) return;
+        dt_contour_handle output = nullptr;
+        set_wait_cursor(true);
+        const dt_status status = dt_contours_load_text(
+            wide_to_utf8(file.c_str()).c_str(), &output);
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"等高线导入失败：" + last_error_text();
+            return;
+        }
+        destroy_contour_layer();
+        contours_ = output;
+        contour_info_ = {};
+        contour_info_.struct_size = sizeof(contour_info_);
+        dt_contours_get_info(contours_, &contour_info_);
+        show_contours_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        std::wostringstream text;
+        text << L"已导入等高线：" << contour_info_.line_count << L" 条，"
+             << contour_info_.vertex_count << L" 点";
+        action_text_ = text.str();
+    }
+
+    void export_contour_file() {
+        if (!contours_) {
+            action_text_ = L"没有可导出的等高线";
+            return;
+        }
+        const auto file = choose_file(true, L"terrain.dcontour",
+            L"DCONTOUR 等高线 (*.dcontour;*.txt)\0*.dcontour;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dcontour");
+        if (file.empty()) return;
+        const dt_status status = dt_contours_save_text(
+            contours_, wide_to_utf8(file.c_str()).c_str());
+        action_text_ = status == DT_OK ? L"已导出等高线：" + file
+                                       : L"等高线导出失败：" + last_error_text();
+    }
+
+    void toggle_layer(int id) {
+        enter_2d_view();
+        if (id == ID_LAYER_TIN) show_tin_ = !show_tin_;
+        else if (id == ID_LAYER_GRID) {
+            if (!grid_) action_text_ = L"当前没有 GRID 图层";
+            else show_grid_ = !show_grid_;
+        } else if (id == ID_LAYER_CONTOURS) {
+            if (!contours_) action_text_ = L"当前没有等高线图层";
+            else show_contours_ = !show_contours_;
+        }
+        update_layer_menu();
+        reset_view();
+        invalidate_mesh_cache();
+    }
+
     void on_command(int id) {
         switch (id) {
         case ID_GENERATE_100K: generate(100000); break;
@@ -1101,12 +1739,15 @@ private:
         case ID_CLEAR: clear_mesh(); break;
         case ID_MODE_INSERT:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
+            show_tin_ = true; update_layer_menu();
             mode_ = Mode::Insert; action_text_ = L"单击网格位置插入地形点"; break;
         case ID_MODE_DELETE:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
+            show_tin_ = true; update_layer_menu();
             mode_ = Mode::Delete; action_text_ = L"单击位置删除最近顶点"; break;
         case ID_MODE_QUERY:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
+            show_tin_ = true; update_layer_menu();
             mode_ = Mode::Query; action_text_ = L"单击查询最近顶点和覆盖三角形"; break;
         case ID_MODE_ZOOM_BOX:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
@@ -1129,6 +1770,17 @@ private:
         case ID_LOAD: load_file(); break;
         case ID_VIEW_3D: toggle_view_mode(); break;
         case ID_Z_EXAGGERATION: change_exaggeration(1); break;
+        case ID_TIN_TO_GRID: convert_tin_to_grid(); break;
+        case ID_GRID_TO_TIN: convert_grid_to_tin(); break;
+        case ID_CONTOURS_FROM_TIN: generate_contours(false); break;
+        case ID_CONTOURS_FROM_GRID: generate_contours(true); break;
+        case ID_IMPORT_GRID: import_grid_file(); break;
+        case ID_EXPORT_GRID: export_grid_file(); break;
+        case ID_IMPORT_CONTOURS: import_contour_file(); break;
+        case ID_EXPORT_CONTOURS: export_contour_file(); break;
+        case ID_LAYER_TIN:
+        case ID_LAYER_GRID:
+        case ID_LAYER_CONTOURS: toggle_layer(id); break;
         default: break;
         }
         InvalidateRect(hwnd_, nullptr, FALSE);

@@ -175,6 +175,53 @@ void test_cdt_api() {
     assert(after_failed_add.constraint_count == stats.constraint_count);
     assert(after_failed_add.generation == stats.generation);
 
+    const dt_point3 moved_breakline[] = {
+        {0, 3, 109}, {1, 2.5, 109.5}, {2, 3, 113}};
+    dt_edit_result cdt_effect = nullptr;
+    require_ok(dt_cdt_update_constraint(
+                   cdt, breakline_id, 0, moved_breakline, 3, &cdt_effect),
+               "update breakline constraint");
+    dt_edit_result_view cdt_effect_view{};
+    require_ok(dt_edit_result_get_view(cdt_effect, &cdt_effect_view),
+               "CDT edit effect view");
+    assert(cdt_effect_view.removed_triangle_count > 0);
+    assert(cdt_effect_view.added_triangle_count > 0);
+    assert(cdt_effect_view.boundary_edge_count > 0);
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics after constraint update");
+    assert(stats.constraint_count == 3);
+    assert(stats.generation == after_failed_add.generation + 1);
+    assert(cdt_effect_view.generation == stats.generation);
+    dt_release_edit_result(cdt_effect);
+
+    required_points = 0;
+    require_ok(dt_cdt_copy_constraint_points(cdt, breakline_id, nullptr, 0,
+                                             &required_points),
+               "updated breakline point count");
+    assert(required_points == 3);
+    copied.resize(required_points);
+    require_ok(dt_cdt_copy_constraint_points(cdt, breakline_id, copied.data(),
+                                             copied.size(), nullptr),
+               "copy updated breakline");
+    assert(close(copied[1].x, 1.0) && close(copied[1].y, 2.5));
+
+    const dt_point3 rejected_breakline[] = {
+        {1, 2.5, 109.5}, {5, 2.5, 117.5}};
+    const uint64_t generation_before_rejected_update = stats.generation;
+    assert(dt_cdt_update_constraint(cdt, breakline_id, 0,
+                                    rejected_breakline, 2, nullptr) ==
+           DT_E_UNSUPPORTED);
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics after rejected constraint update");
+    assert(stats.generation == generation_before_rejected_update);
+    copied.resize(3);
+    require_ok(dt_cdt_copy_constraint_points(cdt, breakline_id, copied.data(),
+                                             copied.size(), nullptr),
+               "constraint unchanged after rejected update");
+    assert(close(copied[1].x, 1.0) && close(copied[1].y, 2.5));
+    assert(dt_cdt_update_constraint(cdt, 999999, 0, moved_breakline, 3,
+                                    nullptr) == DT_E_NOT_FOUND);
+
     require_ok(dt_cdt_set_crs_wkt(cdt, "LOCAL_CS[\"CDT test\"]"),
                "set CDT CRS");
     const char* file_name = "dterrain_test_roundtrip.dcdt";
@@ -464,7 +511,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 8 && patch == 0);
+    assert(major == 0 && minor == 9 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");

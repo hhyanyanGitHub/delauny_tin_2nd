@@ -1123,6 +1123,23 @@ dt_status DT_CALL dt_cdt_add_constraint(
     });
 }
 
+dt_status DT_CALL dt_cdt_update_constraint(
+    dt_cdt_handle cdt, dt_constraint_id constraint_id, uint32_t flags,
+    const dt_point3* points, uint64_t point_count,
+    dt_edit_result* output_effect) {
+    if (output_effect) *output_effect = nullptr;
+    return guarded([&] {
+        auto data = require_cdt(cdt).update_constraint(
+            constraint_id, flags, points, point_count,
+            output_effect != nullptr);
+        if (output_effect) {
+            auto result = std::make_unique<dt_edit_result_t>();
+            result->data = std::move(*data);
+            *output_effect = result.release();
+        }
+    });
+}
+
 dt_status DT_CALL dt_cdt_remove_constraint(dt_cdt_handle cdt,
                                             dt_constraint_id constraint_id) {
     return guarded(

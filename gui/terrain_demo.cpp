@@ -66,6 +66,7 @@ enum CommandId {
     ID_CDT_DRAW_HOLE,
     ID_CDT_FINISH,
     ID_CDT_CANCEL,
+    ID_CDT_MOVE_VERTEX,
     ID_CDT_DELETE
 };
 
@@ -77,6 +78,7 @@ enum class Mode {
     CdtBreakline,
     CdtOuter,
     CdtHole,
+    CdtMoveVertex,
     CdtDelete
 };
 enum class ViewMode { Map2D, Terrain3D };
@@ -231,6 +233,13 @@ public:
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return 0;
             }
+            if (wparam == VK_ESCAPE && mode_ == Mode::CdtMoveVertex &&
+                cdt_move_constraint_id_ != 0) {
+                reset_cdt_move_selection();
+                action_text_ = L"已取消约束顶点选择";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (wparam == VK_ESCAPE && box_zooming_) {
                 cancel_box_zoom();
                 action_text_ = L"已取消框选放大";
@@ -267,6 +276,8 @@ private:
     std::vector<ConstraintLine> constraint_lines_;
     std::vector<dt_point3> cdt_draft_;
     int32_t cdt_draft_kind_ = DT_CONSTRAINT_BREAKLINE;
+    dt_constraint_id cdt_move_constraint_id_ = 0;
+    size_t cdt_move_point_index_ = std::numeric_limits<size_t>::max();
     dt_cdt_statistics cdt_info_{};
     std::vector<dt_triangle3> removed_triangles_;
     std::vector<dt_triangle3> added_triangles_;
@@ -397,6 +408,8 @@ private:
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_CANCEL,
                     L"取消当前约束（Esc）");
         AppendMenuW(cdt_edit_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_MOVE_VERTEX,
+                    L"移动约束顶点（两次单击）");
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DELETE,
                     L"选择删除约束");
 
@@ -473,6 +486,7 @@ private:
         cdt_triangles_.clear();
         constraint_lines_.clear();
         cdt_draft_.clear();
+        reset_cdt_move_selection();
         cdt_info_ = {};
     }
 
@@ -604,18 +618,37 @@ private:
         if (!effect) return;
         dt_edit_result_view view{};
         if (dt_edit_result_get_view(effect, &view) != DT_OK) return;
-        if (view.removed_triangle_count)
-            removed_triangles_.assign(view.removed_triangles,
-                                      view.removed_triangles + view.removed_triangle_count);
-        if (view.added_triangle_count)
-            added_triangles_.assign(view.added_triangles,
-                                    view.added_triangles + view.added_triangle_count);
-        if (view.boundary_edge_count)
-            boundary_edges_.assign(view.boundary_edges,
-                                   view.boundary_edges + view.boundary_edge_count);
-        if (view.added_edge_count)
-            added_edges_.assign(view.added_edges,
-                                view.added_edges + view.added_edge_count);
+        auto copy_triangles = [](const dt_triangle3* source, uint64_t count,
+                                 std::vector<dt_triangle3>& destination) {
+            if (!source || count == 0) return;
+            const uint64_t step = std::max<uint64_t>(
+                1, (count + kMaxDrawTriangles - 1) / kMaxDrawTriangles);
+            destination.reserve(static_cast<size_t>((count + step - 1) / step));
+            for (uint64_t i = 0; i < count; i += step)
+                destination.push_back(source[i]);
+        };
+        auto copy_segments = [](const dt_segment3* source, uint64_t count,
+                                std::vector<dt_segment3>& destination) {
+            if (!source || count == 0) return;
+            constexpr uint64_t kMaxDrawSegments = kMaxDrawTriangles * 2;
+            const uint64_t step = std::max<uint64_t>(
+                1, (count + kMaxDrawSegments - 1) / kMaxDrawSegments);
+            destination.reserve(static_cast<size_t>((count + step - 1) / step));
+            for (uint64_t i = 0; i < count; i += step)
+                destination.push_back(source[i]);
+        };
+        copy_triangles(view.removed_triangles, view.removed_triangle_count,
+                       removed_triangles_);
+        copy_triangles(view.added_triangles, view.added_triangle_count,
+                       added_triangles_);
+        copy_segments(view.boundary_edges, view.boundary_edge_count,
+                      boundary_edges_);
+        copy_segments(view.added_edges, view.added_edge_count, added_edges_);
+    }
+
+    void reset_cdt_move_selection() {
+        cdt_move_constraint_id_ = 0;
+        cdt_move_point_index_ = std::numeric_limits<size_t>::max();
     }
 
     bool is_cdt_draw_mode() const {
@@ -628,6 +661,7 @@ private:
         cancel_box_zoom();
         clear_overlays();
         cdt_draft_.clear();
+        reset_cdt_move_selection();
         cdt_draft_kind_ = kind;
         mode_ = mode;
         show_cdt_ = true;
@@ -729,6 +763,12 @@ private:
     }
 
     void cancel_cdt_draft() {
+        if (mode_ == Mode::CdtMoveVertex &&
+            cdt_move_constraint_id_ != 0) {
+            reset_cdt_move_selection();
+            action_text_ = L"已取消约束顶点选择";
+            return;
+        }
         cdt_draft_.clear();
         action_text_ = L"已取消当前约束草图";
     }
@@ -753,6 +793,91 @@ private:
         const double py = static_cast<double>(point.y) -
                           (static_cast<double>(a.y) + t * dy);
         return px * px + py * py;
+    }
+
+    void move_cdt_vertex_at(int x, int y, const dt_point3& world) {
+        if (constraint_lines_.empty()) {
+            action_text_ = L"当前没有可编辑的约束顶点";
+            return;
+        }
+        constexpr double kPickRadius = 14.0;
+        if (cdt_move_constraint_id_ == 0) {
+            const POINT clicked{x, y};
+            double best_distance = std::numeric_limits<double>::infinity();
+            for (const auto& line : constraint_lines_) {
+                for (size_t index = 0; index < line.points.size(); ++index) {
+                    const POINT point = world_to_screen(line.points[index]);
+                    const double dx = static_cast<double>(clicked.x - point.x);
+                    const double dy = static_cast<double>(clicked.y - point.y);
+                    const double distance = dx * dx + dy * dy;
+                    if (distance < best_distance) {
+                        best_distance = distance;
+                        cdt_move_constraint_id_ = line.id;
+                        cdt_move_point_index_ = index;
+                    }
+                }
+            }
+            if (best_distance > kPickRadius * kPickRadius) {
+                reset_cdt_move_selection();
+                action_text_ = L"未选中约束顶点，请在彩色约束折点附近单击";
+                return;
+            }
+            std::wostringstream text;
+            text << L"已选择约束 ID=" << cdt_move_constraint_id_
+                 << L" 的第 " << (cdt_move_point_index_ + 1)
+                 << L" 个点；单击新位置，Esc 取消";
+            action_text_ = text.str();
+            return;
+        }
+
+        const auto line = std::find_if(
+            constraint_lines_.begin(), constraint_lines_.end(),
+            [&](const ConstraintLine& item) {
+                return item.id == cdt_move_constraint_id_;
+            });
+        if (line == constraint_lines_.end() ||
+            cdt_move_point_index_ >= line->points.size()) {
+            reset_cdt_move_selection();
+            action_text_ = L"所选约束已变化，请重新选择顶点";
+            return;
+        }
+        auto points = line->points;
+        points[cdt_move_point_index_] =
+            {world.x, world.y, constraint_point_z(world)};
+        const dt_constraint_id moved_id = line->id;
+        const size_t moved_index = cdt_move_point_index_;
+        dt_edit_result effect = nullptr;
+        set_wait_cursor(true);
+        const dt_status status = dt_cdt_update_constraint(
+            cdt_, line->id, line->flags, points.data(), points.size(), &effect);
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"移动约束顶点失败：" + last_error_text() +
+                           L"；可重新选择位置或按 Esc 取消";
+            dt_release_edit_result(effect);
+            return;
+        }
+        uint64_t removed_count = 0;
+        uint64_t added_count = 0;
+        dt_edit_result_view effect_view{};
+        if (dt_edit_result_get_view(effect, &effect_view) == DT_OK) {
+            removed_count = effect_view.removed_triangle_count;
+            added_count = effect_view.added_triangle_count;
+        }
+        copy_effect(effect);
+        dt_release_edit_result(effect);
+        reset_cdt_move_selection();
+        destroy_grid_layer();
+        destroy_contour_layer();
+        refresh_cdt_constraints();
+        show_cdt_ = true;
+        update_layer_menu();
+        invalidate_mesh_cache();
+        std::wostringstream text;
+        text << L"已移动约束 ID=" << moved_id << L" 的第 "
+             << (moved_index + 1) << L" 个点；影响旧面 " << removed_count
+             << L"，新面 " << added_count << L"；可继续选择下一顶点";
+        action_text_ = text.str();
     }
 
     void delete_cdt_constraint_at(int x, int y) {
@@ -805,6 +930,8 @@ private:
         const auto begin = std::chrono::steady_clock::now();
         if (is_cdt_draw_mode()) {
             append_cdt_draft_point(world);
+        } else if (mode_ == Mode::CdtMoveVertex) {
+            move_cdt_vertex_at(x, y, world);
         } else if (mode_ == Mode::CdtDelete) {
             delete_cdt_constraint_at(x, y);
         } else if (mode_ == Mode::Insert) {
@@ -1347,6 +1474,30 @@ private:
             Polyline(dc, points.data(), static_cast<int>(points.size()));
             SelectObject(dc, old_pen);
         }
+        if (mode_ == Mode::CdtMoveVertex) {
+            HPEN point_pen = CreatePen(PS_SOLID, 1, RGB(28, 32, 38));
+            HBRUSH point_brush = CreateSolidBrush(RGB(245, 245, 245));
+            HBRUSH selected_brush = CreateSolidBrush(RGB(255, 238, 70));
+            const auto old_pen = SelectObject(dc, point_pen);
+            const auto old_brush = SelectObject(dc, point_brush);
+            for (const auto& line : constraint_lines_) {
+                for (size_t index = 0; index < line.points.size(); ++index) {
+                    const POINT point = world_to_screen(line.points[index]);
+                    const bool selected =
+                        line.id == cdt_move_constraint_id_ &&
+                        index == cdt_move_point_index_;
+                    SelectObject(dc, selected ? selected_brush : point_brush);
+                    const int radius = selected ? 7 : 3;
+                    Ellipse(dc, point.x - radius, point.y - radius,
+                            point.x + radius + 1, point.y + radius + 1);
+                }
+            }
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            DeleteObject(selected_brush);
+            DeleteObject(point_brush);
+            DeleteObject(point_pen);
+        }
         if (!cdt_draft_.empty()) {
             std::vector<POINT> points;
             points.reserve(cdt_draft_.size() + 1);
@@ -1693,6 +1844,7 @@ private:
                               mode_ == Mode::CdtBreakline ? L"绘制断裂线" :
                               mode_ == Mode::CdtOuter ? L"绘制外边界" :
                               mode_ == Mode::CdtHole ? L"绘制孔洞" :
+                              mode_ == Mode::CdtMoveVertex ? L"移动约束顶点" :
                               mode_ == Mode::CdtDelete ? L"删除约束" : L"查询";
         std::wostringstream text;
         text << L"  视图: "
@@ -2363,21 +2515,25 @@ private:
         case ID_MODE_INSERT:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             cdt_draft_.clear();
+            reset_cdt_move_selection();
             show_tin_ = true; update_layer_menu();
             mode_ = Mode::Insert; action_text_ = L"单击网格位置插入地形点"; break;
         case ID_MODE_DELETE:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             cdt_draft_.clear();
+            reset_cdt_move_selection();
             show_tin_ = true; update_layer_menu();
             mode_ = Mode::Delete; action_text_ = L"单击位置删除最近顶点"; break;
         case ID_MODE_QUERY:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             cdt_draft_.clear();
+            reset_cdt_move_selection();
             show_tin_ = true; update_layer_menu();
             mode_ = Mode::Query; action_text_ = L"单击查询最近顶点和覆盖三角形"; break;
         case ID_MODE_ZOOM_BOX:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
             cdt_draft_.clear();
+            reset_cdt_move_selection();
             cancel_box_zoom();
             mode_ = Mode::ZoomBox;
             action_text_ = L"按住左键拖出矩形，松开后放大并适屏";
@@ -2424,9 +2580,20 @@ private:
             break;
         case ID_CDT_FINISH: finish_cdt_draft(); break;
         case ID_CDT_CANCEL: cancel_cdt_draft(); break;
+        case ID_CDT_MOVE_VERTEX:
+            enter_2d_view();
+            cdt_draft_.clear();
+            reset_cdt_move_selection();
+            clear_overlays();
+            mode_ = Mode::CdtMoveVertex;
+            show_cdt_ = true;
+            update_layer_menu();
+            action_text_ = L"先单击一个约束折点，再单击新位置；Esc 取消选择";
+            break;
         case ID_CDT_DELETE:
             enter_2d_view();
             cdt_draft_.clear();
+            reset_cdt_move_selection();
             mode_ = Mode::CdtDelete;
             show_cdt_ = true;
             update_layer_menu();

@@ -1,6 +1,6 @@
 # 约束 Delaunay API
 
-本文说明 dterrain 0.8 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
+本文说明 dterrain 0.9 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
 改变普通 `dt_handle`、旧 12 接口或 TIN/GRID/等高线 API 的行为。
 
 ## 数据模型
@@ -30,6 +30,7 @@ dt_cdt_build_from_tin(cdt, tin);
 dt_constraint_id id = 0;
 dt_cdt_add_constraint(cdt, DT_CONSTRAINT_BREAKLINE, 0,
                       ridge, ridge_count, &id);
+dt_cdt_update_constraint(cdt, id, 0, moved_ridge, moved_count, nullptr);
 dt_cdt_remove_constraint(cdt, id);
 dt_cdt_destroy(cdt);
 ```
@@ -41,7 +42,16 @@ dt_cdt_destroy(cdt);
 当前交叉约束必须预先在交点处分段，并把交点作为共享顶点传入。未分段的交叉返回
 `DT_E_UNSUPPORTED`，原句柄保持不变。
 
-v0.8 仍以正确性为基线：添加或删除约束会在候选状态中完整重建 CDT，成功后原子替换。
+`dt_cdt_update_constraint()` 原子替换指定约束的点序列和闭合标志，约束类型及
+`dt_constraint_id` 保持不变。更新失败时约束点、generation 和全部拓扑均不改变。
+边界仍被强制闭合；断裂线可通过 `DT_CONSTRAINT_CLOSED` 在开闭状态间切换。
+
+调用方可通过 `output_effect` 请求普通 `dt_edit_result`。结果包含更新前被移除的域内
+三角形、更新后新增的域内三角形、删除区域边界以及新旧边，并使用更新后的 generation。
+结果必须用 `dt_release_edit_result()` 释放。传入 `NULL` 时不会执行影响差分，可减少
+大网更新的额外时间和内存。
+
+v0.9 仍以正确性为基线：添加、更新或删除约束会在候选状态中完整重建 CDT，成功后原子替换。
 这适合研究、文件交换和中等规模约束编辑；百万级实时局部约束编辑将在后续版本
 增加。
 
@@ -104,5 +114,6 @@ CRS 仅作为 UTF-8 WKT 元数据保存，不参与重投影。使用
 |---|---|
 | `dt_cdt_handle` | `dt_cdt_destroy()` |
 | `dt_cdt_query_result` | `dt_cdt_release_query_result()` |
+| `dt_edit_result`（约束更新可选结果） | `dt_release_edit_result()` |
 
 约束点通过调用方缓冲区复制，不存在跨 DLL 的释放责任。

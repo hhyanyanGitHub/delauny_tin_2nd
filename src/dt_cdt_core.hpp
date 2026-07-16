@@ -4,10 +4,10 @@
 #include "dt_cdt_api.h"
 #include "dt_core.hpp"
 
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string>
-#include <functional>
 #include <vector>
 
 namespace dt {
@@ -36,6 +36,9 @@ public:
     void build_from_tin(std::vector<dt_point3> points, std::string crs_wkt);
     dt_constraint_id add_constraint(int32_t kind, uint32_t flags,
                                     const dt_point3* points, uint64_t count);
+    std::unique_ptr<EditData> update_constraint(
+        dt_constraint_id id, uint32_t flags, const dt_point3* points,
+        uint64_t count, bool capture_effect);
     void remove_constraint(dt_constraint_id id);
 
     dt_cdt_statistics statistics() const;
@@ -62,6 +65,8 @@ private:
         const std::vector<CdtConstraint>& constraints,
         dt_constraint_id next_constraint_id, uint64_t generation,
         const std::string& crs_wkt);
+    static std::unique_ptr<EditData> make_edit_data(
+        const State& before, const State& after);
 };
 
 } // namespace dt

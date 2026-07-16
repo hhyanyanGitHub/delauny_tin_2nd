@@ -9,6 +9,7 @@
 #include <CGAL/number_utils.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <utility>
 
 namespace dt {
@@ -46,6 +48,9 @@ using CdtFaceHandle = Cdt::Face_handle;
 using CdtVertexHandle = Cdt::Vertex_handle;
 using CdtEdge = Cdt::Edge;
 using BarrierKey = std::pair<dt_vertex_id, dt_vertex_id>;
+using PointKey = std::tuple<double, double, double>;
+using TriangleKey = std::array<PointKey, 3>;
+using GeometryEdgeKey = std::pair<PointKey, PointKey>;
 
 bool finite_value(double value) {
     return std::isfinite(value) != 0;
@@ -96,6 +101,29 @@ dt_vertex3 to_vertex(CdtVertexHandle vertex) {
 dt_triangle3 to_triangle(CdtFaceHandle face) {
     return {{to_vertex(face->vertex(0)), to_vertex(face->vertex(1)),
              to_vertex(face->vertex(2))}};
+}
+
+PointKey point_key(const dt_point3& point) {
+    return {point.x, point.y, point.z};
+}
+
+TriangleKey triangle_key(const dt_triangle3& triangle) {
+    TriangleKey key{point_key(triangle.vertex[0].point),
+                    point_key(triangle.vertex[1].point),
+                    point_key(triangle.vertex[2].point)};
+    std::sort(key.begin(), key.end());
+    return key;
+}
+
+GeometryEdgeKey geometry_edge_key(const dt_segment3& segment) {
+    auto a = point_key(segment.vertex[0].point);
+    auto b = point_key(segment.vertex[1].point);
+    if (b < a) std::swap(a, b);
+    return {a, b};
+}
+
+dt_segment3 triangle_edge(const dt_triangle3& triangle, size_t index) {
+    return {{triangle.vertex[index], triangle.vertex[(index + 1) % 3]}};
 }
 
 double interpolate_edge_z(CdtVertexHandle a, CdtVertexHandle b,
@@ -365,6 +393,59 @@ std::unique_ptr<CdtContext::State> CdtContext::make_state(
     return next;
 }
 
+std::unique_ptr<EditData> CdtContext::make_edit_data(
+    const State& before, const State& after) {
+    auto result = std::make_unique<EditData>();
+    result->generation = after.generation;
+
+    std::map<TriangleKey, dt_triangle3> old_triangles;
+    std::map<TriangleKey, dt_triangle3> new_triangles;
+    for (auto face = before.triangulation.finite_faces_begin();
+         face != before.triangulation.finite_faces_end(); ++face) {
+        if (!domain_face(before, face)) continue;
+        const auto triangle = to_triangle(face);
+        old_triangles.emplace(triangle_key(triangle), triangle);
+    }
+    for (auto face = after.triangulation.finite_faces_begin();
+         face != after.triangulation.finite_faces_end(); ++face) {
+        if (!domain_face(after, face)) continue;
+        const auto triangle = to_triangle(face);
+        new_triangles.emplace(triangle_key(triangle), triangle);
+    }
+    for (const auto& item : old_triangles) {
+        if (new_triangles.count(item.first) == 0)
+            result->removed_triangles.push_back(item.second);
+    }
+    for (const auto& item : new_triangles) {
+        if (old_triangles.count(item.first) == 0)
+            result->added_triangles.push_back(item.second);
+    }
+
+    auto collect_edges = [](const std::vector<dt_triangle3>& triangles,
+                            std::vector<dt_segment3>& edges,
+                            std::vector<dt_segment3>* boundary) {
+        std::map<GeometryEdgeKey, std::pair<dt_segment3, uint64_t>> unique;
+        for (const auto& triangle : triangles) {
+            for (size_t edge = 0; edge < 3; ++edge) {
+                const auto segment = triangle_edge(triangle, edge);
+                auto& entry = unique[geometry_edge_key(segment)];
+                if (entry.second == 0) entry.first = segment;
+                ++entry.second;
+            }
+        }
+        edges.reserve(unique.size());
+        for (const auto& item : unique) {
+            edges.push_back(item.second.first);
+            if (boundary && item.second.second == 1)
+                boundary->push_back(item.second.first);
+        }
+    };
+    collect_edges(result->removed_triangles, result->removed_edges,
+                  &result->boundary_edges);
+    collect_edges(result->added_triangles, result->added_edges, nullptr);
+    return result;
+}
+
 void CdtContext::clear() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     state_ = make_state({}, {}, 1, state_->generation + 1, state_->crs_wkt);
@@ -436,6 +517,48 @@ dt_constraint_id CdtContext::add_constraint(int32_t kind, uint32_t flags,
                            state_->generation + 1, state_->crs_wkt);
     state_.swap(next);
     return constraint.id;
+}
+
+std::unique_ptr<EditData> CdtContext::update_constraint(
+    dt_constraint_id id, uint32_t flags, const dt_point3* points,
+    uint64_t count, bool capture_effect) {
+    if (id == 0) throw Exception(DT_E_INVALID_ARGUMENT, "constraint id is zero");
+    if (!points || count == 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "constraint points is empty");
+    }
+    if (count > kMaxLoadConstraintPoints) {
+        throw Exception(DT_E_LIMIT_EXCEEDED, "too many constraint points");
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto constraints = state_->constraints;
+    const auto found = std::find_if(
+        constraints.begin(), constraints.end(),
+        [id](const CdtConstraint& constraint) { return constraint.id == id; });
+    if (found == constraints.end()) {
+        throw Exception(DT_E_NOT_FOUND, "constraint id was not found");
+    }
+
+    found->flags = flags & DT_CONSTRAINT_CLOSED;
+    if (found->kind != DT_CONSTRAINT_BREAKLINE)
+        found->flags |= DT_CONSTRAINT_CLOSED;
+    found->points.assign(points, points + count);
+    if (found->points.size() > 1 &&
+        same_xy(found->points.front(), found->points.back())) {
+        if (!compatible_z(found->points.front().z, found->points.back().z)) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "repeated closing point has inconsistent Z");
+        }
+        found->points.pop_back();
+        found->flags |= DT_CONSTRAINT_CLOSED;
+    }
+
+    auto next = make_state(state_->base_points, constraints,
+                           state_->next_constraint_id, state_->generation + 1,
+                           state_->crs_wkt);
+    auto effect = capture_effect ? make_edit_data(*state_, *next) : nullptr;
+    state_.swap(next);
+    return effect;
 }
 
 void CdtContext::remove_constraint(dt_constraint_id id) {

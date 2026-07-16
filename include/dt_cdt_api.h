@@ -76,6 +76,13 @@ DT_API dt_status DT_CALL dt_cdt_add_constraint(
     dt_cdt_handle cdt, int32_t kind, uint32_t flags,
     const dt_point3* points, uint64_t point_count,
     dt_constraint_id* output_constraint_id);
+/* Atomically replaces one constraint's geometry while preserving its stable
+   id and kind. output_effect is optional; requesting it performs a complete
+   before/after domain diff and returns a normal dt_edit_result handle. */
+DT_API dt_status DT_CALL dt_cdt_update_constraint(
+    dt_cdt_handle cdt, dt_constraint_id constraint_id, uint32_t flags,
+    const dt_point3* points, uint64_t point_count,
+    dt_edit_result* output_effect);
 DT_API dt_status DT_CALL dt_cdt_remove_constraint(
     dt_cdt_handle cdt, dt_constraint_id constraint_id);
 

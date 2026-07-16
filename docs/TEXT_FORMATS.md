@@ -36,7 +36,7 @@ TRIANGLES 2
 - `dt_save_mesh_text()` 使用足以无损往返 `double` 的十进制精度；
 - `dt_load_mesh_text()` 先从顶点重建 Delaunay，再逐面检查索引、重复面、面数和
   Delaunay 拓扑；不匹配时返回 `DT_E_CORRUPTED_DATA`，原三角网保持不变；
-- 当前格式用于普通 Delaunay TIN。后续约束 Delaunay 将通过新格式版本增加约束段。
+- 当前格式用于普通 Delaunay TIN；约束网使用独立 `DCDT 1` 格式。
 
 ## DGRID 规则高程节点文本
 
@@ -72,3 +72,29 @@ END
 
 `LINE` 后依次是等高值、标志和顶点数。标志位 0 表示闭合线；每个顶点保存 XYZ，
 其中 Z 应等于该线的等高值。
+
+## DCDT 约束三角网文本
+
+```text
+DCDT 1
+CRS "LOCAL_CS[\"sample\"]"
+POINTS 4
+0 0 10
+10 0 12
+10 10 15
+0 10 13
+CONSTRAINTS 1
+CONSTRAINT 1 2 1 4
+0 0 10
+10 0 12
+10 10 15
+0 10 13
+END
+```
+
+- `CRS` 使用带转义的双引号字符串，可为空；
+- `POINTS` 保存基础地形 XYZ；
+- `CONSTRAINT` 后依次为约束 ID、类型、标志和点数；类型 1/2/3 分别表示断裂线、
+  外边界、孔洞，标志位 0 表示闭合；
+- 闭合折线不重复保存首点；
+- 加载会重建 CDT、标记奇偶嵌套域并验证约束；失败时原句柄不变。

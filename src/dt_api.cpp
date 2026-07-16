@@ -1,4 +1,6 @@
 #include "dt_core.hpp"
+#include "dt_cdt_api.h"
+#include "dt_cdt_core.hpp"
 #include "dt_gdal_api.h"
 #include "dt_task_api.h"
 #include "dt_terrain_core.hpp"
@@ -37,6 +39,15 @@ struct dt_grid_t {
 
 struct dt_contour_set_t {
     std::shared_ptr<dt::ContourSet> contours;
+};
+
+struct dt_cdt_t {
+    std::shared_ptr<dt::CdtContext> context =
+        std::make_shared<dt::CdtContext>();
+};
+
+struct dt_cdt_query_result_t {
+    dt::CdtQueryData data;
 };
 
 struct dt_task_t {
@@ -92,6 +103,13 @@ dt_status guarded(Function&& function) noexcept {
 dt::Context& require_context(dt_handle handle) {
     if (!handle || !handle->context) {
         throw dt::Exception(DT_E_NOT_INITIALIZED, "invalid context handle");
+    }
+    return *handle->context;
+}
+
+dt::CdtContext& require_cdt(dt_cdt_handle handle) {
+    if (!handle || !handle->context) {
+        throw dt::Exception(DT_E_NOT_INITIALIZED, "invalid CDT handle");
     }
     return *handle->context;
 }
@@ -1057,6 +1075,182 @@ dt_status DT_CALL dt_get_crs_wkt(dt_handle handle, char* buffer,
         if (status != DT_OK) {
             throw dt::Exception(status, "CRS output buffer is too small");
         }
+    });
+}
+
+dt_status DT_CALL dt_cdt_create(const dt_cdt_options* options,
+                                dt_cdt_handle* output_cdt) {
+    if (output_cdt) *output_cdt = nullptr;
+    return guarded([&] {
+        if (!output_cdt) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_cdt is null");
+        }
+        if (options) validate_options(options, "dt_cdt_options");
+        *output_cdt = new dt_cdt_t();
+    });
+}
+
+void DT_CALL dt_cdt_destroy(dt_cdt_handle cdt) {
+    delete cdt;
+}
+
+dt_status DT_CALL dt_cdt_clear(dt_cdt_handle cdt) {
+    return guarded([&] { require_cdt(cdt).clear(); });
+}
+
+dt_status DT_CALL dt_cdt_build(dt_cdt_handle cdt, const dt_point3* points,
+                               uint64_t point_count) {
+    return guarded([&] { require_cdt(cdt).build(points, point_count); });
+}
+
+dt_status DT_CALL dt_cdt_add_constraint(
+    dt_cdt_handle cdt, int32_t kind, uint32_t flags,
+    const dt_point3* points, uint64_t point_count,
+    dt_constraint_id* output_constraint_id) {
+    if (output_constraint_id) *output_constraint_id = 0;
+    return guarded([&] {
+        const auto id =
+            require_cdt(cdt).add_constraint(kind, flags, points, point_count);
+        if (output_constraint_id) *output_constraint_id = id;
+    });
+}
+
+dt_status DT_CALL dt_cdt_remove_constraint(dt_cdt_handle cdt,
+                                            dt_constraint_id constraint_id) {
+    return guarded(
+        [&] { require_cdt(cdt).remove_constraint(constraint_id); });
+}
+
+dt_status DT_CALL dt_cdt_get_statistics(
+    dt_cdt_handle cdt, dt_cdt_statistics* output_statistics) {
+    return guarded([&] {
+        if (!output_statistics) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_statistics is null");
+        }
+        *output_statistics = require_cdt(cdt).statistics();
+    });
+}
+
+dt_status DT_CALL dt_cdt_get_constraint_info(
+    dt_cdt_handle cdt, uint64_t constraint_index,
+    dt_constraint_info* output_info) {
+    return guarded([&] {
+        if (!output_info) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_info is null");
+        }
+        const auto constraint = require_cdt(cdt).constraint_at(constraint_index);
+        dt_constraint_info result{};
+        result.struct_size = sizeof(result);
+        result.flags = constraint.flags;
+        result.id = constraint.id;
+        result.kind = constraint.kind;
+        result.point_count = constraint.points.size();
+        *output_info = result;
+    });
+}
+
+dt_status DT_CALL dt_cdt_copy_constraint_points(
+    dt_cdt_handle cdt, dt_constraint_id constraint_id,
+    dt_point3* output_points, uint64_t point_capacity,
+    uint64_t* required_count) {
+    if (required_count) *required_count = 0;
+    return guarded([&] {
+        const auto constraint = require_cdt(cdt).constraint_by_id(constraint_id);
+        const uint64_t required = constraint.points.size();
+        if (required_count) *required_count = required;
+        if (!output_points) {
+            if (point_capacity != 0) {
+                throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                    "output_points is null");
+            }
+            return;
+        }
+        if (point_capacity < required) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "constraint point buffer is too small");
+        }
+        std::copy(constraint.points.begin(), constraint.points.end(),
+                  output_points);
+    });
+}
+
+dt_status DT_CALL dt_cdt_query_triangles(
+    dt_cdt_handle cdt, const dt_bounds2* bounds,
+    dt_cdt_query_result* output_result) {
+    if (output_result) *output_result = nullptr;
+    return guarded([&] {
+        if (!bounds || !output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "bounds or output_result is null");
+        }
+        auto data = require_cdt(cdt).query(*bounds);
+        auto result = std::make_unique<dt_cdt_query_result_t>();
+        result->data = std::move(*data);
+        *output_result = result.release();
+    });
+}
+
+dt_status DT_CALL dt_cdt_query_result_get_view(
+    dt_cdt_query_result result, dt_cdt_query_result_view* output_view) {
+    return guarded([&] {
+        if (!result || !output_view) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "result or output_view is null");
+        }
+        dt_cdt_query_result_view view{};
+        view.struct_size = sizeof(view);
+        view.triangles = result->data.triangles.data();
+        view.triangle_count = result->data.triangles.size();
+        view.generation = result->data.generation;
+        *output_view = view;
+    });
+}
+
+void DT_CALL dt_cdt_release_query_result(dt_cdt_query_result result) {
+    delete result;
+}
+
+dt_status DT_CALL dt_cdt_validate(dt_cdt_handle cdt, int32_t verbose) {
+    return guarded([&] {
+        if (!require_cdt(cdt).validate(verbose != 0)) {
+            throw dt::Exception(DT_E_INTERNAL, "CDT validation failed");
+        }
+    });
+}
+
+dt_status DT_CALL dt_cdt_set_crs_wkt(dt_cdt_handle cdt,
+                                     const char* utf8_crs_wkt) {
+    return guarded([&] {
+        require_cdt(cdt).set_crs_wkt(utf8_crs_wkt ? utf8_crs_wkt : "");
+    });
+}
+
+dt_status DT_CALL dt_cdt_get_crs_wkt(dt_cdt_handle cdt, char* buffer,
+                                     size_t buffer_size,
+                                     size_t* required_size) {
+    return guarded([&] {
+        const auto value = require_cdt(cdt).crs_wkt();
+        const dt_status status =
+            copy_utf8_string(value, buffer, buffer_size, required_size);
+        if (status != DT_OK) {
+            throw dt::Exception(status, "CDT CRS output buffer is too small");
+        }
+    });
+}
+
+dt_status DT_CALL dt_cdt_save_text(dt_cdt_handle cdt,
+                                   const char* utf8_file_name) {
+    return guarded(
+        [&] { require_cdt(cdt).save_text(utf8_file_name); });
+}
+
+dt_status DT_CALL dt_cdt_load_text(dt_cdt_handle cdt,
+                                   const char* utf8_file_name,
+                                   dt_bounds2* output_bounds) {
+    return guarded([&] {
+        const auto bounds = require_cdt(cdt).load_text(utf8_file_name);
+        if (output_bounds) *output_bounds = bounds;
     });
 }
 

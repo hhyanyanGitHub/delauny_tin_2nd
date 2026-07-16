@@ -1,4 +1,5 @@
 #include "dt_api.h"
+#include "dt_cdt_api.h"
 #include "dt_gdal_api.h"
 #include "dt_legacy.hpp"
 #include "dt_task_api.h"
@@ -26,6 +27,156 @@ void require_ok(dt_status status, const char* operation) {
 
 bool close(double a, double b) {
     return std::abs(a - b) < 1e-12;
+}
+
+void test_cdt_api() {
+    dt_cdt_handle cdt = nullptr;
+    require_ok(dt_cdt_create(nullptr, &cdt), "dt_cdt_create");
+    assert(cdt != nullptr);
+
+    std::vector<dt_point3> terrain;
+    for (int y = 0; y <= 6; ++y) {
+        for (int x = 0; x <= 6; ++x) {
+            terrain.push_back(
+                {static_cast<double>(x), static_cast<double>(y),
+                 100.0 + x * 2.0 + y * 3.0});
+        }
+    }
+    require_ok(dt_cdt_build(cdt, terrain.data(), terrain.size()),
+               "dt_cdt_build");
+
+    const dt_point3 outer[] = {{0, 0, 100}, {6, 0, 112},
+                               {6, 6, 130}, {0, 6, 118}};
+    dt_constraint_id outer_id = 0;
+    require_ok(dt_cdt_add_constraint(
+                   cdt, DT_CONSTRAINT_OUTER_BOUNDARY, 0, outer, 4, &outer_id),
+               "add outer boundary");
+    assert(outer_id != 0);
+
+    const dt_point3 hole[] = {{2, 2, 110}, {4, 2, 114},
+                              {4, 4, 120}, {2, 4, 116}};
+    dt_constraint_id hole_id = 0;
+    require_ok(dt_cdt_add_constraint(cdt, DT_CONSTRAINT_HOLE_BOUNDARY, 0,
+                                     hole, 4, &hole_id),
+               "add hole boundary");
+
+    const dt_point3 breakline[] = {{0, 3, 109}, {1, 3, 111}, {2, 3, 113}};
+    dt_constraint_id breakline_id = 0;
+    require_ok(dt_cdt_add_constraint(cdt, DT_CONSTRAINT_BREAKLINE, 0,
+                                     breakline, 3, &breakline_id),
+               "add breakline");
+
+    dt_cdt_statistics stats{};
+    require_ok(dt_cdt_get_statistics(cdt, &stats), "CDT statistics");
+    assert(stats.base_point_count == terrain.size());
+    assert(stats.constraint_count == 3);
+    assert(stats.constrained_edge_count >= 10);
+    assert(stats.domain_triangle_count > 0);
+    assert(stats.domain_triangle_count < stats.finite_triangle_count);
+    assert(close(stats.bounds.xmin, 0.0) && close(stats.bounds.xmax, 6.0));
+    require_ok(dt_cdt_validate(cdt, 0), "CDT validation");
+
+    dt_constraint_info constraint_info{};
+    require_ok(dt_cdt_get_constraint_info(cdt, 1, &constraint_info),
+               "CDT constraint info");
+    assert(constraint_info.id == hole_id);
+    assert(constraint_info.kind == DT_CONSTRAINT_HOLE_BOUNDARY);
+    assert((constraint_info.flags & DT_CONSTRAINT_CLOSED) != 0);
+    assert(constraint_info.point_count == 4);
+    uint64_t required_points = 0;
+    require_ok(dt_cdt_copy_constraint_points(cdt, hole_id, nullptr, 0,
+                                             &required_points),
+               "CDT constraint point count");
+    assert(required_points == 4);
+    std::vector<dt_point3> copied(required_points);
+    require_ok(dt_cdt_copy_constraint_points(cdt, hole_id, copied.data(),
+                                             copied.size(), nullptr),
+               "CDT copy constraint points");
+    assert(close(copied[2].x, 4.0) && close(copied[2].y, 4.0));
+
+    const dt_bounds2 all{-1, -1, 7, 7};
+    dt_cdt_query_result query = nullptr;
+    require_ok(dt_cdt_query_triangles(cdt, &all, &query),
+               "CDT query triangles");
+    dt_cdt_query_result_view view{};
+    require_ok(dt_cdt_query_result_get_view(query, &view),
+               "CDT query view");
+    assert(view.triangle_count == stats.domain_triangle_count);
+    for (uint64_t i = 0; i < view.triangle_count; ++i) {
+        const auto& triangle = view.triangles[i];
+        const double cx = (triangle.vertex[0].point.x +
+                           triangle.vertex[1].point.x +
+                           triangle.vertex[2].point.x) /
+                          3.0;
+        const double cy = (triangle.vertex[0].point.y +
+                           triangle.vertex[1].point.y +
+                           triangle.vertex[2].point.y) /
+                          3.0;
+        assert(!(cx > 2.0 && cx < 4.0 && cy > 2.0 && cy < 4.0));
+    }
+    dt_cdt_release_query_result(query);
+
+    const dt_point3 crossing[] = {{1, 2.5, 109.5}, {1, 3.5, 112.5}};
+    const auto crossing_status = dt_cdt_add_constraint(
+        cdt, DT_CONSTRAINT_BREAKLINE, 0, crossing, 2, nullptr);
+    assert(crossing_status == DT_E_UNSUPPORTED);
+    dt_cdt_statistics after_failed_add{};
+    require_ok(dt_cdt_get_statistics(cdt, &after_failed_add),
+               "statistics after rejected crossing");
+    assert(after_failed_add.constraint_count == stats.constraint_count);
+    assert(after_failed_add.generation == stats.generation);
+
+    require_ok(dt_cdt_set_crs_wkt(cdt, "LOCAL_CS[\"CDT test\"]"),
+               "set CDT CRS");
+    const char* file_name = "dterrain_test_roundtrip.dcdt";
+    require_ok(dt_cdt_save_text(cdt, file_name), "save DCDT text");
+    dt_cdt_handle loaded = nullptr;
+    require_ok(dt_cdt_create(nullptr, &loaded), "create loaded CDT");
+    dt_bounds2 loaded_bounds{};
+    require_ok(dt_cdt_load_text(loaded, file_name, &loaded_bounds),
+               "load DCDT text");
+    dt_cdt_statistics loaded_stats{};
+    require_ok(dt_cdt_get_statistics(loaded, &loaded_stats),
+               "loaded CDT statistics");
+    assert(loaded_stats.base_point_count == stats.base_point_count);
+    assert(loaded_stats.constraint_count == stats.constraint_count);
+    assert(loaded_stats.domain_triangle_count == stats.domain_triangle_count);
+    size_t crs_size = 0;
+    require_ok(dt_cdt_get_crs_wkt(loaded, nullptr, 0, &crs_size),
+               "loaded CDT CRS size");
+    std::vector<char> crs(crs_size);
+    require_ok(dt_cdt_get_crs_wkt(loaded, crs.data(), crs.size(), nullptr),
+               "loaded CDT CRS");
+    assert(std::string(crs.data()) == "LOCAL_CS[\"CDT test\"]");
+    require_ok(dt_cdt_validate(loaded, 0), "loaded CDT validation");
+
+    const char* invalid_id_file = "dterrain_test_invalid_cdt_id.dcdt";
+    {
+        std::ofstream invalid(invalid_id_file, std::ios::binary);
+        invalid << "DCDT 1\nCRS \"\"\nPOINTS 0\nCONSTRAINTS 1\n"
+                   "CONSTRAINT 18446744073709551615 1 0 2\n"
+                   "0 0 0\n1 0 0\nEND\n";
+    }
+    const auto generation_before_invalid_load = loaded_stats.generation;
+    assert(dt_cdt_load_text(loaded, invalid_id_file, nullptr) ==
+           DT_E_CORRUPTED_DATA);
+    require_ok(dt_cdt_get_statistics(loaded, &loaded_stats),
+               "statistics after rejected DCDT id");
+    assert(loaded_stats.generation == generation_before_invalid_load);
+    assert(loaded_stats.constraint_count == stats.constraint_count);
+    std::remove(invalid_id_file);
+
+    const auto domain_before_remove = loaded_stats.domain_triangle_count;
+    require_ok(dt_cdt_remove_constraint(loaded, hole_id),
+               "remove hole constraint");
+    require_ok(dt_cdt_get_statistics(loaded, &loaded_stats),
+               "statistics after hole removal");
+    assert(loaded_stats.constraint_count == 2);
+    assert(loaded_stats.domain_triangle_count > domain_before_remove);
+
+    dt_cdt_destroy(loaded);
+    dt_cdt_destroy(cdt);
+    std::remove(file_name);
 }
 
 void test_v2_api() {
@@ -236,7 +387,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 6 && patch == 0);
+    assert(major == 0 && minor == 7 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");
@@ -537,11 +688,27 @@ void test_packaged_terrain_samples() {
     assert(contour_info.line_count == 2);
     assert(contour_info.vertex_count == 10);
     dt_contours_destroy(contours);
+
+    dt_cdt_handle cdt = nullptr;
+    require_ok(dt_cdt_create(nullptr, &cdt), "create packaged CDT");
+    require_ok(dt_cdt_load_text(
+                   cdt, (root + "/examples/sample_constraints.dcdt").c_str(),
+                   nullptr),
+               "load packaged CDT sample");
+    dt_cdt_statistics cdt_info{};
+    require_ok(dt_cdt_get_statistics(cdt, &cdt_info), "packaged CDT info");
+    assert(cdt_info.base_point_count == 25);
+    assert(cdt_info.constraint_count == 3);
+    assert(cdt_info.domain_triangle_count > 0);
+    assert(cdt_info.domain_triangle_count < cdt_info.finite_triangle_count);
+    require_ok(dt_cdt_validate(cdt, 0), "packaged CDT validation");
+    dt_cdt_destroy(cdt);
 }
 
 } // namespace
 
 int main() {
+    test_cdt_api();
     test_v2_api();
     test_legacy_api();
     test_random_dynamic_sequence();

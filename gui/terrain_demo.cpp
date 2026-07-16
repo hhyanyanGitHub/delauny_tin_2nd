@@ -4,6 +4,7 @@
 #include <commdlg.h>
 
 #include "dt_api.h"
+#include "dt_cdt_api.h"
 #include "dt_terrain_api.h"
 #include "terrain_3d.hpp"
 
@@ -51,9 +52,12 @@ enum CommandId {
     ID_EXPORT_GRID,
     ID_IMPORT_CONTOURS,
     ID_EXPORT_CONTOURS,
+    ID_IMPORT_CDT,
+    ID_EXPORT_CDT,
     ID_LAYER_TIN,
     ID_LAYER_GRID,
-    ID_LAYER_CONTOURS
+    ID_LAYER_CONTOURS,
+    ID_LAYER_CDT
 };
 
 enum class Mode { Insert, Delete, Query, ZoomBox };
@@ -111,8 +115,12 @@ double jitter(uint64_t value) {
 
 class DemoApp {
 public:
-    DemoApp() { dt_create(nullptr, &mesh_); }
+    DemoApp() {
+        dt_create(nullptr, &mesh_);
+        dt_cdt_create(nullptr, &cdt_);
+    }
     ~DemoApp() {
+        dt_cdt_destroy(cdt_);
         dt_contours_destroy(contours_);
         dt_grid_destroy(grid_);
         dt_destroy(mesh_);
@@ -206,6 +214,7 @@ public:
 private:
     HWND hwnd_ = nullptr;
     dt_handle mesh_ = nullptr;
+    dt_cdt_handle cdt_ = nullptr;
     dt_grid_handle grid_ = nullptr;
     dt_contour_handle contours_ = nullptr;
     Mode mode_ = Mode::Query;
@@ -214,6 +223,14 @@ private:
     bool view_valid_ = false;
     bool cache_valid_ = false;
     std::vector<dt_triangle3> triangles_;
+    std::vector<dt_triangle3> cdt_triangles_;
+    struct ConstraintLine {
+        int32_t kind = DT_CONSTRAINT_BREAKLINE;
+        uint32_t flags = 0;
+        std::vector<dt_point3> points;
+    };
+    std::vector<ConstraintLine> constraint_lines_;
+    dt_cdt_statistics cdt_info_{};
     std::vector<dt_triangle3> removed_triangles_;
     std::vector<dt_triangle3> added_triangles_;
     std::vector<dt_segment3> boundary_edges_;
@@ -235,6 +252,7 @@ private:
     bool show_tin_ = true;
     bool show_grid_ = true;
     bool show_contours_ = true;
+    bool show_cdt_ = true;
     dt_grid_info grid_info_{};
     std::vector<double> grid_values_;
     std::vector<uint32_t> grid_preview_;
@@ -316,6 +334,11 @@ private:
                     L"导入等高线文本…");
         AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_CONTOURS,
                     L"导出等高线文本…");
+        AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CDT,
+                    L"打开约束网 DCDT…");
+        AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_CDT,
+                    L"保存约束网 DCDT…");
 
         layer_menu_ = CreatePopupMenu();
         AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_TIN,
@@ -324,6 +347,8 @@ private:
                     L"GRID 高程着色");
         AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_CONTOURS,
                     L"等高线");
+        AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_CDT,
+                    L"约束 Delaunay");
 
         AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(terrain_menu),
                     L"地形转换(&T)");
@@ -342,6 +367,8 @@ private:
                       MF_BYCOMMAND | (show_grid_ ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(layer_menu_, ID_LAYER_CONTOURS,
                       MF_BYCOMMAND | (show_contours_ ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(layer_menu_, ID_LAYER_CDT,
+                      MF_BYCOMMAND | (show_cdt_ ? MF_CHECKED : MF_UNCHECKED));
         DrawMenuBar(hwnd_);
     }
 
@@ -379,6 +406,13 @@ private:
         if (clear_contours) destroy_contour_layer();
     }
 
+    void clear_cdt_layer() {
+        if (cdt_) dt_cdt_clear(cdt_);
+        cdt_triangles_.clear();
+        constraint_lines_.clear();
+        cdt_info_ = {};
+    }
+
     void generate(uint64_t count) {
         set_wait_cursor(true);
         std::vector<dt_point3> points;
@@ -404,6 +438,7 @@ private:
         show_tin_ = true;
         update_layer_menu();
         clear_derived_layers();
+        clear_cdt_layer();
         clear_overlays();
         reset_view();
         const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
@@ -417,6 +452,7 @@ private:
     void clear_mesh() {
         if (dt_clear_handle(mesh_) == DT_OK) {
             clear_derived_layers();
+            clear_cdt_layer();
             triangles_.clear();
             clear_overlays();
             view_valid_ = false;
@@ -471,6 +507,12 @@ private:
             contour_info_.struct_size = sizeof(contour_info_);
             if (dt_contours_get_info(contours_, &contour_info_) == DT_OK &&
                 contour_info_.line_count != 0) include(contour_info_.bounds);
+        }
+        if (view_mode_ == ViewMode::Map2D && show_cdt_ && cdt_) {
+            dt_cdt_statistics cdt_stats{};
+            cdt_stats.struct_size = sizeof(cdt_stats);
+            if (dt_cdt_get_statistics(cdt_, &cdt_stats) == DT_OK &&
+                cdt_stats.vertex_count != 0) include(cdt_stats.bounds);
         }
         if (!found) {
             view_valid_ = false;
@@ -796,29 +838,51 @@ private:
 
     void ensure_cache() {
         if (cache_valid_ || !view_valid_) return;
+        const auto begin = std::chrono::steady_clock::now();
         dt_statistics statistics{};
         if (!show_tin_ || dt_get_statistics(mesh_, &statistics) != DT_OK ||
             statistics.finite_triangle_count == 0) {
             triangles_.clear();
-            cache_valid_ = true;
-            last_query_ms_ = 0.0;
-            return;
+        } else {
+            dt_query_result result = nullptr;
+            if (dt_query_triangles(mesh_, &view_, &result) != DT_OK) {
+                action_text_ = L"TIN 范围查询失败：" + last_error_text();
+                return;
+            }
+            dt_query_result_view result_view{};
+            if (dt_query_result_get_view(result, &result_view) == DT_OK) {
+                if (result_view.triangle_count)
+                    triangles_.assign(result_view.triangles,
+                                      result_view.triangles + result_view.triangle_count);
+                else
+                    triangles_.clear();
+            }
+            dt_release_query_result(result);
         }
-        const auto begin = std::chrono::steady_clock::now();
-        dt_query_result result = nullptr;
-        if (dt_query_triangles(mesh_, &view_, &result) != DT_OK) {
-            action_text_ = L"范围查询失败：" + last_error_text();
-            return;
+
+        cdt_triangles_.clear();
+        if (show_cdt_ && cdt_) {
+            dt_cdt_statistics cdt_stats{};
+            cdt_stats.struct_size = sizeof(cdt_stats);
+            if (dt_cdt_get_statistics(cdt_, &cdt_stats) == DT_OK &&
+                cdt_stats.domain_triangle_count != 0) {
+                cdt_info_ = cdt_stats;
+                dt_cdt_query_result result = nullptr;
+                if (dt_cdt_query_triangles(cdt_, &view_, &result) != DT_OK) {
+                    action_text_ = L"CDT 范围查询失败：" + last_error_text();
+                    return;
+                }
+                dt_cdt_query_result_view result_view{};
+                if (dt_cdt_query_result_get_view(result, &result_view) == DT_OK &&
+                    result_view.triangle_count) {
+                    cdt_triangles_.assign(
+                        result_view.triangles,
+                        result_view.triangles + result_view.triangle_count);
+                }
+                dt_cdt_release_query_result(result);
+            }
         }
-        dt_query_result_view view{};
-        if (dt_query_result_get_view(result, &view) == DT_OK) {
-            if (view.triangle_count)
-                triangles_.assign(view.triangles, view.triangles + view.triangle_count);
-            else
-                triangles_.clear();
-            cache_valid_ = true;
-        }
-        dt_release_query_result(result);
+        cache_valid_ = true;
         const auto end = std::chrono::steady_clock::now();
         last_query_ms_ = std::chrono::duration<double, std::milli>(end - begin).count();
     }
@@ -994,6 +1058,50 @@ private:
         }
         DeleteObject(minor_pen);
         DeleteObject(major_pen);
+    }
+
+    void draw_cdt(HDC dc) const {
+        if (!show_cdt_) return;
+        if (!cdt_triangles_.empty()) {
+            const size_t step = std::max<size_t>(
+                1, (cdt_triangles_.size() + kMaxDrawTriangles - 1) /
+                       kMaxDrawTriangles);
+            HPEN mesh_pen = CreatePen(PS_SOLID, 1, RGB(151, 126, 205));
+            const auto old_pen = SelectObject(dc, mesh_pen);
+            for (size_t i = 0; i < cdt_triangles_.size(); i += step) {
+                const auto& triangle = cdt_triangles_[i];
+                POINT points[4]{world_to_screen(triangle.vertex[0].point),
+                                world_to_screen(triangle.vertex[1].point),
+                                world_to_screen(triangle.vertex[2].point),
+                                world_to_screen(triangle.vertex[0].point)};
+                Polyline(dc, points, 4);
+            }
+            SelectObject(dc, old_pen);
+            DeleteObject(mesh_pen);
+        }
+        HPEN breakline_pen = CreatePen(PS_SOLID, 3, RGB(255, 145, 55));
+        HPEN outer_pen = CreatePen(PS_SOLID, 4, RGB(55, 225, 238));
+        HPEN hole_pen = CreatePen(PS_SOLID, 4, RGB(255, 92, 178));
+        for (const auto& line : constraint_lines_) {
+            if (line.points.size() < 2) continue;
+            std::vector<POINT> points;
+            points.reserve(line.points.size() + 1);
+            for (const auto& point : line.points)
+                points.push_back(world_to_screen(point));
+            if ((line.flags & DT_CONSTRAINT_CLOSED) != 0)
+                points.push_back(points.front());
+            HPEN pen = line.kind == DT_CONSTRAINT_OUTER_BOUNDARY
+                           ? outer_pen
+                           : line.kind == DT_CONSTRAINT_HOLE_BOUNDARY
+                                 ? hole_pen
+                                 : breakline_pen;
+            const auto old_pen = SelectObject(dc, pen);
+            Polyline(dc, points.data(), static_cast<int>(points.size()));
+            SelectObject(dc, old_pen);
+        }
+        DeleteObject(breakline_pen);
+        DeleteObject(outer_pen);
+        DeleteObject(hole_pen);
     }
 
     void update_model_metrics() {
@@ -1289,6 +1397,7 @@ private:
         } else {
             draw_grid(dc);
             if (show_tin_) draw_mesh(dc);
+            draw_cdt(dc);
             draw_triangle_set(dc, removed_triangles_, RGB(245, 68, 70), 2);
             draw_segment_set(dc, boundary_edges_, RGB(255, 210, 50), 3);
             draw_triangle_set(dc, added_triangles_, RGB(60, 220, 100), 2);
@@ -1327,6 +1436,7 @@ private:
              << (show_tin_ ? L"T" : L"-")
              << (show_grid_ && grid_ ? L"G" : L"-")
              << (show_contours_ && contours_ ? L"C" : L"-")
+             << (show_cdt_ && !constraint_lines_.empty() ? L"D" : L"-")
              << L" | "
              << action_text_;
         DrawTextW(dc, text.str().c_str(), -1, &status,
@@ -1376,6 +1486,7 @@ private:
             show_tin_ = true;
             update_layer_menu();
             clear_derived_layers();
+            clear_cdt_layer();
             clear_overlays();
             reset_view();
             invalidate_mesh_cache();
@@ -1426,6 +1537,7 @@ private:
             show_tin_ = true;
             update_layer_menu();
             clear_derived_layers();
+            clear_cdt_layer();
             clear_overlays();
             reset_view();
             action_text_ = L"已加载：" + file;
@@ -1717,6 +1829,79 @@ private:
                                        : L"等高线导出失败：" + last_error_text();
     }
 
+    bool refresh_cdt_constraints() {
+        cdt_triangles_.clear();
+        constraint_lines_.clear();
+        cdt_info_ = {};
+        cdt_info_.struct_size = sizeof(cdt_info_);
+        if (!cdt_ || dt_cdt_get_statistics(cdt_, &cdt_info_) != DT_OK)
+            return false;
+        constraint_lines_.reserve(static_cast<size_t>(cdt_info_.constraint_count));
+        for (uint64_t index = 0; index < cdt_info_.constraint_count; ++index) {
+            dt_constraint_info info{};
+            info.struct_size = sizeof(info);
+            if (dt_cdt_get_constraint_info(cdt_, index, &info) != DT_OK)
+                return false;
+            ConstraintLine line;
+            line.kind = info.kind;
+            line.flags = info.flags;
+            line.points.resize(static_cast<size_t>(info.point_count));
+            if (info.point_count != 0 &&
+                dt_cdt_copy_constraint_points(cdt_, info.id, line.points.data(),
+                                              info.point_count, nullptr) != DT_OK)
+                return false;
+            constraint_lines_.push_back(std::move(line));
+        }
+        return true;
+    }
+
+    void import_cdt_file() {
+        const auto file = choose_file(
+            false, L"terrain.dcdt",
+            L"DCDT 约束网 (*.dcdt;*.txt)\0*.dcdt;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dcdt");
+        if (file.empty()) return;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_cdt_load_text(
+            cdt_, wide_to_utf8(file.c_str()).c_str(), nullptr);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK || !refresh_cdt_constraints()) {
+            action_text_ = L"约束网导入失败：" + last_error_text();
+            return;
+        }
+        show_cdt_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"已打开约束网：" << cdt_info_.vertex_count << L" 顶点，"
+             << cdt_info_.domain_triangle_count << L" 域内面，"
+             << cdt_info_.constraint_count << L" 条约束，耗时 "
+             << std::fixed << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
+    void export_cdt_file() {
+        if (!cdt_ || cdt_info_.vertex_count == 0) {
+            action_text_ = L"没有可保存的约束网";
+            return;
+        }
+        const auto file = choose_file(
+            true, L"terrain.dcdt",
+            L"DCDT 约束网 (*.dcdt;*.txt)\0*.dcdt;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dcdt");
+        if (file.empty()) return;
+        const dt_status status =
+            dt_cdt_save_text(cdt_, wide_to_utf8(file.c_str()).c_str());
+        action_text_ = status == DT_OK ? L"已保存约束网：" + file
+                                       : L"约束网保存失败：" + last_error_text();
+    }
+
     void toggle_layer(int id) {
         enter_2d_view();
         if (id == ID_LAYER_TIN) show_tin_ = !show_tin_;
@@ -1726,6 +1911,11 @@ private:
         } else if (id == ID_LAYER_CONTOURS) {
             if (!contours_) action_text_ = L"当前没有等高线图层";
             else show_contours_ = !show_contours_;
+        } else if (id == ID_LAYER_CDT) {
+            if (!cdt_ || cdt_info_.vertex_count == 0)
+                action_text_ = L"当前没有约束 Delaunay 图层";
+            else
+                show_cdt_ = !show_cdt_;
         }
         update_layer_menu();
         reset_view();
@@ -1778,9 +1968,12 @@ private:
         case ID_EXPORT_GRID: export_grid_file(); break;
         case ID_IMPORT_CONTOURS: import_contour_file(); break;
         case ID_EXPORT_CONTOURS: export_contour_file(); break;
+        case ID_IMPORT_CDT: import_cdt_file(); break;
+        case ID_EXPORT_CDT: export_cdt_file(); break;
         case ID_LAYER_TIN:
         case ID_LAYER_GRID:
-        case ID_LAYER_CONTOURS: toggle_layer(id); break;
+        case ID_LAYER_CONTOURS:
+        case ID_LAYER_CDT: toggle_layer(id); break;
         default: break;
         }
         InvalidateRect(hwnd_, nullptr, FALSE);

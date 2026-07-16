@@ -1103,6 +1103,14 @@ dt_status DT_CALL dt_cdt_build(dt_cdt_handle cdt, const dt_point3* points,
     return guarded([&] { require_cdt(cdt).build(points, point_count); });
 }
 
+dt_status DT_CALL dt_cdt_build_from_tin(dt_cdt_handle cdt, dt_handle tin) {
+    return guarded([&] {
+        auto& source = require_context(tin);
+        auto points = source.points();
+        require_cdt(cdt).build_from_tin(std::move(points), source.crs_wkt());
+    });
+}
+
 dt_status DT_CALL dt_cdt_add_constraint(
     dt_cdt_handle cdt, int32_t kind, uint32_t flags,
     const dt_point3* points, uint64_t point_count,
@@ -1209,6 +1217,49 @@ dt_status DT_CALL dt_cdt_query_result_get_view(
 
 void DT_CALL dt_cdt_release_query_result(dt_cdt_query_result result) {
     delete result;
+}
+
+dt_status DT_CALL dt_cdt_sample_height_xy(dt_cdt_handle cdt,
+                                           const dt_point3* query,
+                                           double* output_z) {
+    return guarded([&] {
+        if (!query || !output_z) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "query or output_z is null");
+        }
+        *output_z = require_cdt(cdt).sample_height_xy(*query);
+    });
+}
+
+dt_status DT_CALL dt_grid_from_cdt(
+    dt_cdt_handle cdt, const dt_tin_to_grid_options* options,
+    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_tin_to_grid_options");
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::grid_from_cdt(require_cdt(cdt), *options);
+        *output_grid = result.release();
+    });
+}
+
+dt_status DT_CALL dt_contours_from_cdt(
+    dt_cdt_handle cdt, const dt_contour_options* options,
+    dt_contour_handle* output_contours) {
+    if (output_contours) *output_contours = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_contour_options");
+        if (!output_contours) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_contours is null");
+        }
+        auto result = std::make_unique<dt_contour_set_t>();
+        result->contours = dt::contours_from_cdt(require_cdt(cdt), *options);
+        *output_contours = result.release();
+    });
 }
 
 dt_status DT_CALL dt_cdt_validate(dt_cdt_handle cdt, int32_t verbose) {

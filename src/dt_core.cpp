@@ -620,6 +620,20 @@ dt_location_result Context::locate(const dt_point3& query_point) const {
     return result;
 }
 
+std::vector<dt_point3> Context::points() const {
+    std::lock_guard<std::recursive_mutex> cgal_lock(g_cgal_mutex);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::vector<dt_point3> result;
+    result.reserve(state_->triangulation.number_of_vertices());
+    for (auto vertex = state_->triangulation.finite_vertices_begin();
+         vertex != state_->triangulation.finite_vertices_end(); ++vertex) {
+        result.push_back({CGAL::to_double(vertex->point().x()),
+                          CGAL::to_double(vertex->point().y()),
+                          vertex->info().z});
+    }
+    return result;
+}
+
 std::unique_ptr<QueryData> Context::query(const dt_bounds2& bounds) const {
     std::lock_guard<std::recursive_mutex> cgal_lock(g_cgal_mutex);
     validate_bounds(bounds);

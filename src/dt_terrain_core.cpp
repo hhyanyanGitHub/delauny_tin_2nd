@@ -1,4 +1,5 @@
 #include "dt_terrain_core.hpp"
+#include "dt_cdt_core.hpp"
 
 #include <algorithm>
 #include <array>
@@ -634,6 +635,45 @@ std::unique_ptr<Grid> grid_from_tin(Context& tin,
     return grid;
 }
 
+std::unique_ptr<Grid> grid_from_cdt(CdtContext& cdt,
+                                    const dt_tin_to_grid_options& options,
+                                    const ProgressCallback& progress,
+                                    const CancelCallback& cancelled) {
+    const auto statistics = cdt.statistics();
+    if (statistics.domain_triangle_count == 0) {
+        throw Exception(DT_E_EMPTY, "CDT has no active domain surface");
+    }
+    dt_grid_create_options create{};
+    create.struct_size = sizeof(create);
+    create.flags = options.flags | DT_GRID_HAS_NODATA;
+    create.width = options.width;
+    create.height = options.height;
+    std::copy(std::begin(options.geo_transform), std::end(options.geo_transform),
+              create.geo_transform);
+    create.nodata_value = options.nodata_value;
+    auto grid = std::make_unique<Grid>(create);
+    grid->set_crs_wkt(cdt.crs_wkt());
+    std::vector<double> row(static_cast<size_t>(create.width),
+                            create.nodata_value);
+    for (uint64_t y = 0; y < create.height; ++y) {
+        check_cancelled(cancelled);
+        for (uint64_t x = 0; x < create.width; ++x) {
+            const auto sample = grid->point(x, y, 0.0);
+            try {
+                row[static_cast<size_t>(x)] = cdt.sample_height_xy(sample);
+            } catch (const Exception& error) {
+                if (error.status() != DT_E_NOT_FOUND) throw;
+            }
+        }
+        grid->write_window(0, y, create.width, 1, row.data(), create.width);
+        std::fill(row.begin(), row.end(), create.nodata_value);
+        report_progress(progress,
+                        static_cast<double>(y + 1) /
+                            static_cast<double>(create.height));
+    }
+    return grid;
+}
+
 std::vector<dt_point3> points_from_grid(
     const Grid& grid, const dt_grid_to_tin_options& options,
     const ProgressCallback& progress, const CancelCallback& cancelled) {
@@ -664,7 +704,7 @@ std::vector<dt_point3> points_from_grid(
         (options.flags & DT_GRID_TO_TIN_ALLOW_NODATA_BRIDGING) == 0) {
         throw Exception(
             DT_E_UNSUPPORTED,
-            "GRID contains NoData nodes; enable bridging explicitly or wait for CDT holes");
+            "GRID contains NoData nodes; enable bridging explicitly or use CDT hole boundaries");
     }
     if (points.size() < 3) {
         throw Exception(DT_E_EMPTY, "GRID has fewer than three valid nodes");
@@ -722,6 +762,68 @@ std::unique_ptr<ContourSet> contours_from_tin(
             report_progress(progress,
                             0.35 + 0.5 * static_cast<double>(visited) /
                                        static_cast<double>(statistics.finite_triangle_count));
+        }
+    });
+    for (size_t i = 0; i < levels.size(); ++i) {
+        check_cancelled(cancelled);
+        stitch_level(levels[i], segments[i], xmin, ymin, tolerance, *output);
+        report_progress(progress,
+                        0.85 + 0.15 * static_cast<double>(i + 1) /
+                                   static_cast<double>(levels.size()));
+    }
+    return output;
+}
+
+std::unique_ptr<ContourSet> contours_from_cdt(
+    CdtContext& cdt, const dt_contour_options& options,
+    const ProgressCallback& progress, const CancelCallback& cancelled) {
+    const auto statistics = cdt.statistics();
+    if (statistics.domain_triangle_count == 0) {
+        throw Exception(DT_E_EMPTY, "CDT has no active domain surface");
+    }
+    double xmin = std::numeric_limits<double>::infinity();
+    double ymin = xmin;
+    double xmax = -xmin;
+    double ymax = -xmin;
+    double zmin = xmin;
+    double zmax = -xmin;
+    uint64_t visited = 0;
+    cdt.visit_domain_triangles([&](const dt_triangle3& triangle) {
+        if ((visited & 0x3fffU) == 0) check_cancelled(cancelled);
+        for (const auto& vertex : triangle.vertex) {
+            xmin = std::min(xmin, vertex.point.x);
+            ymin = std::min(ymin, vertex.point.y);
+            xmax = std::max(xmax, vertex.point.x);
+            ymax = std::max(ymax, vertex.point.y);
+            zmin = std::min(zmin, vertex.point.z);
+            zmax = std::max(zmax, vertex.point.z);
+        }
+        ++visited;
+        if ((visited & 0x3fffU) == 0) {
+            report_progress(progress,
+                            0.35 * static_cast<double>(visited) /
+                                static_cast<double>(statistics.domain_triangle_count));
+        }
+    });
+    const auto levels = make_levels(zmin, zmax, options);
+    auto output = std::make_unique<ContourSet>();
+    output->crs_wkt = cdt.crs_wkt();
+    if (levels.empty()) return output;
+    const double extent = std::max(xmax - xmin, ymax - ymin);
+    const double tolerance = options.stitch_tolerance > 0.0
+                                 ? options.stitch_tolerance
+                                 : std::max(extent * 1e-10, 1e-12);
+    validate_stitch_scale(extent, tolerance);
+    std::vector<std::vector<Segment>> segments(levels.size());
+    visited = 0;
+    cdt.visit_domain_triangles([&](const dt_triangle3& triangle) {
+        if ((visited & 0x3fffU) == 0) check_cancelled(cancelled);
+        add_triangle_segments(triangle, levels, segments, tolerance);
+        ++visited;
+        if ((visited & 0x3fffU) == 0) {
+            report_progress(progress,
+                            0.35 + 0.5 * static_cast<double>(visited) /
+                                       static_cast<double>(statistics.domain_triangle_count));
         }
     });
     for (size_t i = 0; i < levels.size(); ++i) {

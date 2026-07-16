@@ -48,6 +48,9 @@ enum CommandId {
     ID_GRID_TO_TIN,
     ID_CONTOURS_FROM_TIN,
     ID_CONTOURS_FROM_GRID,
+    ID_CDT_FROM_TIN,
+    ID_GRID_FROM_CDT,
+    ID_CONTOURS_FROM_CDT,
     ID_IMPORT_GRID,
     ID_EXPORT_GRID,
     ID_IMPORT_CONTOURS,
@@ -57,10 +60,25 @@ enum CommandId {
     ID_LAYER_TIN,
     ID_LAYER_GRID,
     ID_LAYER_CONTOURS,
-    ID_LAYER_CDT
+    ID_LAYER_CDT,
+    ID_CDT_DRAW_BREAKLINE,
+    ID_CDT_DRAW_OUTER,
+    ID_CDT_DRAW_HOLE,
+    ID_CDT_FINISH,
+    ID_CDT_CANCEL,
+    ID_CDT_DELETE
 };
 
-enum class Mode { Insert, Delete, Query, ZoomBox };
+enum class Mode {
+    Insert,
+    Delete,
+    Query,
+    ZoomBox,
+    CdtBreakline,
+    CdtOuter,
+    CdtHole,
+    CdtDelete
+};
 enum class ViewMode { Map2D, Terrain3D };
 enum class Drag3D { None, Orbit, Pan };
 
@@ -197,6 +215,22 @@ public:
         }
         case WM_KEYDOWN:
             if (view_mode_ == ViewMode::Terrain3D && handle_key3d(wparam)) return 0;
+            if (wparam == VK_RETURN && is_cdt_draw_mode()) {
+                finish_cdt_draft();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            if (wparam == VK_BACK && is_cdt_draw_mode() && !cdt_draft_.empty()) {
+                cdt_draft_.pop_back();
+                action_text_ = L"已撤销约束草图最后一点";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            if (wparam == VK_ESCAPE && !cdt_draft_.empty()) {
+                cancel_cdt_draft();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (wparam == VK_ESCAPE && box_zooming_) {
                 cancel_box_zoom();
                 action_text_ = L"已取消框选放大";
@@ -225,11 +259,14 @@ private:
     std::vector<dt_triangle3> triangles_;
     std::vector<dt_triangle3> cdt_triangles_;
     struct ConstraintLine {
+        dt_constraint_id id = 0;
         int32_t kind = DT_CONSTRAINT_BREAKLINE;
         uint32_t flags = 0;
         std::vector<dt_point3> points;
     };
     std::vector<ConstraintLine> constraint_lines_;
+    std::vector<dt_point3> cdt_draft_;
+    int32_t cdt_draft_kind_ = DT_CONSTRAINT_BREAKLINE;
     dt_cdt_statistics cdt_info_{};
     std::vector<dt_triangle3> removed_triangles_;
     std::vector<dt_triangle3> added_triangles_;
@@ -323,6 +360,13 @@ private:
                     L"从 TIN 生成等高线（自动间隔）");
         AppendMenuW(terrain_menu, MF_STRING, ID_CONTOURS_FROM_GRID,
                     L"从 GRID 生成等高线（自动间隔）");
+        AppendMenuW(terrain_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(terrain_menu, MF_STRING, ID_CDT_FROM_TIN,
+                    L"从当前 TIN 创建约束网");
+        AppendMenuW(terrain_menu, MF_STRING, ID_GRID_FROM_CDT,
+                    L"约束网 → GRID（自动 401）");
+        AppendMenuW(terrain_menu, MF_STRING, ID_CONTOURS_FROM_CDT,
+                    L"从约束网生成等高线（自动间隔）");
 
         HMENU exchange_menu = CreatePopupMenu();
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_GRID,
@@ -340,6 +384,22 @@ private:
         AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_CDT,
                     L"保存约束网 DCDT…");
 
+        HMENU cdt_edit_menu = CreatePopupMenu();
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DRAW_BREAKLINE,
+                    L"绘制断裂线");
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DRAW_OUTER,
+                    L"绘制外边界");
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DRAW_HOLE,
+                    L"绘制孔洞边界");
+        AppendMenuW(cdt_edit_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_FINISH,
+                    L"完成当前约束（Enter）");
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_CANCEL,
+                    L"取消当前约束（Esc）");
+        AppendMenuW(cdt_edit_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DELETE,
+                    L"选择删除约束");
+
         layer_menu_ = CreatePopupMenu();
         AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_TIN,
                     L"TIN 三角网");
@@ -354,6 +414,8 @@ private:
                     L"地形转换(&T)");
         AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(exchange_menu),
                     L"数据交换(&E)");
+        AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(cdt_edit_menu),
+                    L"约束编辑(&C)");
         AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu_),
                     L"图层(&L)");
         SetMenu(hwnd_, menu_bar);
@@ -410,6 +472,7 @@ private:
         if (cdt_) dt_cdt_clear(cdt_);
         cdt_triangles_.clear();
         constraint_lines_.clear();
+        cdt_draft_.clear();
         cdt_info_ = {};
     }
 
@@ -555,11 +618,196 @@ private:
                                 view.added_edges + view.added_edge_count);
     }
 
+    bool is_cdt_draw_mode() const {
+        return mode_ == Mode::CdtBreakline || mode_ == Mode::CdtOuter ||
+               mode_ == Mode::CdtHole;
+    }
+
+    void begin_cdt_draft(Mode mode, int32_t kind, const wchar_t* label) {
+        enter_2d_view();
+        cancel_box_zoom();
+        clear_overlays();
+        cdt_draft_.clear();
+        cdt_draft_kind_ = kind;
+        mode_ = mode;
+        show_cdt_ = true;
+        update_layer_menu();
+        action_text_ = std::wstring(L"正在绘制") + label +
+                       L"：左键逐点，Enter 完成，Backspace 撤点，Esc 取消";
+    }
+
+    double interpolate_triangle(const dt_triangle3& triangle,
+                                const dt_point3& point) const {
+        const auto& a = triangle.vertex[0].point;
+        const auto& b = triangle.vertex[1].point;
+        const auto& c = triangle.vertex[2].point;
+        const double denominator =
+            (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if (denominator == 0.0) return terrain_z(point.x, point.y);
+        const double wa = ((b.y - c.y) * (point.x - c.x) +
+                           (c.x - b.x) * (point.y - c.y)) / denominator;
+        const double wb = ((c.y - a.y) * (point.x - c.x) +
+                           (a.x - c.x) * (point.y - c.y)) / denominator;
+        return wa * a.z + wb * b.z + (1.0 - wa - wb) * c.z;
+    }
+
+    double constraint_point_z(const dt_point3& point) const {
+        double z = 0.0;
+        if (cdt_ && dt_cdt_sample_height_xy(cdt_, &point, &z) == DT_OK)
+            return z;
+        dt_location_result location{};
+        if (dt_locate_point_xy(mesh_, &point, &location) == DT_OK) {
+            if (location.type == DT_LOCATION_VERTEX)
+                return location.vertex.point.z;
+            if (location.type == DT_LOCATION_FACE)
+                return interpolate_triangle(location.triangle, point);
+            if (location.type == DT_LOCATION_EDGE &&
+                location.edge.vertex[0].id != 0 &&
+                location.edge.vertex[1].id != 0) {
+                const auto& a = location.edge.vertex[0].point;
+                const auto& b = location.edge.vertex[1].point;
+                const double dx = b.x - a.x;
+                const double dy = b.y - a.y;
+                const double denominator = dx * dx + dy * dy;
+                if (denominator > 0.0) {
+                    const double t = std::clamp(
+                        ((point.x - a.x) * dx + (point.y - a.y) * dy) /
+                            denominator,
+                        0.0, 1.0);
+                    return a.z + t * (b.z - a.z);
+                }
+            }
+        }
+        return terrain_z(point.x, point.y);
+    }
+
+    void append_cdt_draft_point(const dt_point3& world) {
+        dt_point3 point{world.x, world.y, constraint_point_z(world)};
+        if (!cdt_draft_.empty() && cdt_draft_.back().x == point.x &&
+            cdt_draft_.back().y == point.y) {
+            action_text_ = L"该位置与约束草图最后一点重合";
+            return;
+        }
+        cdt_draft_.push_back(point);
+        std::wostringstream text;
+        text << L"约束草图已取 " << cdt_draft_.size()
+             << L" 点；Enter 完成，Backspace 撤点，Esc 取消";
+        action_text_ = text.str();
+    }
+
+    void finish_cdt_draft() {
+        if (!is_cdt_draw_mode()) {
+            action_text_ = L"当前没有正在绘制的约束";
+            return;
+        }
+        const size_t minimum = cdt_draft_kind_ == DT_CONSTRAINT_BREAKLINE ? 2 : 3;
+        if (cdt_draft_.size() < minimum) {
+            std::wostringstream text;
+            text << L"当前约束至少需要 " << minimum << L" 个点";
+            action_text_ = text.str();
+            return;
+        }
+        dt_constraint_id id = 0;
+        set_wait_cursor(true);
+        const dt_status status = dt_cdt_add_constraint(
+            cdt_, cdt_draft_kind_, 0, cdt_draft_.data(), cdt_draft_.size(), &id);
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"添加约束失败：" + last_error_text();
+            return;
+        }
+        cdt_draft_.clear();
+        destroy_grid_layer();
+        destroy_contour_layer();
+        refresh_cdt_constraints();
+        show_cdt_ = true;
+        update_layer_menu();
+        invalidate_mesh_cache();
+        std::wostringstream text;
+        text << L"约束 ID=" << id << L" 已添加；可继续绘制下一条";
+        action_text_ = text.str();
+    }
+
+    void cancel_cdt_draft() {
+        cdt_draft_.clear();
+        action_text_ = L"已取消当前约束草图";
+    }
+
+    static double point_segment_distance_squared(POINT point, POINT a,
+                                                  POINT b) {
+        const double dx = static_cast<double>(b.x - a.x);
+        const double dy = static_cast<double>(b.y - a.y);
+        const double denominator = dx * dx + dy * dy;
+        if (denominator == 0.0) {
+            const double px = static_cast<double>(point.x - a.x);
+            const double py = static_cast<double>(point.y - a.y);
+            return px * px + py * py;
+        }
+        const double t = std::clamp(
+            (static_cast<double>(point.x - a.x) * dx +
+             static_cast<double>(point.y - a.y) * dy) /
+                denominator,
+            0.0, 1.0);
+        const double px = static_cast<double>(point.x) -
+                          (static_cast<double>(a.x) + t * dx);
+        const double py = static_cast<double>(point.y) -
+                          (static_cast<double>(a.y) + t * dy);
+        return px * px + py * py;
+    }
+
+    void delete_cdt_constraint_at(int x, int y) {
+        if (constraint_lines_.empty()) {
+            action_text_ = L"当前没有可删除的约束";
+            return;
+        }
+        const POINT clicked{x, y};
+        double best_distance = std::numeric_limits<double>::infinity();
+        dt_constraint_id best_id = 0;
+        for (const auto& line : constraint_lines_) {
+            if (line.points.size() < 2) continue;
+            const size_t segment_count = line.points.size() - 1 +
+                (((line.flags & DT_CONSTRAINT_CLOSED) != 0) ? 1 : 0);
+            for (size_t segment = 0; segment < segment_count; ++segment) {
+                const POINT a = world_to_screen(line.points[segment % line.points.size()]);
+                const POINT b = world_to_screen(
+                    line.points[(segment + 1) % line.points.size()]);
+                const double distance = point_segment_distance_squared(clicked, a, b);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best_id = line.id;
+                }
+            }
+        }
+        constexpr double kPickRadius = 14.0;
+        if (best_id == 0 || best_distance > kPickRadius * kPickRadius) {
+            action_text_ = L"未选中约束，请在彩色约束线附近单击";
+            return;
+        }
+        set_wait_cursor(true);
+        const dt_status status = dt_cdt_remove_constraint(cdt_, best_id);
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"删除约束失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        destroy_contour_layer();
+        refresh_cdt_constraints();
+        invalidate_mesh_cache();
+        std::wostringstream text;
+        text << L"已删除约束 ID=" << best_id;
+        action_text_ = text.str();
+    }
+
     void on_left_click(int x, int y) {
         if (!view_valid_) return;
         const dt_point3 world = screen_to_world(x, y);
         const auto begin = std::chrono::steady_clock::now();
-        if (mode_ == Mode::Insert) {
+        if (is_cdt_draw_mode()) {
+            append_cdt_draft_point(world);
+        } else if (mode_ == Mode::CdtDelete) {
+            delete_cdt_constraint_at(x, y);
+        } else if (mode_ == Mode::Insert) {
             dt_point3 point{world.x, world.y, terrain_z(world.x, world.y)};
             dt_vertex_id id = 0;
             dt_edit_result effect = nullptr;
@@ -1099,6 +1347,27 @@ private:
             Polyline(dc, points.data(), static_cast<int>(points.size()));
             SelectObject(dc, old_pen);
         }
+        if (!cdt_draft_.empty()) {
+            std::vector<POINT> points;
+            points.reserve(cdt_draft_.size() + 1);
+            for (const auto& point : cdt_draft_)
+                points.push_back(world_to_screen(point));
+            if (cdt_draft_kind_ != DT_CONSTRAINT_BREAKLINE &&
+                points.size() >= 2)
+                points.push_back(points.front());
+            HPEN draft_pen = CreatePen(PS_SOLID, 2, RGB(255, 238, 70));
+            const auto old_pen = SelectObject(dc, draft_pen);
+            if (points.size() >= 2)
+                Polyline(dc, points.data(), static_cast<int>(points.size()));
+            const POINT last = world_to_screen(cdt_draft_.back());
+            HBRUSH brush = CreateSolidBrush(RGB(255, 238, 70));
+            const auto old_brush = SelectObject(dc, brush);
+            Ellipse(dc, last.x - 4, last.y - 4, last.x + 5, last.y + 5);
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            DeleteObject(brush);
+            DeleteObject(draft_pen);
+        }
         DeleteObject(breakline_pen);
         DeleteObject(outer_pen);
         DeleteObject(hole_pen);
@@ -1420,7 +1689,11 @@ private:
         dt_get_statistics(mesh_, &stats);
         const wchar_t* mode = mode_ == Mode::Insert ? L"插入" :
                               mode_ == Mode::Delete ? L"删除" :
-                              mode_ == Mode::ZoomBox ? L"框选放大" : L"查询";
+                              mode_ == Mode::ZoomBox ? L"框选放大" :
+                              mode_ == Mode::CdtBreakline ? L"绘制断裂线" :
+                              mode_ == Mode::CdtOuter ? L"绘制外边界" :
+                              mode_ == Mode::CdtHole ? L"绘制孔洞" :
+                              mode_ == Mode::CdtDelete ? L"删除约束" : L"查询";
         std::wostringstream text;
         text << L"  视图: "
              << (view_mode_ == ViewMode::Terrain3D ? L"3D" : L"2D")
@@ -1436,7 +1709,7 @@ private:
              << (show_tin_ ? L"T" : L"-")
              << (show_grid_ && grid_ ? L"G" : L"-")
              << (show_contours_ && contours_ ? L"C" : L"-")
-             << (show_cdt_ && !constraint_lines_.empty() ? L"D" : L"-")
+             << (show_cdt_ && cdt_info_.vertex_count != 0 ? L"D" : L"-")
              << L" | "
              << action_text_;
         DrawTextW(dc, text.str().c_str(), -1, &status,
@@ -1590,6 +1863,68 @@ private:
         return zmax >= zmin;
     }
 
+    bool cdt_elevation_range(double& zmin, double& zmax) {
+        dt_cdt_statistics stats{};
+        stats.struct_size = sizeof(stats);
+        if (dt_cdt_get_statistics(cdt_, &stats) != DT_OK ||
+            stats.domain_triangle_count == 0) {
+            action_text_ = L"当前没有可生成等高线的约束网有效域";
+            return false;
+        }
+        dt_cdt_query_result result = nullptr;
+        if (dt_cdt_query_triangles(cdt_, &stats.bounds, &result) != DT_OK) {
+            action_text_ = L"读取约束网有效域失败：" + last_error_text();
+            return false;
+        }
+        dt_cdt_query_result_view triangles{};
+        const dt_status status = dt_cdt_query_result_get_view(result, &triangles);
+        if (status != DT_OK || triangles.triangle_count == 0) {
+            dt_cdt_release_query_result(result);
+            action_text_ = L"约束网有效域没有三角形";
+            return false;
+        }
+        zmin = std::numeric_limits<double>::max();
+        zmax = std::numeric_limits<double>::lowest();
+        for (uint64_t index = 0; index < triangles.triangle_count; ++index)
+            for (const auto& vertex : triangles.triangles[index].vertex) {
+                zmin = std::min(zmin, vertex.point.z);
+                zmax = std::max(zmax, vertex.point.z);
+            }
+        dt_cdt_release_query_result(result);
+        return zmax >= zmin;
+    }
+
+    void create_cdt_from_tin() {
+        dt_statistics stats{};
+        if (dt_get_statistics(mesh_, &stats) != DT_OK || stats.dimension != 2) {
+            action_text_ = L"创建约束网失败：当前没有二维 TIN";
+            return;
+        }
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_cdt_build_from_tin(cdt_, mesh_);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK || !refresh_cdt_constraints()) {
+            action_text_ = L"创建约束网失败：" + last_error_text();
+            return;
+        }
+        cdt_draft_.clear();
+        destroy_grid_layer();
+        destroy_contour_layer();
+        show_cdt_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"已从 TIN 创建约束网：" << cdt_info_.base_point_count
+             << L" 基础点，耗时 " << std::fixed << std::setprecision(1)
+             << ms << L" ms；原约束已清除";
+        action_text_ = text.str();
+    }
+
     void convert_tin_to_grid() {
         dt_statistics stats{};
         if (dt_get_statistics(mesh_, &stats) != DT_OK || stats.dimension != 2) {
@@ -1642,6 +1977,64 @@ private:
         text << L"TIN→GRID 完成：" << grid_info_.width << L"×"
              << grid_info_.height << L"，有效节点 "
              << grid_info_.valid_value_count << L"，耗时 "
+             << std::fixed << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
+    void convert_cdt_to_grid() {
+        dt_cdt_statistics stats{};
+        stats.struct_size = sizeof(stats);
+        if (dt_cdt_get_statistics(cdt_, &stats) != DT_OK ||
+            stats.domain_triangle_count == 0) {
+            action_text_ = L"约束网→GRID 失败：当前没有有效域";
+            return;
+        }
+        const double x_range = stats.bounds.xmax - stats.bounds.xmin;
+        const double y_range = stats.bounds.ymax - stats.bounds.ymin;
+        if (!(x_range > 0.0) || !(y_range > 0.0)) {
+            action_text_ = L"约束网→GRID 失败：范围无效";
+            return;
+        }
+        dt_tin_to_grid_options options{};
+        options.struct_size = sizeof(options);
+        if (x_range >= y_range) {
+            options.width = 401;
+            options.height = std::max<uint64_t>(2, static_cast<uint64_t>(
+                std::llround(y_range / x_range * 400.0)) + 1);
+        } else {
+            options.height = 401;
+            options.width = std::max<uint64_t>(2, static_cast<uint64_t>(
+                std::llround(x_range / y_range * 400.0)) + 1);
+        }
+        options.geo_transform[0] = stats.bounds.xmin;
+        options.geo_transform[1] = x_range / static_cast<double>(options.width - 1);
+        options.geo_transform[3] = stats.bounds.ymin;
+        options.geo_transform[5] = y_range / static_cast<double>(options.height - 1);
+        options.nodata_value = -9999.0;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_grid_from_cdt(cdt_, &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"约束网→GRID 失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        destroy_contour_layer();
+        grid_ = output;
+        show_grid_ = true;
+        update_layer_menu();
+        refresh_grid_cache();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"约束网→GRID 完成：" << grid_info_.width << L"×"
+             << grid_info_.height << L"，有效节点 "
+             << grid_info_.valid_value_count << L"，孔洞/域外为 NoData，耗时 "
              << std::fixed << std::setprecision(1) << ms << L" ms";
         action_text_ = text.str();
     }
@@ -1736,6 +2129,44 @@ private:
              << contour_info_.line_count << L" 条，"
              << contour_info_.vertex_count << L" 点，耗时 "
              << std::fixed << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
+    void generate_cdt_contours() {
+        double zmin = 0.0;
+        double zmax = 0.0;
+        if (!cdt_elevation_range(zmin, zmax)) return;
+        const double interval = nice_interval(zmax - zmin);
+        dt_contour_options options{};
+        options.struct_size = sizeof(options);
+        options.interval = interval;
+        options.base = std::floor(zmin / interval) * interval;
+        dt_contour_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_contours_from_cdt(cdt_, &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"约束网等高线失败：" + last_error_text();
+            return;
+        }
+        destroy_contour_layer();
+        contours_ = output;
+        contour_info_ = {};
+        contour_info_.struct_size = sizeof(contour_info_);
+        dt_contours_get_info(contours_, &contour_info_);
+        show_contours_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"约束网等高线完成：间隔 " << std::setprecision(8)
+             << interval << L"，" << contour_info_.line_count << L" 条，"
+             << contour_info_.vertex_count << L" 点，耗时 " << std::fixed
+             << std::setprecision(1) << ms << L" ms";
         action_text_ = text.str();
     }
 
@@ -1843,6 +2274,7 @@ private:
             if (dt_cdt_get_constraint_info(cdt_, index, &info) != DT_OK)
                 return false;
             ConstraintLine line;
+            line.id = info.id;
             line.kind = info.kind;
             line.flags = info.flags;
             line.points.resize(static_cast<size_t>(info.point_count));
@@ -1871,6 +2303,7 @@ private:
             action_text_ = L"约束网导入失败：" + last_error_text();
             return;
         }
+        cdt_draft_.clear();
         show_cdt_ = true;
         update_layer_menu();
         enter_2d_view();
@@ -1929,18 +2362,22 @@ private:
         case ID_CLEAR: clear_mesh(); break;
         case ID_MODE_INSERT:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
+            cdt_draft_.clear();
             show_tin_ = true; update_layer_menu();
             mode_ = Mode::Insert; action_text_ = L"单击网格位置插入地形点"; break;
         case ID_MODE_DELETE:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
+            cdt_draft_.clear();
             show_tin_ = true; update_layer_menu();
             mode_ = Mode::Delete; action_text_ = L"单击位置删除最近顶点"; break;
         case ID_MODE_QUERY:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
+            cdt_draft_.clear();
             show_tin_ = true; update_layer_menu();
             mode_ = Mode::Query; action_text_ = L"单击查询最近顶点和覆盖三角形"; break;
         case ID_MODE_ZOOM_BOX:
             if (view_mode_ == ViewMode::Terrain3D) toggle_view_mode();
+            cdt_draft_.clear();
             cancel_box_zoom();
             mode_ = Mode::ZoomBox;
             action_text_ = L"按住左键拖出矩形，松开后放大并适屏";
@@ -1964,12 +2401,37 @@ private:
         case ID_GRID_TO_TIN: convert_grid_to_tin(); break;
         case ID_CONTOURS_FROM_TIN: generate_contours(false); break;
         case ID_CONTOURS_FROM_GRID: generate_contours(true); break;
+        case ID_CDT_FROM_TIN: create_cdt_from_tin(); break;
+        case ID_GRID_FROM_CDT: convert_cdt_to_grid(); break;
+        case ID_CONTOURS_FROM_CDT: generate_cdt_contours(); break;
         case ID_IMPORT_GRID: import_grid_file(); break;
         case ID_EXPORT_GRID: export_grid_file(); break;
         case ID_IMPORT_CONTOURS: import_contour_file(); break;
         case ID_EXPORT_CONTOURS: export_contour_file(); break;
         case ID_IMPORT_CDT: import_cdt_file(); break;
         case ID_EXPORT_CDT: export_cdt_file(); break;
+        case ID_CDT_DRAW_BREAKLINE:
+            begin_cdt_draft(Mode::CdtBreakline, DT_CONSTRAINT_BREAKLINE,
+                            L"断裂线");
+            break;
+        case ID_CDT_DRAW_OUTER:
+            begin_cdt_draft(Mode::CdtOuter, DT_CONSTRAINT_OUTER_BOUNDARY,
+                            L"外边界");
+            break;
+        case ID_CDT_DRAW_HOLE:
+            begin_cdt_draft(Mode::CdtHole, DT_CONSTRAINT_HOLE_BOUNDARY,
+                            L"孔洞边界");
+            break;
+        case ID_CDT_FINISH: finish_cdt_draft(); break;
+        case ID_CDT_CANCEL: cancel_cdt_draft(); break;
+        case ID_CDT_DELETE:
+            enter_2d_view();
+            cdt_draft_.clear();
+            mode_ = Mode::CdtDelete;
+            show_cdt_ = true;
+            update_layer_menu();
+            action_text_ = L"请在彩色约束线附近单击以删除；删除外边界前需先删除孔洞";
+            break;
         case ID_LAYER_TIN:
         case ID_LAYER_GRID:
         case ID_LAYER_CONTOURS:

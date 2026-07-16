@@ -1,7 +1,7 @@
 #ifndef DT_CDT_API_H
 #define DT_CDT_API_H
 
-#include "dt_api.h"
+#include "dt_terrain_api.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,6 +66,9 @@ DT_API dt_status DT_CALL dt_cdt_clear(dt_cdt_handle cdt);
 /* Replaces the unconstrained terrain points atomically and removes constraints. */
 DT_API dt_status DT_CALL dt_cdt_build(
     dt_cdt_handle cdt, const dt_point3* points, uint64_t point_count);
+/* Copies the current ordinary TIN vertices and CRS into cdt atomically. */
+DT_API dt_status DT_CALL dt_cdt_build_from_tin(
+    dt_cdt_handle cdt, dt_handle tin);
 
 /* Boundary and hole constraints are always closed and require at least three
    distinct points. Breaklines may be open or DT_CONSTRAINT_CLOSED. */
@@ -96,6 +99,20 @@ DT_API dt_status DT_CALL dt_cdt_query_triangles(
 DT_API dt_status DT_CALL dt_cdt_query_result_get_view(
     dt_cdt_query_result result, dt_cdt_query_result_view* output_view);
 DT_API void DT_CALL dt_cdt_release_query_result(dt_cdt_query_result result);
+
+/* Samples the piecewise-linear CDT surface. Points outside the active domain
+   or inside holes return DT_E_NOT_FOUND. Query Z is ignored. */
+DT_API dt_status DT_CALL dt_cdt_sample_height_xy(
+    dt_cdt_handle cdt, const dt_point3* query, double* output_z);
+
+/* Derived products honor the active CDT domain. GRID nodes outside the domain
+   become NoData; contours stop at outer and hole boundaries. */
+DT_API dt_status DT_CALL dt_grid_from_cdt(
+    dt_cdt_handle cdt, const dt_tin_to_grid_options* options,
+    dt_grid_handle* output_grid);
+DT_API dt_status DT_CALL dt_contours_from_cdt(
+    dt_cdt_handle cdt, const dt_contour_options* options,
+    dt_contour_handle* output_contours);
 
 DT_API dt_status DT_CALL dt_cdt_validate(dt_cdt_handle cdt, int32_t verbose);
 DT_API dt_status DT_CALL dt_cdt_set_crs_wkt(

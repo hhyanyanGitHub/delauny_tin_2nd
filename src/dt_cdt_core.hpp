@@ -7,6 +7,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <functional>
 #include <vector>
 
 namespace dt {
@@ -32,6 +33,7 @@ public:
 
     void clear();
     void build(const dt_point3* points, uint64_t count);
+    void build_from_tin(std::vector<dt_point3> points, std::string crs_wkt);
     dt_constraint_id add_constraint(int32_t kind, uint32_t flags,
                                     const dt_point3* points, uint64_t count);
     void remove_constraint(dt_constraint_id id);
@@ -40,6 +42,9 @@ public:
     CdtConstraint constraint_at(uint64_t index) const;
     CdtConstraint constraint_by_id(dt_constraint_id id) const;
     std::unique_ptr<CdtQueryData> query(const dt_bounds2& bounds) const;
+    double sample_height_xy(const dt_point3& query) const;
+    void visit_domain_triangles(
+        const std::function<void(const dt_triangle3&)>& visitor) const;
     bool validate(bool verbose) const;
 
     void set_crs_wkt(std::string value);

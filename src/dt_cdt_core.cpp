@@ -98,6 +98,42 @@ dt_triangle3 to_triangle(CdtFaceHandle face) {
              to_vertex(face->vertex(2))}};
 }
 
+double interpolate_edge_z(CdtVertexHandle a, CdtVertexHandle b,
+                          const dt_point3& query) {
+    const double ax = CGAL::to_double(a->point().x());
+    const double ay = CGAL::to_double(a->point().y());
+    const double bx = CGAL::to_double(b->point().x());
+    const double by = CGAL::to_double(b->point().y());
+    const double dx = bx - ax;
+    const double dy = by - ay;
+    const double denominator = dx * dx + dy * dy;
+    if (denominator == 0.0) return a->info().z;
+    const double t = std::clamp(((query.x - ax) * dx + (query.y - ay) * dy) /
+                                    denominator,
+                                0.0, 1.0);
+    return a->info().z + t * (b->info().z - a->info().z);
+}
+
+double interpolate_face_z(CdtFaceHandle face, const dt_point3& query) {
+    const auto a = to_vertex(face->vertex(0)).point;
+    const auto b = to_vertex(face->vertex(1)).point;
+    const auto c = to_vertex(face->vertex(2)).point;
+    const double denominator =
+        (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+    if (denominator == 0.0) {
+        throw Exception(DT_E_INTERNAL, "degenerate CDT triangle");
+    }
+    const double wa =
+        ((b.y - c.y) * (query.x - c.x) +
+         (c.x - b.x) * (query.y - c.y)) /
+        denominator;
+    const double wb =
+        ((c.y - a.y) * (query.x - c.x) +
+         (a.x - c.x) * (query.y - c.y)) /
+        denominator;
+    return wa * a.z + wb * b.z + (1.0 - wa - wb) * c.z;
+}
+
 template <class StateT>
 bool domain_face(const StateT& state, CdtFaceHandle face) {
     if (state.triangulation.is_infinite(face)) return false;
@@ -308,10 +344,12 @@ std::unique_ptr<CdtContext::State> CdtContext::make_state(
             }
         }
     }
-    mark_domains(*next);
-    for (auto face = next->triangulation.finite_faces_begin();
-         face != next->triangulation.finite_faces_end(); ++face) {
-        if (domain_face(*next, face)) ++next->domain_triangle_count;
+    if (next->triangulation.dimension() == 2) {
+        mark_domains(*next);
+        for (auto face = next->triangulation.finite_faces_begin();
+             face != next->triangulation.finite_faces_end(); ++face) {
+            if (domain_face(*next, face)) ++next->domain_triangle_count;
+        }
     }
 
     if (!vertices.empty()) {
@@ -344,6 +382,16 @@ void CdtContext::build(const dt_point3* points, uint64_t count) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto next = make_state(copied, {}, 1, state_->generation + 1,
                            state_->crs_wkt);
+    state_.swap(next);
+}
+
+void CdtContext::build_from_tin(std::vector<dt_point3> points,
+                                std::string crs_wkt) {
+    if (points.size() > kMaxLoadPoints) {
+        throw Exception(DT_E_LIMIT_EXCEEDED, "too many CDT base points");
+    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto next = make_state(points, {}, 1, state_->generation + 1, crs_wkt);
     state_.swap(next);
 }
 
@@ -460,6 +508,56 @@ std::unique_ptr<CdtQueryData> CdtContext::query(
         }
     }
     return result;
+}
+
+double CdtContext::sample_height_xy(const dt_point3& query_point) const {
+    validate_point(query_point);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (state_->triangulation.dimension() != 2) {
+        throw Exception(DT_E_EMPTY, "CDT has no two-dimensional surface");
+    }
+    Cdt::Locate_type type;
+    int index = 0;
+    const auto face = state_->triangulation.locate(
+        Kernel::Point_2(query_point.x, query_point.y), type, index);
+    if (type == Cdt::FACE) {
+        if (domain_face(*state_, face))
+            return interpolate_face_z(face, query_point);
+    } else if (type == Cdt::EDGE) {
+        const auto neighbor = face->neighbor(index);
+        if (domain_face(*state_, face) || domain_face(*state_, neighbor)) {
+            const auto vertices = edge_vertices(CdtEdge(face, index));
+            if (!state_->triangulation.is_infinite(vertices.first) &&
+                !state_->triangulation.is_infinite(vertices.second)) {
+                return interpolate_edge_z(vertices.first, vertices.second,
+                                          query_point);
+            }
+        }
+    } else if (type == Cdt::VERTEX) {
+        const auto vertex = face->vertex(index);
+        auto incident = state_->triangulation.incident_faces(vertex);
+        if (incident != 0) {
+            const auto begin = incident;
+            do {
+                if (domain_face(*state_, incident)) return vertex->info().z;
+                ++incident;
+            } while (incident != begin);
+        }
+    }
+    throw Exception(DT_E_NOT_FOUND,
+                    "query point is outside the active CDT domain");
+}
+
+void CdtContext::visit_domain_triangles(
+    const std::function<void(const dt_triangle3&)>& visitor) const {
+    if (!visitor) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "triangle visitor is empty");
+    }
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (auto face = state_->triangulation.finite_faces_begin();
+         face != state_->triangulation.finite_faces_end(); ++face) {
+        if (domain_face(*state_, face)) visitor(to_triangle(face));
+    }
 }
 
 bool CdtContext::validate(bool verbose) const {

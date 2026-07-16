@@ -12,8 +12,8 @@ enum dt_grid_flags {
 };
 
 enum dt_grid_to_tin_flags {
-    /* Omits NoData nodes. This may triangulate across holes until CDT support
-       is enabled, so callers must opt in explicitly. */
+    /* Omits NoData nodes. Ordinary TIN construction may bridge holes; use a
+       separate dt_cdt_handle when hard hole boundaries are required. */
     DT_GRID_TO_TIN_ALLOW_NODATA_BRIDGING = 1u << 0
 };
 
@@ -129,8 +129,8 @@ DT_API dt_status DT_CALL dt_grid_from_tin(
     dt_handle tin, const dt_tin_to_grid_options* options,
     dt_grid_handle* output_grid);
 
-/* Replaces output_tin atomically. NoData holes require explicit opt-in until
-   the constrained-Delaunay backend is available. */
+/* Replaces output_tin atomically. NoData bridging requires explicit opt-in;
+   this ordinary-TIN function does not infer CDT hole boundaries. */
 DT_API dt_status DT_CALL dt_tin_from_grid(
     dt_grid_handle grid, const dt_grid_to_tin_options* options,
     dt_handle output_tin);

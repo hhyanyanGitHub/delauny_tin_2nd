@@ -97,6 +97,7 @@ public:
 
     dt_vertex3 nearest(const dt_point3& query) const;
     dt_location_result locate(const dt_point3& query) const;
+    std::vector<dt_point3> points() const;
     std::unique_ptr<QueryData> query(const dt_bounds2& bounds) const;
     void visit_triangles(
         const std::function<void(const dt_triangle3&)>& visitor) const;

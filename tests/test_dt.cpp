@@ -33,6 +33,7 @@ void test_cdt_api() {
     dt_cdt_handle cdt = nullptr;
     require_ok(dt_cdt_create(nullptr, &cdt), "dt_cdt_create");
     assert(cdt != nullptr);
+    require_ok(dt_cdt_clear(cdt), "clear empty CDT");
 
     std::vector<dt_point3> terrain;
     for (int y = 0; y <= 6; ++y) {
@@ -116,6 +117,54 @@ void test_cdt_api() {
     }
     dt_cdt_release_query_result(query);
 
+    double sampled_z = 0.0;
+    const dt_point3 surface_query{1.0, 1.0, -999.0};
+    require_ok(dt_cdt_sample_height_xy(cdt, &surface_query, &sampled_z),
+               "sample CDT height");
+    assert(close(sampled_z, 105.0));
+    const dt_point3 hole_query{3.0, 3.0, 0.0};
+    assert(dt_cdt_sample_height_xy(cdt, &hole_query, &sampled_z) ==
+           DT_E_NOT_FOUND);
+
+    dt_tin_to_grid_options grid_options{};
+    grid_options.struct_size = sizeof(grid_options);
+    grid_options.width = 7;
+    grid_options.height = 7;
+    grid_options.geo_transform[0] = 0.0;
+    grid_options.geo_transform[1] = 1.0;
+    grid_options.geo_transform[3] = 0.0;
+    grid_options.geo_transform[5] = 1.0;
+    grid_options.nodata_value = -9999.0;
+    dt_grid_handle cdt_grid = nullptr;
+    require_ok(dt_grid_from_cdt(cdt, &grid_options, &cdt_grid),
+               "CDT to GRID");
+    dt_grid_info cdt_grid_info{};
+    require_ok(dt_grid_get_info(cdt_grid, &cdt_grid_info), "CDT GRID info");
+    assert(cdt_grid_info.width == 7 && cdt_grid_info.height == 7);
+    assert(cdt_grid_info.valid_value_count == 48);
+    std::vector<double> cdt_grid_values(49);
+    require_ok(dt_grid_read_window(cdt_grid, 0, 0, 7, 7,
+                                   cdt_grid_values.data(), 7),
+               "read CDT GRID");
+    assert(close(cdt_grid_values[0], 100.0));
+    assert(close(cdt_grid_values[8], 105.0));
+    assert(close(cdt_grid_values[24], -9999.0));
+    dt_grid_destroy(cdt_grid);
+
+    dt_contour_options cdt_contour_options{};
+    cdt_contour_options.struct_size = sizeof(cdt_contour_options);
+    cdt_contour_options.interval = 5.0;
+    cdt_contour_options.base = 0.0;
+    dt_contour_handle cdt_contours = nullptr;
+    require_ok(dt_contours_from_cdt(cdt, &cdt_contour_options, &cdt_contours),
+               "CDT contours");
+    dt_contour_info cdt_contour_info{};
+    require_ok(dt_contours_get_info(cdt_contours, &cdt_contour_info),
+               "CDT contour info");
+    assert(cdt_contour_info.line_count > 0);
+    assert(cdt_contour_info.vertex_count >= cdt_contour_info.line_count * 2);
+    dt_contours_destroy(cdt_contours);
+
     const dt_point3 crossing[] = {{1, 2.5, 109.5}, {1, 3.5, 112.5}};
     const auto crossing_status = dt_cdt_add_constraint(
         cdt, DT_CONSTRAINT_BREAKLINE, 0, crossing, 2, nullptr);
@@ -173,6 +222,34 @@ void test_cdt_api() {
                "statistics after hole removal");
     assert(loaded_stats.constraint_count == 2);
     assert(loaded_stats.domain_triangle_count > domain_before_remove);
+
+    dt_handle source_tin = nullptr;
+    require_ok(dt_create(nullptr, &source_tin), "create CDT source TIN");
+    require_ok(dt_build(source_tin, terrain.data(), terrain.size(), nullptr),
+               "build CDT source TIN");
+    require_ok(dt_set_crs_wkt(source_tin, "LOCAL_CS[\"source TIN\"]"),
+               "set source TIN CRS");
+    dt_cdt_handle copied_from_tin = nullptr;
+    require_ok(dt_cdt_create(nullptr, &copied_from_tin),
+               "create CDT copied from TIN");
+    require_ok(dt_cdt_build_from_tin(copied_from_tin, source_tin),
+               "build CDT from TIN");
+    dt_cdt_statistics copied_stats{};
+    require_ok(dt_cdt_get_statistics(copied_from_tin, &copied_stats),
+               "copied CDT statistics");
+    assert(copied_stats.base_point_count == terrain.size());
+    assert(copied_stats.constraint_count == 0);
+    size_t copied_crs_size = 0;
+    require_ok(dt_cdt_get_crs_wkt(copied_from_tin, nullptr, 0,
+                                  &copied_crs_size),
+               "copied CDT CRS size");
+    std::vector<char> copied_crs(copied_crs_size);
+    require_ok(dt_cdt_get_crs_wkt(copied_from_tin, copied_crs.data(),
+                                  copied_crs.size(), nullptr),
+               "copied CDT CRS");
+    assert(std::string(copied_crs.data()) == "LOCAL_CS[\"source TIN\"]");
+    dt_cdt_destroy(copied_from_tin);
+    dt_destroy(source_tin);
 
     dt_cdt_destroy(loaded);
     dt_cdt_destroy(cdt);
@@ -387,7 +464,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 7 && patch == 0);
+    assert(major == 0 && minor == 8 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");

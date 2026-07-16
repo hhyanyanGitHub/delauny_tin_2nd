@@ -44,6 +44,9 @@ public:
     std::unique_ptr<EditData> remove_constraint_vertex(
         dt_constraint_id id, uint64_t point_index, uint32_t flags,
         bool capture_effect);
+    std::unique_ptr<EditData> apply_constraint_edits(
+        const dt_cdt_constraint_edit* edits, uint64_t edit_count,
+        std::vector<dt_constraint_id>& result_ids, bool capture_effect);
     void remove_constraint(dt_constraint_id id);
 
     dt_cdt_statistics statistics() const;

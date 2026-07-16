@@ -26,6 +26,12 @@ enum dt_cdt_remove_vertex_flags {
     DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH = 1u << 0
 };
 
+enum dt_cdt_constraint_edit_operation {
+    DT_CDT_EDIT_ADD = 1,
+    DT_CDT_EDIT_UPDATE = 2,
+    DT_CDT_EDIT_REMOVE = 3
+};
+
 typedef struct dt_cdt_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -63,6 +69,17 @@ typedef struct dt_cdt_vertex_usage {
     uint32_t is_base_point;
     uint32_t reserved2;
 } dt_cdt_vertex_usage;
+
+typedef struct dt_cdt_constraint_edit {
+    uint32_t struct_size;
+    int32_t operation;
+    dt_constraint_id constraint_id;
+    int32_t kind;
+    uint32_t flags;
+    const dt_point3* points;
+    uint64_t point_count;
+    uint64_t reserved[2];
+} dt_cdt_constraint_edit;
 
 typedef struct dt_cdt_query_result_view {
     uint32_t struct_size;
@@ -112,6 +129,15 @@ DT_API dt_status DT_CALL dt_cdt_get_constraint_vertex_usage(
 DT_API dt_status DT_CALL dt_cdt_remove_constraint_vertex(
     dt_cdt_handle cdt, dt_constraint_id constraint_id, uint64_t point_index,
     uint32_t flags, dt_edit_result* output_effect);
+/* Applies all edits in array order and rebuilds one candidate CDT. ADD requires
+   constraint_id == 0 and a valid kind. UPDATE/REMOVE require an existing id
+   and kind == 0; UPDATE preserves the original kind. REMOVE requires no
+   points. output_constraint_ids is optional and receives the resulting id for
+   every edit. No output is committed when any edit or topology check fails. */
+DT_API dt_status DT_CALL dt_cdt_apply_constraint_edits(
+    dt_cdt_handle cdt, const dt_cdt_constraint_edit* edits,
+    uint64_t edit_count, dt_constraint_id* output_constraint_ids,
+    dt_edit_result* output_effect);
 DT_API dt_status DT_CALL dt_cdt_remove_constraint(
     dt_cdt_handle cdt, dt_constraint_id constraint_id);
 

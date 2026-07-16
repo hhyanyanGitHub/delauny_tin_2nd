@@ -1169,6 +1169,26 @@ dt_status DT_CALL dt_cdt_remove_constraint_vertex(
     });
 }
 
+dt_status DT_CALL dt_cdt_apply_constraint_edits(
+    dt_cdt_handle cdt, const dt_cdt_constraint_edit* edits,
+    uint64_t edit_count, dt_constraint_id* output_constraint_ids,
+    dt_edit_result* output_effect) {
+    if (output_effect) *output_effect = nullptr;
+    return guarded([&] {
+        std::vector<dt_constraint_id> ids;
+        auto data = require_cdt(cdt).apply_constraint_edits(
+            edits, edit_count, ids, output_effect != nullptr);
+        if (output_constraint_ids) {
+            std::copy(ids.begin(), ids.end(), output_constraint_ids);
+        }
+        if (output_effect) {
+            auto result = std::make_unique<dt_edit_result_t>();
+            result->data = std::move(*data);
+            *output_effect = result.release();
+        }
+    });
+}
+
 dt_status DT_CALL dt_cdt_remove_constraint(dt_cdt_handle cdt,
                                             dt_constraint_id constraint_id) {
     return guarded(

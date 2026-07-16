@@ -64,6 +64,7 @@ enum CommandId {
     ID_CDT_DRAW_BREAKLINE,
     ID_CDT_DRAW_OUTER,
     ID_CDT_DRAW_HOLE,
+    ID_CDT_BATCH_SAMPLE,
     ID_CDT_FINISH,
     ID_CDT_CANCEL,
     ID_CDT_MOVE_VERTEX,
@@ -404,6 +405,8 @@ private:
                     L"绘制外边界");
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DRAW_HOLE,
                     L"绘制孔洞边界");
+        AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_BATCH_SAMPLE,
+                    L"批量添加 12 条示例断裂线");
         AppendMenuW(cdt_edit_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_FINISH,
                     L"完成当前约束（Enter）");
@@ -763,6 +766,75 @@ private:
         invalidate_mesh_cache();
         std::wostringstream text;
         text << L"约束 ID=" << id << L" 已添加；可继续绘制下一条";
+        action_text_ = text.str();
+    }
+
+    void add_sample_breaklines_batch() {
+        enter_2d_view();
+        cdt_draft_.clear();
+        reset_cdt_move_selection();
+        clear_overlays();
+        if (!cdt_ || cdt_info_.vertex_count == 0) {
+            action_text_ = L"请先从当前 TIN 创建约束网或打开 DCDT";
+            return;
+        }
+        if (!constraint_lines_.empty()) {
+            action_text_ = L"批量示例要求当前约束为空，以避免与已有约束交叉";
+            return;
+        }
+        const double width = cdt_info_.bounds.xmax - cdt_info_.bounds.xmin;
+        const double height = cdt_info_.bounds.ymax - cdt_info_.bounds.ymin;
+        if (!(width > 0.0) || !(height > 0.0)) {
+            action_text_ = L"约束网范围不足，无法生成批量示例";
+            return;
+        }
+
+        constexpr size_t kLineCount = 12;
+        std::vector<std::array<dt_point3, 2>> lines(kLineCount);
+        std::vector<dt_cdt_constraint_edit> edits(kLineCount);
+        std::vector<dt_constraint_id> ids(kLineCount);
+        const double xmin = cdt_info_.bounds.xmin + width * 0.12;
+        const double xmax = cdt_info_.bounds.xmin + width * 0.88;
+        for (size_t index = 0; index < kLineCount; ++index) {
+            const double fraction =
+                0.12 + 0.76 * static_cast<double>(index + 1) /
+                           static_cast<double>(kLineCount + 1);
+            const double y = cdt_info_.bounds.ymin + height * fraction;
+            dt_point3 a{xmin, y, 0.0};
+            dt_point3 b{xmax, y, 0.0};
+            a.z = constraint_point_z(a);
+            b.z = constraint_point_z(b);
+            lines[index] = {a, b};
+            edits[index].struct_size = sizeof(dt_cdt_constraint_edit);
+            edits[index].operation = DT_CDT_EDIT_ADD;
+            edits[index].kind = DT_CONSTRAINT_BREAKLINE;
+            edits[index].points = lines[index].data();
+            edits[index].point_count = lines[index].size();
+        }
+
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_cdt_apply_constraint_edits(
+            cdt_, edits.data(), edits.size(), ids.data(), nullptr);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"批量添加示例断裂线失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        destroy_contour_layer();
+        refresh_cdt_constraints();
+        show_cdt_ = true;
+        update_layer_menu();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"已用一次原子事务添加 " << ids.size()
+             << L" 条断裂线，仅重建一次 CDT，耗时 " << std::fixed
+             << std::setprecision(1) << ms << L" ms";
         action_text_ = text.str();
     }
 
@@ -2671,6 +2743,7 @@ private:
             begin_cdt_draft(Mode::CdtHole, DT_CONSTRAINT_HOLE_BOUNDARY,
                             L"孔洞边界");
             break;
+        case ID_CDT_BATCH_SAMPLE: add_sample_breaklines_batch(); break;
         case ID_CDT_FINISH: finish_cdt_draft(); break;
         case ID_CDT_CANCEL: cancel_cdt_draft(); break;
         case ID_CDT_MOVE_VERTEX:

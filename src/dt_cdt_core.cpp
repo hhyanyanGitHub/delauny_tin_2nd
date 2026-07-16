@@ -81,6 +81,37 @@ bool compatible_z(double a, double b) {
     return std::abs(a - b) <= 1e-12 * scale;
 }
 
+bool valid_constraint_kind(int32_t kind) {
+    return kind == DT_CONSTRAINT_BREAKLINE ||
+           kind == DT_CONSTRAINT_OUTER_BOUNDARY ||
+           kind == DT_CONSTRAINT_HOLE_BOUNDARY;
+}
+
+void assign_constraint_geometry(CdtConstraint& constraint, uint32_t flags,
+                                const dt_point3* points, uint64_t count) {
+    if (!points || count == 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "constraint points is empty");
+    }
+    if (count > kMaxLoadConstraintPoints) {
+        throw Exception(DT_E_LIMIT_EXCEEDED,
+                        "too many constraint points");
+    }
+    constraint.flags = flags & DT_CONSTRAINT_CLOSED;
+    if (constraint.kind != DT_CONSTRAINT_BREAKLINE)
+        constraint.flags |= DT_CONSTRAINT_CLOSED;
+    constraint.points.assign(points, points + count);
+    if (constraint.points.size() > 1 &&
+        same_xy(constraint.points.front(), constraint.points.back())) {
+        if (!compatible_z(constraint.points.front().z,
+                          constraint.points.back().z)) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "repeated closing point has inconsistent Z");
+        }
+        constraint.points.pop_back();
+        constraint.flags |= DT_CONSTRAINT_CLOSED;
+    }
+}
+
 BarrierKey barrier_key(CdtVertexHandle a, CdtVertexHandle b) {
     const auto x = a->info().id;
     const auto y = b->info().id;
@@ -479,31 +510,12 @@ void CdtContext::build_from_tin(std::vector<dt_point3> points,
 dt_constraint_id CdtContext::add_constraint(int32_t kind, uint32_t flags,
                                              const dt_point3* points,
                                              uint64_t count) {
-    if (!points || count == 0) {
-        throw Exception(DT_E_INVALID_ARGUMENT, "constraint points is empty");
-    }
-    if (kind != DT_CONSTRAINT_BREAKLINE &&
-        kind != DT_CONSTRAINT_OUTER_BOUNDARY &&
-        kind != DT_CONSTRAINT_HOLE_BOUNDARY) {
+    if (!valid_constraint_kind(kind)) {
         throw Exception(DT_E_INVALID_ARGUMENT, "unknown constraint kind");
     }
     CdtConstraint constraint;
     constraint.kind = kind;
-    constraint.flags = flags & DT_CONSTRAINT_CLOSED;
-    if (kind != DT_CONSTRAINT_BREAKLINE) {
-        constraint.flags |= DT_CONSTRAINT_CLOSED;
-    }
-    constraint.points.assign(points, points + count);
-    if (constraint.points.size() > 1 &&
-        same_xy(constraint.points.front(), constraint.points.back())) {
-        if (!compatible_z(constraint.points.front().z,
-                          constraint.points.back().z)) {
-            throw Exception(DT_E_INVALID_ARGUMENT,
-                            "repeated closing point has inconsistent Z");
-        }
-        constraint.points.pop_back();
-        constraint.flags |= DT_CONSTRAINT_CLOSED;
-    }
+    assign_constraint_geometry(constraint, flags, points, count);
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     constraint.id = state_->next_constraint_id;
@@ -523,13 +535,6 @@ std::unique_ptr<EditData> CdtContext::update_constraint(
     dt_constraint_id id, uint32_t flags, const dt_point3* points,
     uint64_t count, bool capture_effect) {
     if (id == 0) throw Exception(DT_E_INVALID_ARGUMENT, "constraint id is zero");
-    if (!points || count == 0) {
-        throw Exception(DT_E_INVALID_ARGUMENT, "constraint points is empty");
-    }
-    if (count > kMaxLoadConstraintPoints) {
-        throw Exception(DT_E_LIMIT_EXCEEDED, "too many constraint points");
-    }
-
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto constraints = state_->constraints;
     const auto found = std::find_if(
@@ -539,19 +544,7 @@ std::unique_ptr<EditData> CdtContext::update_constraint(
         throw Exception(DT_E_NOT_FOUND, "constraint id was not found");
     }
 
-    found->flags = flags & DT_CONSTRAINT_CLOSED;
-    if (found->kind != DT_CONSTRAINT_BREAKLINE)
-        found->flags |= DT_CONSTRAINT_CLOSED;
-    found->points.assign(points, points + count);
-    if (found->points.size() > 1 &&
-        same_xy(found->points.front(), found->points.back())) {
-        if (!compatible_z(found->points.front().z, found->points.back().z)) {
-            throw Exception(DT_E_INVALID_ARGUMENT,
-                            "repeated closing point has inconsistent Z");
-        }
-        found->points.pop_back();
-        found->flags |= DT_CONSTRAINT_CLOSED;
-    }
+    assign_constraint_geometry(*found, flags, points, count);
 
     auto next = make_state(state_->base_points, constraints,
                            state_->next_constraint_id, state_->generation + 1,
@@ -644,6 +637,95 @@ std::unique_ptr<EditData> CdtContext::remove_constraint_vertex(
                            state_->crs_wkt);
     auto effect = capture_effect ? make_edit_data(*state_, *next) : nullptr;
     state_.swap(next);
+    return effect;
+}
+
+std::unique_ptr<EditData> CdtContext::apply_constraint_edits(
+    const dt_cdt_constraint_edit* edits, uint64_t edit_count,
+    std::vector<dt_constraint_id>& result_ids, bool capture_effect) {
+    if (!edits || edit_count == 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "constraint edit batch is empty");
+    }
+    if (edit_count > kMaxLoadConstraints) {
+        throw Exception(DT_E_LIMIT_EXCEEDED,
+                        "too many constraint edits");
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto constraints = state_->constraints;
+    auto next_constraint_id = state_->next_constraint_id;
+    std::vector<dt_constraint_id> ids(static_cast<size_t>(edit_count), 0);
+
+    for (uint64_t index = 0; index < edit_count; ++index) {
+        const auto& edit = edits[static_cast<size_t>(index)];
+        if (edit.struct_size != sizeof(dt_cdt_constraint_edit)) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "constraint edit struct_size is invalid");
+        }
+        if (edit.operation == DT_CDT_EDIT_ADD) {
+            if (edit.constraint_id != 0 || !valid_constraint_kind(edit.kind)) {
+                throw Exception(DT_E_INVALID_ARGUMENT,
+                                "invalid add constraint edit");
+            }
+            if (next_constraint_id == 0 ||
+                next_constraint_id ==
+                    std::numeric_limits<dt_constraint_id>::max()) {
+                throw Exception(DT_E_LIMIT_EXCEEDED,
+                                "constraint id space exhausted");
+            }
+            CdtConstraint constraint;
+            constraint.id = next_constraint_id++;
+            constraint.kind = edit.kind;
+            assign_constraint_geometry(constraint, edit.flags, edit.points,
+                                       edit.point_count);
+            constraints.push_back(std::move(constraint));
+            if (constraints.size() > kMaxLoadConstraints) {
+                throw Exception(DT_E_LIMIT_EXCEEDED,
+                                "too many CDT constraints");
+            }
+            ids[static_cast<size_t>(index)] = constraints.back().id;
+            continue;
+        }
+
+        if (edit.constraint_id == 0 || edit.kind != 0) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "update or remove edit requires an existing id "
+                            "and kind zero");
+        }
+        const auto found = std::find_if(
+            constraints.begin(), constraints.end(),
+            [&](const CdtConstraint& constraint) {
+                return constraint.id == edit.constraint_id;
+            });
+        if (found == constraints.end()) {
+            throw Exception(DT_E_NOT_FOUND,
+                            "constraint edit id was not found");
+        }
+        ids[static_cast<size_t>(index)] = edit.constraint_id;
+        if (edit.operation == DT_CDT_EDIT_UPDATE) {
+            assign_constraint_geometry(*found, edit.flags, edit.points,
+                                       edit.point_count);
+        } else if (edit.operation == DT_CDT_EDIT_REMOVE) {
+            if (edit.flags != 0 || edit.points != nullptr ||
+                edit.point_count != 0) {
+                throw Exception(DT_E_INVALID_ARGUMENT,
+                                "remove constraint edit must not contain "
+                                "geometry or flags");
+            }
+            constraints.erase(found);
+        } else {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "unknown constraint edit operation");
+        }
+    }
+
+    auto next = make_state(state_->base_points, constraints,
+                           next_constraint_id, state_->generation + 1,
+                           state_->crs_wkt);
+    auto effect = capture_effect ? make_edit_data(*state_, *next) : nullptr;
+    state_.swap(next);
+    result_ids = std::move(ids);
     return effect;
 }
 

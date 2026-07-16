@@ -1,6 +1,6 @@
 # 约束 Delaunay API
 
-本文说明 dterrain 0.10 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
+本文说明 dterrain 0.11 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
 改变普通 `dt_handle`、旧 12 接口或 TIN/GRID/等高线 API 的行为。
 
 ## 数据模型
@@ -70,9 +70,41 @@ XY 被多条约束共同引用，函数返回 `DT_E_UNSUPPORTED`，原约束、g
 交叉等规则。候选状态校验失败时操作原子回滚。`output_effect` 与约束更新接口相同，
 可选返回完整的新旧域差异。
 
-v0.10 仍以正确性为基线：添加、更新、顶点删除或整条删除约束会在候选状态中完整重建 CDT，成功后原子替换。
+v0.11 的单项添加、更新、顶点删除或整条删除仍会在候选状态中完整重建 CDT，成功后原子替换。
 这适合研究、文件交换和中等规模约束编辑；百万级实时局部约束编辑将在后续版本
 增加。
+
+### 原子批量约束事务
+
+`dt_cdt_apply_constraint_edits()` 按数组顺序处理 `ADD`、`UPDATE`、`REMOVE`：
+
+- `ADD` 要求 `constraint_id == 0` 并提供类型、标志和点序列；
+- `UPDATE` 要求已有稳定 ID，`kind == 0`，保留原约束类型；
+- `REMOVE` 要求已有稳定 ID，且不携带点、标志或类型；
+- 每个元素的 `struct_size` 必须是 `sizeof(dt_cdt_constraint_edit)`；
+- 可选 `output_constraint_ids[i]` 在成功后返回对应新增或既有 ID；
+- 可选 `output_effect` 对整批操作只计算一次完整域差异。
+
+库先在内存约束记录上按顺序应用全部操作，再完整构建一个候选 CDT。任一参数、ID、
+最小点数、交叉或孔洞规则失败时，原约束、ID 分配器、generation 和拓扑全部不变，
+输出 ID 数组也不写入。成功时 generation 只增加一次。与逐条调用相比，N 项批量
+事务把 N 次候选重建降为 1 次；它是 v0.11 面向大批量导入的性能路径，尚不等同于
+原位局部拓扑更新。
+
+```cpp
+dt_cdt_constraint_edit edits[2]{};
+edits[0].struct_size = sizeof(edits[0]);
+edits[0].operation = DT_CDT_EDIT_UPDATE;
+edits[0].constraint_id = existing_id;
+edits[0].points = moved_points;
+edits[0].point_count = moved_count;
+edits[1].struct_size = sizeof(edits[1]);
+edits[1].operation = DT_CDT_EDIT_REMOVE;
+edits[1].constraint_id = obsolete_id;
+
+dt_constraint_id ids[2]{};
+dt_cdt_apply_constraint_edits(cdt, edits, 2, ids, nullptr);
+```
 
 ## 域内查询
 

@@ -285,6 +285,88 @@ void test_cdt_api() {
     assert(dt_cdt_get_constraint_vertex_usage(cdt, breakline_id, 99,
                                               &usage) == DT_E_NOT_FOUND);
 
+    const dt_point3 batch_updated_shared[] = {
+        {1, 2.5, 109.5}, {1.5, 1.5, 107.5}, {1, 1, 105}};
+    const dt_point3 batch_added_breakline[] = {
+        {4.5, 1, 112}, {5.5, 1, 114}};
+    dt_cdt_constraint_edit batch_edits[3]{};
+    batch_edits[0].struct_size = sizeof(dt_cdt_constraint_edit);
+    batch_edits[0].operation = DT_CDT_EDIT_UPDATE;
+    batch_edits[0].constraint_id = shared_breakline_id;
+    batch_edits[0].points = batch_updated_shared;
+    batch_edits[0].point_count = 3;
+    batch_edits[1].struct_size = sizeof(dt_cdt_constraint_edit);
+    batch_edits[1].operation = DT_CDT_EDIT_ADD;
+    batch_edits[1].kind = DT_CONSTRAINT_BREAKLINE;
+    batch_edits[1].points = batch_added_breakline;
+    batch_edits[1].point_count = 2;
+    batch_edits[2].struct_size = sizeof(dt_cdt_constraint_edit);
+    batch_edits[2].operation = DT_CDT_EDIT_REMOVE;
+    batch_edits[2].constraint_id = breakline_id;
+    dt_constraint_id batch_ids[3]{};
+    cdt_effect = nullptr;
+    const uint64_t generation_before_batch = stats.generation;
+    require_ok(dt_cdt_apply_constraint_edits(
+                   cdt, batch_edits, 3, batch_ids, &cdt_effect),
+               "atomic constraint edit batch");
+    assert(batch_ids[0] == shared_breakline_id);
+    assert(batch_ids[1] != 0 && batch_ids[1] != shared_breakline_id);
+    assert(batch_ids[2] == breakline_id);
+    cdt_effect_view = {};
+    require_ok(dt_edit_result_get_view(cdt_effect, &cdt_effect_view),
+               "constraint batch effect view");
+    assert(cdt_effect_view.removed_triangle_count > 0);
+    assert(cdt_effect_view.added_triangle_count > 0);
+    dt_release_edit_result(cdt_effect);
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics after constraint batch");
+    assert(stats.constraint_count == 4);
+    assert(stats.generation == generation_before_batch + 1);
+    assert(cdt_effect_view.generation == stats.generation);
+    assert(dt_cdt_copy_constraint_points(cdt, breakline_id, nullptr, 0,
+                                         &required_points) == DT_E_NOT_FOUND);
+    required_points = 0;
+    require_ok(dt_cdt_copy_constraint_points(
+                   cdt, shared_breakline_id, nullptr, 0, &required_points),
+               "batch updated point count");
+    assert(required_points == 3);
+
+    const dt_point3 rejected_batch_update[] = {
+        {1, 2.5, 109.5}, {1.25, 1.5, 107}, {1, 1, 105}};
+    const dt_point3 rejected_batch_crossing[] = {
+        {1, 2.5, 109.5}, {5, 2.5, 117.5}};
+    dt_cdt_constraint_edit rejected_batch[2]{};
+    rejected_batch[0].struct_size = sizeof(dt_cdt_constraint_edit);
+    rejected_batch[0].operation = DT_CDT_EDIT_UPDATE;
+    rejected_batch[0].constraint_id = shared_breakline_id;
+    rejected_batch[0].points = rejected_batch_update;
+    rejected_batch[0].point_count = 3;
+    rejected_batch[1].struct_size = sizeof(dt_cdt_constraint_edit);
+    rejected_batch[1].operation = DT_CDT_EDIT_ADD;
+    rejected_batch[1].kind = DT_CONSTRAINT_BREAKLINE;
+    rejected_batch[1].points = rejected_batch_crossing;
+    rejected_batch[1].point_count = 2;
+    dt_constraint_id rejected_ids[2] = {77, 88};
+    const uint64_t generation_before_rejected_batch = stats.generation;
+    assert(dt_cdt_apply_constraint_edits(cdt, rejected_batch, 2,
+                                         rejected_ids, nullptr) ==
+           DT_E_UNSUPPORTED);
+    assert(rejected_ids[0] == 77 && rejected_ids[1] == 88);
+    require_ok(dt_cdt_get_statistics(cdt, &stats),
+               "statistics after rejected constraint batch");
+    assert(stats.generation == generation_before_rejected_batch);
+    copied.resize(3);
+    require_ok(dt_cdt_copy_constraint_points(
+                   cdt, shared_breakline_id, copied.data(), copied.size(),
+                   nullptr),
+               "batch rollback preserved earlier update");
+    assert(close(copied[1].x, 1.5) && close(copied[1].y, 1.5));
+    rejected_batch[0].struct_size = 0;
+    assert(dt_cdt_apply_constraint_edits(cdt, rejected_batch, 1, nullptr,
+                                         nullptr) == DT_E_INVALID_ARGUMENT);
+    assert(dt_cdt_apply_constraint_edits(cdt, nullptr, 0, nullptr, nullptr) ==
+           DT_E_INVALID_ARGUMENT);
+
     require_ok(dt_cdt_set_crs_wkt(cdt, "LOCAL_CS[\"CDT test\"]"),
                "set CDT CRS");
     const char* file_name = "dterrain_test_roundtrip.dcdt";
@@ -574,7 +656,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 10 && patch == 0);
+    assert(major == 0 && minor == 11 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");

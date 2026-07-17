@@ -8,6 +8,7 @@
 #include "dt_gdal_api.h"
 #include "dt_terrain_api.h"
 #include "terrain_3d.hpp"
+#include "terrain_measurement.hpp"
 #include "terrain_profile.hpp"
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <iomanip>
@@ -82,7 +84,12 @@ enum CommandId {
     ID_CDT_DELETE,
     ID_PROFILE_MODE,
     ID_PROFILE_EXPORT,
-    ID_PROFILE_CLEAR
+    ID_PROFILE_CLEAR,
+    ID_MEASURE_MODE,
+    ID_MEASURE_FINISH,
+    ID_MEASURE_DATUM,
+    ID_MEASURE_EXPORT,
+    ID_MEASURE_CLEAR
 };
 
 enum class Mode {
@@ -96,11 +103,151 @@ enum class Mode {
     CdtMoveVertex,
     CdtRemoveVertex,
     CdtDelete,
-    Profile
+    Profile,
+    Measure
 };
 enum class ViewMode { Map2D, Terrain3D };
 enum class Drag3D { None, Orbit, Pan };
 enum class ProfileSource { None, Cdt, Tin, Grid };
+
+struct DoublePromptState {
+    HWND edit = nullptr;
+    bool done = false;
+    bool accepted = false;
+    double value = 0.0;
+    const wchar_t* label = nullptr;
+};
+
+LRESULT CALLBACK double_prompt_proc(HWND window, UINT message,
+                                    WPARAM wparam, LPARAM lparam) {
+    auto* state = reinterpret_cast<DoublePromptState*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        state = static_cast<DoublePromptState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(state));
+    }
+    switch (message) {
+    case WM_CREATE: {
+        const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HWND label = CreateWindowExW(0, L"STATIC", state->label,
+            WS_CHILD | WS_VISIBLE, 18, 18, 310, 22, window, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            18, 46, 310, 25, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(1001)),
+            GetModuleHandleW(nullptr), nullptr);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"确定",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            166, 88, 76, 28, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)),
+            GetModuleHandleW(nullptr), nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            252, 88, 76, 28, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)),
+            GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        SendMessageW(state->edit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        SendMessageW(ok, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        std::wostringstream text;
+        text << std::setprecision(15) << state->value;
+        SetWindowTextW(state->edit, text.str().c_str());
+        SetFocus(state->edit);
+        SendMessageW(state->edit, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (!state) break;
+        if (LOWORD(wparam) == IDOK) {
+            wchar_t buffer[128]{};
+            GetWindowTextW(state->edit, buffer, 128);
+            wchar_t* end = nullptr;
+            const double parsed = std::wcstod(buffer, &end);
+            while (end && std::iswspace(*end)) ++end;
+            if (end == buffer || (end && *end != L'\0') ||
+                !std::isfinite(parsed)) {
+                MessageBoxW(window, L"请输入有限数值，例如 100.5。",
+                            L"无效基准高程", MB_OK | MB_ICONWARNING);
+                SetFocus(state->edit);
+                SendMessageW(state->edit, EM_SETSEL, 0, -1);
+                return 0;
+            }
+            state->value = parsed;
+            state->accepted = true;
+            state->done = true;
+            DestroyWindow(window);
+            return 0;
+        }
+        if (LOWORD(wparam) == IDCANCEL) {
+            state->done = true;
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        if (state) state->done = true;
+        DestroyWindow(window);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool prompt_double(HWND owner, const wchar_t* title, const wchar_t* label,
+                   double& value) {
+    static const wchar_t* class_name = L"dterrain_double_prompt";
+    static ATOM prompt_class = 0;
+    if (!prompt_class) {
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = double_prompt_proc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        window_class.lpszClassName = class_name;
+        prompt_class = RegisterClassW(&window_class);
+        if (!prompt_class && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            return false;
+    }
+    DoublePromptState state{};
+    state.value = value;
+    state.label = label;
+    RECT owner_rect{};
+    GetWindowRect(owner, &owner_rect);
+    constexpr int width = 364;
+    constexpr int height = 165;
+    const int x = (owner_rect.left + owner_rect.right - width) / 2;
+    const int y = (owner_rect.top + owner_rect.bottom - height) / 2;
+    HWND dialog = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, class_name, title,
+        WS_CAPTION | WS_SYSMENU | WS_POPUP, x, y, width, height,
+        owner, nullptr, GetModuleHandleW(nullptr), &state);
+    if (!dialog) return false;
+    EnableWindow(owner, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
+    MSG message{};
+    bool saw_quit = false;
+    while (!state.done) {
+        const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+        if (result <= 0) {
+            saw_quit = result == 0;
+            break;
+        }
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    if (IsWindow(dialog)) DestroyWindow(dialog);
+    EnableWindow(owner, TRUE);
+    SetActiveWindow(owner);
+    if (saw_quit) PostQuitMessage(static_cast<int>(message.wParam));
+    if (state.accepted) value = state.value;
+    return state.accepted;
+}
 
 std::wstring utf8_to_wide(const char* text) {
     if (!text || !*text) return {};
@@ -246,6 +393,25 @@ public:
         }
         case WM_KEYDOWN:
             if (view_mode_ == ViewMode::Terrain3D && handle_key3d(wparam)) return 0;
+            if (wparam == VK_RETURN && mode_ == Mode::Measure) {
+                finish_measurement();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            if (wparam == VK_BACK && mode_ == Mode::Measure &&
+                !measurement_complete_ && !measurement_polygon_.empty()) {
+                measurement_polygon_.pop_back();
+                action_text_ = L"已撤销量测多边形最后一点";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            if (wparam == VK_ESCAPE && mode_ == Mode::Measure &&
+                !measurement_polygon_.empty()) {
+                clear_measurement();
+                action_text_ = L"已清除当前面积/土方量测";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (wparam == VK_RETURN && is_cdt_draw_mode()) {
                 finish_cdt_draft();
                 InvalidateRect(hwnd_, nullptr, FALSE);
@@ -368,6 +534,11 @@ private:
     dt_point3 profile_end_{};
     std::vector<dterrain::profile::Sample> profile_samples_;
     dterrain::profile::Statistics profile_statistics_{};
+    ProfileSource measurement_source_ = ProfileSource::None;
+    bool measurement_complete_ = false;
+    double measurement_datum_z_ = 0.0;
+    std::vector<dt_point3> measurement_polygon_;
+    dterrain::measurement::Statistics measurement_statistics_{};
 
     RECT canvas_rect() const {
         RECT rect{};
@@ -492,6 +663,17 @@ private:
                     L"导出剖面 CSV…");
         AppendMenuW(analysis_menu, MF_STRING, ID_PROFILE_CLEAR,
                     L"清除剖面");
+        AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_MODE,
+                    L"面积/土方量测（逐点）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_FINISH,
+                    L"完成面积/土方量测（Enter）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_DATUM,
+                    L"设置土方基准高程…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_EXPORT,
+                    L"导出量测 CSV…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_CLEAR,
+                    L"清除面积/土方量测");
 
         layer_menu_ = CreatePopupMenu();
         AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_TIN,
@@ -556,8 +738,29 @@ private:
         if (profile_source_ == source) clear_profile();
     }
 
+    void clear_measurement() {
+        measurement_source_ = ProfileSource::None;
+        measurement_complete_ = false;
+        measurement_polygon_.clear();
+        measurement_statistics_ = {};
+    }
+
+    void clear_measurement_for_source(ProfileSource source) {
+        if (measurement_source_ == source) clear_measurement();
+    }
+
+    void clear_analysis_for_source(ProfileSource source) {
+        clear_profile_for_source(source);
+        clear_measurement_for_source(source);
+    }
+
+    void clear_analysis() {
+        clear_profile();
+        clear_measurement();
+    }
+
     void destroy_grid_layer() {
-        clear_profile_for_source(ProfileSource::Grid);
+        clear_analysis_for_source(ProfileSource::Grid);
         dt_grid_destroy(grid_);
         grid_ = nullptr;
         grid_info_ = {};
@@ -574,13 +777,13 @@ private:
 
     void clear_derived_layers(bool clear_grid = true,
                               bool clear_contours = true) {
-        clear_profile_for_source(ProfileSource::Tin);
+        clear_analysis_for_source(ProfileSource::Tin);
         if (clear_grid) destroy_grid_layer();
         if (clear_contours) destroy_contour_layer();
     }
 
     void clear_cdt_layer() {
-        clear_profile_for_source(ProfileSource::Cdt);
+        clear_analysis_for_source(ProfileSource::Cdt);
         if (cdt_) dt_cdt_clear(cdt_);
         cdt_triangles_.clear();
         constraint_lines_.clear();
@@ -713,7 +916,7 @@ private:
     }
 
     void copy_effect(dt_edit_result effect) {
-        clear_profile();
+        clear_analysis();
         clear_overlays();
         if (!effect) return;
         dt_edit_result_view view{};
@@ -850,7 +1053,7 @@ private:
             action_text_ = L"添加约束失败：" + last_error_text();
             return;
         }
-        clear_profile_for_source(ProfileSource::Cdt);
+        clear_analysis_for_source(ProfileSource::Cdt);
         cdt_draft_.clear();
         destroy_grid_layer();
         destroy_contour_layer();
@@ -916,7 +1119,7 @@ private:
             action_text_ = L"批量添加示例断裂线失败：" + last_error_text();
             return;
         }
-        clear_profile_for_source(ProfileSource::Cdt);
+        clear_analysis_for_source(ProfileSource::Cdt);
         destroy_grid_layer();
         destroy_contour_layer();
         refresh_cdt_constraints();
@@ -1171,7 +1374,7 @@ private:
             action_text_ = L"删除约束失败：" + last_error_text();
             return;
         }
-        clear_profile_for_source(ProfileSource::Cdt);
+        clear_analysis_for_source(ProfileSource::Cdt);
         destroy_grid_layer();
         destroy_contour_layer();
         refresh_cdt_constraints();
@@ -1181,13 +1384,17 @@ private:
         action_text_ = text.str();
     }
 
-    const wchar_t* profile_source_name() const {
-        switch (profile_source_) {
+    static const wchar_t* surface_source_name(ProfileSource source) {
+        switch (source) {
         case ProfileSource::Cdt: return L"约束网有效域";
         case ProfileSource::Tin: return L"TIN";
         case ProfileSource::Grid: return L"GRID";
         default: return L"无";
         }
+    }
+
+    const wchar_t* profile_source_name() const {
+        return surface_source_name(profile_source_);
     }
 
     ProfileSource select_profile_source() const {
@@ -1297,17 +1504,23 @@ private:
         return std::isfinite(output_z);
     }
 
-    bool sample_profile_point(const dterrain::profile::Point& point,
+    bool sample_surface_point(ProfileSource source,
+                              const dterrain::profile::Point& point,
                               double& output_z) {
-        if (profile_source_ == ProfileSource::Cdt) {
+        if (source == ProfileSource::Cdt) {
             dt_point3 query{point.x, point.y, 0.0};
             return dt_cdt_sample_height_xy(cdt_, &query, &output_z) == DT_OK;
         }
-        if (profile_source_ == ProfileSource::Tin)
+        if (source == ProfileSource::Tin)
             return sample_tin_profile(point, output_z);
-        if (profile_source_ == ProfileSource::Grid)
+        if (source == ProfileSource::Grid)
             return sample_grid_profile(point, output_z);
         return false;
+    }
+
+    bool sample_profile_point(const dterrain::profile::Point& point,
+                              double& output_z) {
+        return sample_surface_point(profile_source_, point, output_z);
     }
 
     bool calculate_profile() {
@@ -1427,12 +1640,197 @@ private:
         action_text_ = L"已导出剖面 CSV：" + file;
     }
 
+    bool calculate_measurement() {
+        if (measurement_polygon_.size() < 3) {
+            action_text_ = L"面积/土方量测至少需要 3 个多边形点";
+            return false;
+        }
+        std::vector<dterrain::measurement::Point> polygon;
+        polygon.reserve(measurement_polygon_.size());
+        for (const auto& point : measurement_polygon_)
+            polygon.push_back({point.x, point.y});
+        if (!dterrain::measurement::is_simple_polygon(polygon)) {
+            action_text_ = L"量测失败：多边形自交、退化或含有重复相邻点";
+            return false;
+        }
+        if (measurement_source_ == ProfileSource::None)
+            measurement_source_ = select_profile_source();
+        if (measurement_source_ == ProfileSource::None) {
+            action_text_ = L"量测失败：当前没有可采样的 TIN、GRID 或 CDT";
+            return false;
+        }
+        set_wait_cursor(true);
+        measurement_statistics_ = dterrain::measurement::integrate_polygon(
+            polygon, measurement_datum_z_, 20000,
+            [this](const dterrain::measurement::Point& point, double& z) {
+                return sample_surface_point(measurement_source_, point, z);
+            });
+        set_wait_cursor(false);
+        if (!(measurement_statistics_.polygon.area > 0.0) ||
+            !(measurement_statistics_.valid_plan_area > 0.0)) {
+            measurement_statistics_ = {};
+            action_text_ = L"量测失败：多边形在固定数据源内没有有效覆盖面积";
+            return false;
+        }
+        measurement_complete_ = true;
+        const double coverage = measurement_statistics_.valid_plan_area /
+                                measurement_statistics_.polygon.area * 100.0;
+        std::wostringstream text;
+        text << L"面积/土方完成（"
+             << surface_source_name(measurement_source_) << L"）：投影面积 "
+             << std::fixed << std::setprecision(2)
+             << measurement_statistics_.polygon.area << L"，有效覆盖 "
+             << coverage << L"%，地表面积 "
+             << measurement_statistics_.surface_area << L"，挖/填方 "
+             << measurement_statistics_.cut_volume << L"/"
+             << measurement_statistics_.fill_volume << L"（基准 Z="
+             << measurement_datum_z_ << L"）";
+        action_text_ = text.str();
+        return true;
+    }
+
+    void begin_measurement_mode() {
+        double datum = measurement_datum_z_;
+        if (!prompt_double(hwnd_, L"面积/土方量测",
+                           L"请输入水平设计基准高程 Z：", datum)) {
+            action_text_ = L"已取消面积/土方量测";
+            return;
+        }
+        enter_2d_view();
+        cdt_draft_.clear();
+        reset_cdt_move_selection();
+        cancel_box_zoom();
+        clear_measurement();
+        measurement_datum_z_ = datum;
+        mode_ = Mode::Measure;
+        action_text_ = L"逐点单击量测多边形；Enter 完成，Backspace 撤点，Esc 清除";
+    }
+
+    void measurement_click(const dt_point3& world) {
+        if (measurement_complete_) clear_measurement();
+        if (measurement_polygon_.empty()) {
+            measurement_source_ = select_profile_source();
+            if (measurement_source_ == ProfileSource::None) {
+                action_text_ = L"量测失败：当前没有可采样地形表面";
+                return;
+            }
+        }
+        if (!measurement_polygon_.empty()) {
+            const auto& previous = measurement_polygon_.back();
+            const double scale = std::max(
+                {1.0, std::abs(previous.x), std::abs(previous.y),
+                 std::abs(world.x), std::abs(world.y)});
+            if (std::hypot(world.x - previous.x, world.y - previous.y) <=
+                std::numeric_limits<double>::epsilon() * scale * 32.0) {
+                action_text_ = L"量测点与上一点过近，已忽略";
+                return;
+            }
+        }
+        dt_point3 point = world;
+        if (!sample_surface_point(measurement_source_, {world.x, world.y},
+                                  point.z)) {
+            point.z = std::numeric_limits<double>::quiet_NaN();
+        }
+        measurement_polygon_.push_back(point);
+        std::wostringstream text;
+        text << L"量测多边形已输入 " << measurement_polygon_.size()
+             << L" 点；固定数据源="
+             << surface_source_name(measurement_source_)
+             << L"，Enter 完成";
+        action_text_ = text.str();
+    }
+
+    void finish_measurement() {
+        if (mode_ != Mode::Measure) {
+            action_text_ = L"请先选择“面积/土方量测（逐点）”";
+            return;
+        }
+        if (measurement_complete_) {
+            action_text_ = L"量测已完成；可导出 CSV、修改基准或单击开始新多边形";
+            return;
+        }
+        calculate_measurement();
+    }
+
+    void set_measurement_datum() {
+        double datum = measurement_datum_z_;
+        if (!prompt_double(hwnd_, L"设置土方基准高程",
+                           L"请输入水平设计基准高程 Z：", datum)) {
+            return;
+        }
+        measurement_datum_z_ = datum;
+        if (measurement_complete_) {
+            measurement_complete_ = false;
+            calculate_measurement();
+        } else {
+            std::wostringstream text;
+            text << L"土方基准高程已设置为 Z=" << std::setprecision(15)
+                 << datum;
+            action_text_ = text.str();
+        }
+    }
+
+    void export_measurement_csv() {
+        if (!measurement_complete_ || measurement_polygon_.empty()) {
+            action_text_ = L"没有可导出的面积/土方结果，请先完成多边形量测";
+            return;
+        }
+        const auto file = choose_file(
+            true, L"terrain_measurement.csv",
+            L"CSV 量测 (*.csv)\0*.csv\0所有文件 (*.*)\0*.*\0", L"csv");
+        if (file.empty()) return;
+        std::ostringstream output;
+        output << std::setprecision(17);
+        output << "# source,"
+               << wide_to_utf8(surface_source_name(measurement_source_))
+               << "\r\n";
+        output << "# datum_z," << measurement_datum_z_ << "\r\n";
+        output << "# polygon_area," << measurement_statistics_.polygon.area
+               << "\r\n# perimeter," << measurement_statistics_.polygon.perimeter
+               << "\r\n# valid_plan_area," << measurement_statistics_.valid_plan_area
+               << "\r\n# surface_area," << measurement_statistics_.surface_area
+               << "\r\n# minimum_z," << measurement_statistics_.minimum_z
+               << "\r\n# maximum_z," << measurement_statistics_.maximum_z
+               << "\r\n# mean_z," << measurement_statistics_.mean_z
+               << "\r\n# cut_volume," << measurement_statistics_.cut_volume
+               << "\r\n# fill_volume," << measurement_statistics_.fill_volume
+               << "\r\n# net_cut_volume," << measurement_statistics_.net_cut_volume
+               << "\r\n# valid_micro_triangles,"
+               << measurement_statistics_.valid_micro_triangle_count
+               << "\r\n# total_micro_triangles,"
+               << measurement_statistics_.total_micro_triangle_count
+               << "\r\n";
+        output << "index,x,y,z,valid\r\n";
+        for (size_t index = 0; index < measurement_polygon_.size(); ++index) {
+            const auto& point = measurement_polygon_[index];
+            const bool valid = std::isfinite(point.z);
+            output << index << ',' << point.x << ',' << point.y << ',';
+            if (valid) output << point.z;
+            output << ',' << (valid ? 1 : 0) << "\r\n";
+        }
+        const std::string bytes = output.str();
+        FILE* stream = _wfopen(file.c_str(), L"wb");
+        if (!stream) {
+            action_text_ = L"量测 CSV 导出失败：无法创建文件";
+            return;
+        }
+        const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), stream);
+        const int close_status = std::fclose(stream);
+        if (written != bytes.size() || close_status != 0) {
+            action_text_ = L"量测 CSV 导出失败：文件写入不完整";
+            return;
+        }
+        action_text_ = L"已导出面积/土方量测 CSV：" + file;
+    }
+
     void on_left_click(int x, int y) {
         if (!view_valid_) return;
         const dt_point3 world = screen_to_world(x, y);
         const auto begin = std::chrono::steady_clock::now();
         if (mode_ == Mode::Profile) {
             profile_click(world);
+        } else if (mode_ == Mode::Measure) {
+            measurement_click(world);
         } else if (is_cdt_draw_mode()) {
             append_cdt_draft_point(world);
         } else if (mode_ == Mode::CdtMoveVertex) {
@@ -2414,6 +2812,78 @@ private:
                   DT_RIGHT | DT_TOP | DT_SINGLELINE);
     }
 
+    void draw_measurement(HDC dc, const RECT& canvas) const {
+        if (measurement_polygon_.empty()) return;
+        std::vector<POINT> points;
+        points.reserve(measurement_polygon_.size());
+        for (const auto& point : measurement_polygon_)
+            points.push_back(world_to_screen(point));
+        SetBkMode(dc, TRANSPARENT);
+        HPEN outline = CreatePen(
+            PS_SOLID, measurement_complete_ ? 3 : 2,
+            measurement_complete_ ? RGB(255, 150, 45) : RGB(255, 220, 70));
+        const auto old_pen = SelectObject(dc, outline);
+        if (measurement_complete_ && points.size() >= 3) {
+            HBRUSH hatch = CreateHatchBrush(HS_DIAGCROSS, RGB(235, 130, 40));
+            const auto old_brush = SelectObject(dc, hatch);
+            Polygon(dc, points.data(), static_cast<int>(points.size()));
+            SelectObject(dc, old_brush);
+            DeleteObject(hatch);
+        } else if (points.size() >= 2) {
+            Polyline(dc, points.data(), static_cast<int>(points.size()));
+        }
+        SelectObject(dc, old_pen);
+        DeleteObject(outline);
+
+        HBRUSH vertex_brush = CreateSolidBrush(RGB(255, 235, 120));
+        const auto old_brush = SelectObject(dc, vertex_brush);
+        for (std::size_t index = 0; index < points.size(); ++index) {
+            const int radius = index == 0 ? 6 : 4;
+            Ellipse(dc, points[index].x - radius, points[index].y - radius,
+                    points[index].x + radius + 1,
+                    points[index].y + radius + 1);
+        }
+        SelectObject(dc, old_brush);
+        DeleteObject(vertex_brush);
+        SetTextColor(dc, RGB(255, 245, 200));
+        TextOutW(dc, points.front().x + 8, points.front().y - 18, L"P1", 2);
+
+        if (!measurement_complete_) return;
+        const double coverage = measurement_statistics_.valid_plan_area /
+                                measurement_statistics_.polygon.area * 100.0;
+        RECT panel{canvas.left + 16, canvas.top + 16,
+                   canvas.right - 16, canvas.top + 92};
+        HBRUSH panel_brush = CreateSolidBrush(RGB(37, 31, 26));
+        FillRect(dc, &panel, panel_brush);
+        DeleteObject(panel_brush);
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(230, 145, 55));
+        const auto previous_pen = SelectObject(dc, border);
+        const auto hollow = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, panel.left, panel.top, panel.right, panel.bottom);
+        SelectObject(dc, hollow);
+        SelectObject(dc, previous_pen);
+        DeleteObject(border);
+        std::wostringstream text;
+        text << L"面积/土方量测｜" << surface_source_name(measurement_source_)
+             << L"｜投影面积 " << std::fixed << std::setprecision(2)
+             << measurement_statistics_.polygon.area << L"｜周长 "
+             << measurement_statistics_.polygon.perimeter << L"｜有效覆盖 "
+             << coverage << L"%｜地表面积 "
+             << measurement_statistics_.surface_area << L"\n平均/最低/最高 Z "
+             << measurement_statistics_.mean_z << L" / "
+             << measurement_statistics_.minimum_z << L" / "
+             << measurement_statistics_.maximum_z << L"｜基准 Z "
+             << measurement_datum_z_ << L"｜挖/填/净挖方 "
+             << measurement_statistics_.cut_volume << L" / "
+             << measurement_statistics_.fill_volume << L" / "
+             << measurement_statistics_.net_cut_volume << L"（积分估算）";
+        SetTextColor(dc, RGB(250, 235, 215));
+        RECT text_rect{panel.left + 10, panel.top + 8,
+                       panel.right - 10, panel.bottom - 6};
+        DrawTextW(dc, text.str().c_str(), -1, &text_rect,
+                  DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+    }
+
     void paint() {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd_, &ps);
@@ -2454,6 +2924,7 @@ private:
             draw_highlight(dc);
             draw_contours(dc);
             draw_box_zoom(dc);
+            draw_measurement(dc, canvas);
             draw_profile(dc, canvas);
         }
         RestoreDC(dc, saved);
@@ -2477,7 +2948,8 @@ private:
                               mode_ == Mode::CdtMoveVertex ? L"移动约束顶点" :
                               mode_ == Mode::CdtRemoveVertex ? L"删除约束顶点" :
                               mode_ == Mode::CdtDelete ? L"删除约束" :
-                              mode_ == Mode::Profile ? L"任意剖面" : L"查询";
+                              mode_ == Mode::Profile ? L"任意剖面" :
+                              mode_ == Mode::Measure ? L"面积/土方" : L"查询";
         std::wostringstream text;
         text << L"  视图: "
              << (view_mode_ == ViewMode::Terrain3D ? L"3D" : L"2D")
@@ -2689,7 +3161,7 @@ private:
         const dt_status status = dt_cdt_build_from_tin(cdt_, mesh_);
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
-        if (status == DT_OK) clear_profile_for_source(ProfileSource::Cdt);
+        if (status == DT_OK) clear_analysis_for_source(ProfileSource::Cdt);
         if (status != DT_OK || !refresh_cdt_constraints()) {
             action_text_ = L"创建约束网失败：" + last_error_text();
             return;
@@ -2841,7 +3313,7 @@ private:
             action_text_ = L"GRID→TIN 失败：" + last_error_text();
             return;
         }
-        clear_profile_for_source(ProfileSource::Tin);
+        clear_analysis_for_source(ProfileSource::Tin);
         destroy_contour_layer();
         clear_overlays();
         show_tin_ = true;
@@ -2877,7 +3349,7 @@ private:
             action_text_ = L"等高线→TIN 失败：" + last_error_text();
             return;
         }
-        clear_profile_for_source(ProfileSource::Tin);
+        clear_analysis_for_source(ProfileSource::Tin);
         destroy_grid_layer();
         clear_cdt_layer();
         clear_overlays();
@@ -3359,7 +3831,7 @@ private:
             cdt_, wide_to_utf8(file.c_str()).c_str(), nullptr);
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
-        if (status == DT_OK) clear_profile_for_source(ProfileSource::Cdt);
+        if (status == DT_OK) clear_analysis_for_source(ProfileSource::Cdt);
         if (status != DT_OK || !refresh_cdt_constraints()) {
             action_text_ = L"约束网导入失败：" + last_error_text();
             return;
@@ -3476,6 +3948,14 @@ private:
         case ID_PROFILE_CLEAR:
             clear_profile();
             action_text_ = L"剖面已清除";
+            break;
+        case ID_MEASURE_MODE: begin_measurement_mode(); break;
+        case ID_MEASURE_FINISH: finish_measurement(); break;
+        case ID_MEASURE_DATUM: set_measurement_datum(); break;
+        case ID_MEASURE_EXPORT: export_measurement_csv(); break;
+        case ID_MEASURE_CLEAR:
+            clear_measurement();
+            action_text_ = L"面积/土方量测已清除";
             break;
         case ID_TIN_TO_GRID: convert_tin_to_grid(); break;
         case ID_GRID_TO_TIN: convert_grid_to_tin(); break;

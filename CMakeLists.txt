@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.14.0
+    VERSION 0.15.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -159,6 +159,12 @@ if(DT_BUILD_TESTS)
     target_include_directories(dterrain_profile_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/gui)
     add_test(NAME dterrain_profile_tests COMMAND dterrain_profile_tests)
+
+    add_executable(dterrain_measurement_tests tests/test_measurement.cpp)
+    target_compile_features(dterrain_measurement_tests PRIVATE cxx_std_17)
+    target_include_directories(dterrain_measurement_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/gui)
+    add_test(NAME dterrain_measurement_tests COMMAND dterrain_measurement_tests)
 endif()
 
 if(DT_BUILD_EXAMPLES)

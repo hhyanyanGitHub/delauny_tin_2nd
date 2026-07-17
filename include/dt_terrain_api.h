@@ -82,7 +82,12 @@ typedef struct dt_grid_terrain_options {
        options structure cannot collide with valid 0-degree/0-gray results;
        otherwise this may be finite or NaN. */
     double output_nodata_value;
-    uint64_t reserved2[4];
+    /* Zero selects an implementation-defined automatic count. One forces
+       deterministic single-thread execution. Values above 64 are rejected. */
+    uint32_t worker_count;
+    /* Rows claimed by one worker at a time. Zero selects 64 rows. */
+    uint32_t tile_row_count;
+    uint64_t reserved2[3];
 } dt_grid_terrain_options;
 
 typedef struct dt_contours_to_tin_options {

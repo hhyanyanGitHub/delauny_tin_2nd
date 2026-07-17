@@ -559,6 +559,8 @@ private:
     double terrain_z_factor_ = 1.0;
     double terrain_sun_azimuth_ = 315.0;
     double terrain_sun_altitude_ = 45.0;
+    uint32_t terrain_worker_count_ = 0;
+    uint32_t terrain_tile_rows_ = 0;
     dt_contour_info contour_info_{};
     HWND view_button_ = nullptr;
     HWND exaggeration_button_ = nullptr;
@@ -736,7 +738,7 @@ private:
         AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_HILLSHADE_GRID,
                     L"生成阴影地形图（当前光照参数）");
         AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_PARAMETERS,
-                    L"设置专题分析参数…");
+                    L"设置专题分析与性能参数…");
         AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_CANCEL,
                     L"取消正在进行的专题计算（Esc）");
         AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_SHOW_ELEVATION,
@@ -3927,6 +3929,8 @@ private:
         double z_factor = terrain_z_factor_;
         double azimuth = terrain_sun_azimuth_;
         double altitude = terrain_sun_altitude_;
+        double workers = static_cast<double>(terrain_worker_count_);
+        double tile_rows = static_cast<double>(terrain_tile_rows_);
         if (!prompt_double(hwnd_, L"专题分析参数",
                            L"高程单位系数 z-factor（必须大于 0）：",
                            z_factor))
@@ -3949,15 +3953,47 @@ private:
                         L"无效参数", MB_OK | MB_ICONWARNING);
             return;
         }
+        if (!prompt_double(hwnd_, L"专题计算性能",
+                           L"工作线程数（0=自动，1=单线程，最大 64）：",
+                           workers))
+            return;
+        if (workers < 0.0 || workers > 64.0 ||
+            workers != std::floor(workers)) {
+            MessageBoxW(hwnd_, L"线程数必须是 0 到 64 之间的整数。",
+                        L"无效参数", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (!prompt_double(hwnd_, L"专题计算性能",
+                           L"分块行数（0=自动 64，最大 1048576）：",
+                           tile_rows))
+            return;
+        if (tile_rows < 0.0 || tile_rows > 1048576.0 ||
+            tile_rows != std::floor(tile_rows)) {
+            MessageBoxW(hwnd_,
+                        L"分块行数必须是 0 到 1048576 之间的整数。",
+                        L"无效参数", MB_OK | MB_ICONWARNING);
+            return;
+        }
         azimuth = std::fmod(azimuth, 360.0);
         if (azimuth < 0.0) azimuth += 360.0;
         terrain_z_factor_ = z_factor;
         terrain_sun_azimuth_ = azimuth;
         terrain_sun_altitude_ = altitude;
+        terrain_worker_count_ = static_cast<uint32_t>(workers);
+        terrain_tile_rows_ = static_cast<uint32_t>(tile_rows);
         std::wostringstream text;
         text << L"专题参数已更新：z-factor=" << std::setprecision(8)
              << terrain_z_factor_ << L"，光照 " << terrain_sun_azimuth_
-             << L"°/" << terrain_sun_altitude_ << L"°";
+             << L"°/" << terrain_sun_altitude_ << L"°，线程=";
+        if (terrain_worker_count_ == 0)
+            text << L"自动";
+        else
+            text << terrain_worker_count_;
+        text << L"，块高=";
+        if (terrain_tile_rows_ == 0)
+            text << L"自动(64)";
+        else
+            text << terrain_tile_rows_;
         action_text_ = text.str();
     }
 
@@ -3982,6 +4018,8 @@ private:
         options.sun_azimuth_degrees = terrain_sun_azimuth_;
         options.sun_altitude_degrees = terrain_sun_altitude_;
         options.output_nodata_value = -9999.0;
+        options.worker_count = terrain_worker_count_;
+        options.tile_row_count = terrain_tile_rows_;
         const wchar_t* requested_name =
             kind == DT_GRID_TERRAIN_SLOPE_DEGREES
                 ? L"坡度"
@@ -4093,6 +4131,13 @@ private:
         if (grid_theme_ == GridTheme::Hillshade)
             text << L"，光照 " << terrain_sun_azimuth_ << L"°/"
                  << terrain_sun_altitude_ << L"°";
+        text << L"，线程=";
+        if (terrain_worker_count_ == 0)
+            text << L"自动";
+        else
+            text << terrain_worker_count_;
+        text << L"，块高="
+             << (terrain_tile_rows_ == 0 ? 64U : terrain_tile_rows_);
         if (grid_preview_.empty()) text << L"（数据已生成，预览超过 2000 万节点上限）";
         action_text_ = text.str();
         if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);

@@ -43,6 +43,10 @@ public:
     dt_surface_analysis analyze_surface_xy(const dt_point3& query) const;
 
 private:
+    friend std::unique_ptr<Grid> grid_derive_terrain(
+        const Grid& source, const dt_grid_terrain_options& options,
+        const ProgressCallback& progress, const CancelCallback& cancelled);
+
     dt_grid_create_options options_{};
     std::vector<double> values_;
     std::string crs_wkt_;

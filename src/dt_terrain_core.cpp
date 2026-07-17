@@ -4,14 +4,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -500,6 +506,19 @@ std::unique_ptr<Grid> grid_derive_terrain(
         throw Exception(DT_E_INVALID_ARGUMENT,
                         "invalid hillshade illumination angles");
     }
+    if (options.worker_count > 64) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "terrain analysis worker_count exceeds 64");
+    }
+    constexpr uint32_t kDefaultTileRows = 64;
+    constexpr uint32_t kMaximumTileRows = 1024U * 1024U;
+    const uint32_t tile_rows = options.tile_row_count == 0
+                                   ? kDefaultTileRows
+                                   : options.tile_row_count;
+    if (tile_rows > kMaximumTileRows) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "terrain analysis tile_row_count is too large");
+    }
 
     dt_grid_create_options create{};
     create.struct_size = sizeof(create);
@@ -525,22 +544,24 @@ std::unique_ptr<Grid> grid_derive_terrain(
     const auto& values = source.values();
     const uint64_t width = source.width();
     const uint64_t height = source.height();
-    std::vector<double> row_values(static_cast<size_t>(width),
-                                   create.nodata_value);
     const auto value_at = [&](uint64_t column, uint64_t row) {
         return values[static_cast<size_t>(row * width + column)];
     };
     const auto valid = [&](double value) {
         return finite(value) && !source.is_nodata(value);
     };
-
-    report_progress(progress, 0.0);
-    for (uint64_t row = 0; row < height; ++row) {
-        check_cancelled(cancelled);
+    const auto compute_row = [&](uint64_t row,
+                                 const std::atomic<bool>* stop_requested) {
         const uint64_t previous_row = row == 0 ? row : row - 1;
         const uint64_t next_row = row + 1 < height ? row + 1 : row;
         const double row_span = static_cast<double>(next_row - previous_row);
+        double* row_output = output->values_.data() +
+                             static_cast<size_t>(row * width);
         for (uint64_t column = 0; column < width; ++column) {
+            if (stop_requested && (column & 4095U) == 0U &&
+                stop_requested->load()) {
+                return false;
+            }
             const uint64_t previous_column = column == 0 ? column : column - 1;
             const uint64_t next_column =
                 column + 1 < width ? column + 1 : column;
@@ -553,7 +574,7 @@ std::unique_ptr<Grid> grid_derive_terrain(
             const double below = value_at(column, next_row);
             if (!valid(center) || !valid(left) || !valid(right) ||
                 !valid(above) || !valid(below)) {
-                row_values[static_cast<size_t>(column)] = create.nodata_value;
+                row_output[static_cast<size_t>(column)] = create.nodata_value;
                 continue;
             }
             const double dz_dcolumn =
@@ -578,13 +599,111 @@ std::unique_ptr<Grid> grid_derive_terrain(
                     (-dz_dx * sun_x - dz_dy * sun_y + sun_z) / length;
                 derived = 255.0 * std::max(0.0, illumination);
             }
-            row_values[static_cast<size_t>(column)] = derived;
+            row_output[static_cast<size_t>(column)] = derived;
         }
-        output->write_window(0, row, width, 1, row_values.data(), width);
-        report_progress(progress,
-                        static_cast<double>(row + 1) /
-                            static_cast<double>(height));
+        return true;
+    };
+
+    const uint64_t tile_count =
+        (height + static_cast<uint64_t>(tile_rows) - 1U) / tile_rows;
+    uint32_t worker_count = options.worker_count;
+    if (worker_count == 0) {
+        worker_count = std::thread::hardware_concurrency();
+        if (worker_count == 0) worker_count = 4;
+        worker_count = std::min(worker_count, 32U);
     }
+    worker_count = static_cast<uint32_t>(std::min<uint64_t>(
+        worker_count, std::max<uint64_t>(1, tile_count)));
+
+    report_progress(progress, 0.0);
+    if (worker_count == 1) {
+        for (uint64_t row = 0; row < height; ++row) {
+            check_cancelled(cancelled);
+            compute_row(row, nullptr);
+            report_progress(progress,
+                            static_cast<double>(row + 1) /
+                                static_cast<double>(height));
+        }
+    } else {
+        std::atomic<uint64_t> next_row{0};
+        std::atomic<uint64_t> completed_rows{0};
+        std::atomic<uint32_t> active_workers{worker_count};
+        std::atomic<bool> stop_requested{false};
+        std::mutex event_mutex;
+        std::condition_variable event;
+        std::mutex error_mutex;
+        std::exception_ptr worker_error;
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        const auto worker = [&] {
+            try {
+                while (!stop_requested.load()) {
+                    const uint64_t begin = next_row.fetch_add(tile_rows);
+                    if (begin >= height) break;
+                    const uint64_t end = std::min<uint64_t>(
+                        height, begin + static_cast<uint64_t>(tile_rows));
+                    for (uint64_t row = begin; row < end; ++row) {
+                        if (stop_requested.load() ||
+                            !compute_row(row, &stop_requested)) {
+                            break;
+                        }
+                        completed_rows.fetch_add(1);
+                    }
+                    event.notify_one();
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!worker_error) worker_error = std::current_exception();
+                }
+                stop_requested.store(true);
+            }
+            active_workers.fetch_sub(1);
+            event.notify_one();
+        };
+
+        try {
+            for (uint32_t i = 0; i < worker_count; ++i)
+                workers.emplace_back(worker);
+        } catch (...) {
+            stop_requested.store(true);
+            for (auto& thread : workers)
+                if (thread.joinable()) thread.join();
+            throw;
+        }
+
+        bool cancellation_seen = false;
+        std::exception_ptr coordinator_error;
+        try {
+            while (active_workers.load() != 0) {
+                if (cancelled && cancelled()) {
+                    cancellation_seen = true;
+                    stop_requested.store(true);
+                }
+                report_progress(
+                    progress,
+                    static_cast<double>(completed_rows.load()) /
+                        static_cast<double>(height));
+                std::unique_lock<std::mutex> lock(event_mutex);
+                event.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                    return active_workers.load() == 0;
+                });
+            }
+        } catch (...) {
+            coordinator_error = std::current_exception();
+            stop_requested.store(true);
+        }
+        for (auto& thread : workers)
+            if (thread.joinable()) thread.join();
+        if (coordinator_error) std::rethrow_exception(coordinator_error);
+        if (worker_error) std::rethrow_exception(worker_error);
+        if (cancellation_seen || (cancelled && cancelled())) {
+            throw Exception(DT_E_CANCELLED,
+                            "terrain operation was cancelled");
+        }
+    }
+    ++output->generation_;
+    report_progress(progress, 1.0);
     return output;
 }
 

@@ -686,9 +686,11 @@ void test_random_dynamic_sequence() {
 }
 
 void test_grid_and_contours() {
+    static_assert(sizeof(dt_grid_terrain_options) == 80,
+                  "terrain options ABI size changed");
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 20 && patch == 0);
+    assert(major == 0 && minor == 22 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");
@@ -785,6 +787,29 @@ void test_grid_and_contours() {
         std::atan(std::sqrt(2.0)) * 180.0 / std::acos(-1.0);
     for (double value : terrain_values) assert(close(value, plane_slope));
     dt_grid_destroy(terrain_grid);
+
+    terrain_options.worker_count = 4;
+    terrain_options.tile_row_count = 1;
+    require_ok(dt_grid_derive_terrain(grid, &terrain_options, &terrain_grid),
+               "derive parallel slope GRID");
+    require_ok(dt_grid_read_window(terrain_grid, 0, 0, 3, 3,
+                                   terrain_values, 3),
+               "read parallel slope GRID");
+    for (double value : terrain_values) assert(close(value, plane_slope));
+    require_ok(dt_grid_get_info(terrain_grid, &terrain_info),
+               "parallel slope info");
+    assert(terrain_info.generation == 2);
+    dt_grid_destroy(terrain_grid);
+    terrain_options.worker_count = 65;
+    terrain_grid = reinterpret_cast<dt_grid_handle>(1);
+    assert(dt_grid_derive_terrain(grid, &terrain_options, &terrain_grid) ==
+           DT_E_INVALID_ARGUMENT);
+    assert(terrain_grid == nullptr);
+    terrain_options.worker_count = 0;
+    terrain_options.tile_row_count = 1024U * 1024U + 1U;
+    assert(dt_grid_derive_terrain(grid, &terrain_options, &terrain_grid) ==
+           DT_E_INVALID_ARGUMENT);
+    terrain_options.tile_row_count = 0;
 
     terrain_options.kind = DT_GRID_TERRAIN_ASPECT_DEGREES;
     require_ok(dt_grid_derive_terrain(grid, &terrain_options, &terrain_grid),
@@ -1153,6 +1178,8 @@ void test_grid_and_contours() {
 
     terrain_options.kind = DT_GRID_TERRAIN_SLOPE_DEGREES;
     terrain_options.output_nodata_value = -9999.0;
+    terrain_options.worker_count = 4;
+    terrain_options.tile_row_count = 1;
     dt_task_handle terrain_task = nullptr;
     require_ok(dt_grid_derive_terrain_async(grid, &terrain_options,
                                              &terrain_task),
@@ -1186,6 +1213,7 @@ void test_grid_and_contours() {
     dt_grid_handle large_grid = nullptr;
     require_ok(dt_grid_create(&large_options, &large_grid),
                "large cancellation grid create");
+    terrain_options.tile_row_count = 8;
     terrain_task = nullptr;
     require_ok(dt_grid_derive_terrain_async(large_grid, &terrain_options,
                                              &terrain_task),

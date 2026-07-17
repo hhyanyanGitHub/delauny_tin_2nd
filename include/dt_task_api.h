@@ -36,6 +36,9 @@ typedef struct dt_task_t* dt_task_handle;
 DT_API dt_status DT_CALL dt_grid_from_tin_async(
     dt_handle tin, const dt_tin_to_grid_options* options,
     dt_task_handle* output_task);
+DT_API dt_status DT_CALL dt_grid_derive_terrain_async(
+    dt_grid_handle source_grid, const dt_grid_terrain_options* options,
+    dt_task_handle* output_task);
 DT_API dt_status DT_CALL dt_tin_from_grid_async(
     dt_grid_handle grid, const dt_grid_to_tin_options* options,
     dt_handle output_tin, dt_task_handle* output_task);

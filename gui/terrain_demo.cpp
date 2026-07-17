@@ -6,6 +6,7 @@
 #include "dt_api.h"
 #include "dt_cdt_api.h"
 #include "dt_gdal_api.h"
+#include "dt_task_api.h"
 #include "dt_terrain_api.h"
 #include "terrain_3d.hpp"
 #include "terrain_measurement.hpp"
@@ -95,6 +96,8 @@ enum CommandId {
     ID_TERRAIN_SLOPE_GRID,
     ID_TERRAIN_ASPECT_GRID,
     ID_TERRAIN_HILLSHADE_GRID,
+    ID_TERRAIN_PARAMETERS,
+    ID_TERRAIN_CANCEL,
     ID_TERRAIN_SHOW_ELEVATION,
     ID_TERRAIN_EXPORT_GRID,
     ID_TERRAIN_EXPORT_GEOTIFF
@@ -344,6 +347,16 @@ public:
         case WM_COMMAND:
             on_command(LOWORD(wparam));
             return 0;
+        case WM_CLOSE:
+            if (terrain_task_running_) {
+                close_after_terrain_task_ = true;
+                dt_task_request_cancel(terrain_task_);
+                action_text_ = L"正在取消专题计算，完成后关闭窗口…";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            DestroyWindow(hwnd_);
+            return 0;
         case WM_SIZE:
             layout_controls();
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -403,6 +416,14 @@ public:
             return 0;
         }
         case WM_KEYDOWN:
+            if (terrain_task_running_) {
+                if (wparam == VK_ESCAPE) {
+                    dt_task_request_cancel(terrain_task_);
+                    action_text_ = L"已请求取消专题计算…";
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (view_mode_ == ViewMode::Terrain3D && handle_key3d(wparam)) return 0;
             if (wparam == VK_RETURN && mode_ == Mode::Measure) {
                 finish_measurement();
@@ -532,6 +553,12 @@ private:
     double grid_zmin_ = 0.0;
     double grid_zmax_ = 1.0;
     GridTheme grid_theme_ = GridTheme::Elevation;
+    dt_task_handle terrain_task_ = nullptr;
+    bool terrain_task_running_ = false;
+    bool close_after_terrain_task_ = false;
+    double terrain_z_factor_ = 1.0;
+    double terrain_sun_azimuth_ = 315.0;
+    double terrain_sun_altitude_ = 45.0;
     dt_contour_info contour_info_{};
     HWND view_button_ = nullptr;
     HWND exaggeration_button_ = nullptr;
@@ -707,7 +734,11 @@ private:
         AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_ASPECT_GRID,
                     L"生成全幅坡向专题图");
         AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_HILLSHADE_GRID,
-                    L"生成阴影地形图（315°/45°）");
+                    L"生成阴影地形图（当前光照参数）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_PARAMETERS,
+                    L"设置专题分析参数…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_CANCEL,
+                    L"取消正在进行的专题计算（Esc）");
         AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_SHOW_ELEVATION,
                     L"恢复显示高程 GRID");
         AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
@@ -3892,6 +3923,44 @@ private:
         action_text_ = text.str();
     }
 
+    void configure_terrain_parameters() {
+        double z_factor = terrain_z_factor_;
+        double azimuth = terrain_sun_azimuth_;
+        double altitude = terrain_sun_altitude_;
+        if (!prompt_double(hwnd_, L"专题分析参数",
+                           L"高程单位系数 z-factor（必须大于 0）：",
+                           z_factor))
+            return;
+        if (z_factor <= 0.0) {
+            MessageBoxW(hwnd_, L"z-factor 必须大于 0。", L"无效参数",
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (!prompt_double(hwnd_, L"阴影地形参数",
+                           L"太阳方位角（度，北为 0，顺时针）：",
+                           azimuth))
+            return;
+        if (!prompt_double(hwnd_, L"阴影地形参数",
+                           L"太阳高度角（度，范围 -90 到 90）：",
+                           altitude))
+            return;
+        if (altitude < -90.0 || altitude > 90.0) {
+            MessageBoxW(hwnd_, L"太阳高度角必须在 -90 到 90 度之间。",
+                        L"无效参数", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        azimuth = std::fmod(azimuth, 360.0);
+        if (azimuth < 0.0) azimuth += 360.0;
+        terrain_z_factor_ = z_factor;
+        terrain_sun_azimuth_ = azimuth;
+        terrain_sun_altitude_ = altitude;
+        std::wostringstream text;
+        text << L"专题参数已更新：z-factor=" << std::setprecision(8)
+             << terrain_z_factor_ << L"，光照 " << terrain_sun_azimuth_
+             << L"°/" << terrain_sun_altitude_ << L"°";
+        action_text_ = text.str();
+    }
+
     void derive_terrain_grid(uint32_t kind) {
         if (!grid_) {
             dt_statistics statistics{};
@@ -3909,19 +3978,88 @@ private:
         dt_grid_terrain_options options{};
         options.struct_size = sizeof(options);
         options.kind = kind;
-        options.z_factor = 1.0;
-        options.sun_azimuth_degrees = 315.0;
-        options.sun_altitude_degrees = 45.0;
+        options.z_factor = terrain_z_factor_;
+        options.sun_azimuth_degrees = terrain_sun_azimuth_;
+        options.sun_altitude_degrees = terrain_sun_altitude_;
         options.output_nodata_value = -9999.0;
-        dt_grid_handle output = nullptr;
+        const wchar_t* requested_name =
+            kind == DT_GRID_TERRAIN_SLOPE_DEGREES
+                ? L"坡度"
+                : kind == DT_GRID_TERRAIN_ASPECT_DEGREES ? L"坡向"
+                                                         : L"阴影地形";
+        dt_task_handle task = nullptr;
+        const dt_status start_status =
+            dt_grid_derive_terrain_async(grid_, &options, &task);
+        if (start_status != DT_OK) {
+            action_text_ = L"专题分析启动失败：" + last_error_text();
+            return;
+        }
+        terrain_task_ = task;
+        terrain_task_running_ = true;
         set_wait_cursor(true);
         const auto begin = std::chrono::steady_clock::now();
-        const dt_status status =
-            dt_grid_derive_terrain(grid_, &options, &output);
+        int32_t completed = 0;
+        int quit_code = 0;
+        bool saw_quit = false;
+        dt_task_info task_info{};
+        while (!completed) {
+            const dt_status wait_status = dt_task_wait(task, 25, &completed);
+            if (wait_status != DT_OK) {
+                dt_task_request_cancel(task);
+                break;
+            }
+            if (dt_task_get_info(task, &task_info) == DT_OK) {
+                const int percent = static_cast<int>(std::clamp(
+                    task_info.progress * 100.0, 0.0, 100.0));
+                std::wostringstream status;
+                status << L"正在计算" << requested_name << L"专题图："
+                       << percent << L"%（Esc 可取消）";
+                if (task_info.cancellation_requested)
+                    status << L"，正在取消…";
+                action_text_ = status.str();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                UpdateWindow(hwnd_);
+            }
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) {
+                    saw_quit = true;
+                    quit_code = static_cast<int>(message.wParam);
+                    dt_task_request_cancel(task);
+                    continue;
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if (!completed) dt_task_wait(task, UINT32_MAX, &completed);
+        dt_task_get_info(task, &task_info);
+        dt_grid_handle output = nullptr;
+        dt_status result_status = task_info.result_status;
+        if (task_info.state == DT_TASK_SUCCEEDED)
+            result_status = dt_task_get_grid_result(task, &output);
+        std::wstring task_error;
+        if (task_info.state == DT_TASK_FAILED) {
+            char buffer[1024]{};
+            if (dt_task_get_error(task, buffer, sizeof(buffer), nullptr) == DT_OK)
+                task_error = utf8_to_wide(buffer);
+        }
+        terrain_task_running_ = false;
+        terrain_task_ = nullptr;
+        dt_task_destroy(task);
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
-        if (status != DT_OK) {
-            action_text_ = L"专题分析失败：" + last_error_text();
+        if (task_info.state == DT_TASK_CANCELLED) {
+            action_text_ = std::wstring(requested_name) + L"专题计算已取消";
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
+            return;
+        }
+        if (result_status != DT_OK || !output) {
+            action_text_ = L"专题分析失败：" +
+                           (task_error.empty() ? last_error_text() : task_error);
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
             return;
         }
         dt_grid_destroy(terrain_grid_);
@@ -3951,8 +4089,14 @@ private:
         text << name << L"专题图完成：" << info.width << L"×" << info.height
              << L"，有效节点 " << info.valid_value_count << L"，耗时 "
              << std::fixed << std::setprecision(1) << ms << L" ms";
+        text << L"，z-factor=" << std::setprecision(4) << terrain_z_factor_;
+        if (grid_theme_ == GridTheme::Hillshade)
+            text << L"，光照 " << terrain_sun_azimuth_ << L"°/"
+                 << terrain_sun_altitude_ << L"°";
         if (grid_preview_.empty()) text << L"（数据已生成，预览超过 2000 万节点上限）";
         action_text_ = text.str();
+        if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+        if (saw_quit) PostQuitMessage(quit_code);
     }
 
     void show_elevation_grid() {
@@ -4370,6 +4514,16 @@ private:
     }
 
     void on_command(int id) {
+        if (terrain_task_running_) {
+            if (id == ID_TERRAIN_CANCEL) {
+                dt_task_request_cancel(terrain_task_);
+                action_text_ = L"已请求取消专题计算…";
+            } else {
+                action_text_ = L"专题计算正在进行；按 Esc 或选择“取消正在进行的专题计算”";
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
         switch (id) {
         case ID_GENERATE_100K: generate(100000); break;
         case ID_GENERATE_1M: generate(1000000); break;
@@ -4456,6 +4610,10 @@ private:
             derive_terrain_grid(DT_GRID_TERRAIN_ASPECT_DEGREES); break;
         case ID_TERRAIN_HILLSHADE_GRID:
             derive_terrain_grid(DT_GRID_TERRAIN_HILLSHADE); break;
+        case ID_TERRAIN_PARAMETERS: configure_terrain_parameters(); break;
+        case ID_TERRAIN_CANCEL:
+            action_text_ = L"当前没有正在进行的专题计算";
+            break;
         case ID_TERRAIN_SHOW_ELEVATION: show_elevation_grid(); break;
         case ID_TERRAIN_EXPORT_GRID: export_terrain_grid_file(); break;
         case ID_TERRAIN_EXPORT_GEOTIFF: export_terrain_geotiff(); break;

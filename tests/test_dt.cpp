@@ -1151,17 +1151,65 @@ void test_grid_and_contours() {
                "NoData grid TIN statistics");
     assert(statistics.vertex_count == 3);
 
+    terrain_options.kind = DT_GRID_TERRAIN_SLOPE_DEGREES;
+    terrain_options.output_nodata_value = -9999.0;
+    dt_task_handle terrain_task = nullptr;
+    require_ok(dt_grid_derive_terrain_async(grid, &terrain_options,
+                                             &terrain_task),
+               "async terrain start");
+    int32_t completed = 0;
+    require_ok(dt_task_wait(terrain_task, UINT32_MAX, &completed),
+               "async terrain wait");
+    assert(completed == 1);
+    dt_task_info task_info{};
+    require_ok(dt_task_get_info(terrain_task, &task_info),
+               "async terrain info");
+    assert(task_info.state == DT_TASK_SUCCEEDED);
+    assert(task_info.result_kind == DT_TASK_RESULT_GRID);
+    assert(close(task_info.progress, 1.0));
+    dt_grid_handle async_terrain_grid = nullptr;
+    require_ok(dt_task_get_grid_result(terrain_task, &async_terrain_grid),
+               "async terrain result");
+    require_ok(dt_grid_read_window(async_terrain_grid, 0, 0, 3, 3,
+                                   terrain_values, 3),
+               "async terrain values");
+    for (double value : terrain_values) assert(close(value, plane_slope));
+    dt_grid_destroy(async_terrain_grid);
+    dt_task_destroy(terrain_task);
+
+    dt_grid_create_options large_options{};
+    large_options.struct_size = sizeof(large_options);
+    large_options.width = 2048;
+    large_options.height = 2048;
+    large_options.geo_transform[1] = 1.0;
+    large_options.geo_transform[5] = 1.0;
+    dt_grid_handle large_grid = nullptr;
+    require_ok(dt_grid_create(&large_options, &large_grid),
+               "large cancellation grid create");
+    terrain_task = nullptr;
+    require_ok(dt_grid_derive_terrain_async(large_grid, &terrain_options,
+                                             &terrain_task),
+               "cancelled terrain start");
+    require_ok(dt_task_request_cancel(terrain_task),
+               "cancel terrain request");
+    require_ok(dt_task_wait(terrain_task, UINT32_MAX, &completed),
+               "cancelled terrain wait");
+    require_ok(dt_task_get_info(terrain_task, &task_info),
+               "cancelled terrain info");
+    assert(task_info.state == DT_TASK_CANCELLED);
+    assert(task_info.result_status == DT_E_CANCELLED);
+    dt_task_destroy(terrain_task);
+    dt_grid_destroy(large_grid);
+
     dt_task_handle grid_task = nullptr;
     require_ok(dt_grid_from_tin_async(plane, &raster_options, &grid_task),
                "async grid start");
     /* The task retains the source context even after its public handle dies. */
     dt_destroy(plane);
     plane = nullptr;
-    int32_t completed = 0;
     require_ok(dt_task_wait(grid_task, UINT32_MAX, &completed),
                "async grid wait");
     assert(completed == 1);
-    dt_task_info task_info{};
     require_ok(dt_task_get_info(grid_task, &task_info), "async grid info");
     assert(task_info.state == DT_TASK_SUCCEEDED);
     assert(task_info.result_kind == DT_TASK_RESULT_GRID);

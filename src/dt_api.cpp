@@ -676,6 +676,28 @@ dt_status DT_CALL dt_grid_from_tin_async(
     });
 }
 
+dt_status DT_CALL dt_grid_derive_terrain_async(
+    dt_grid_handle source_grid, const dt_grid_terrain_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_terrain_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto source = require_grid_shared(source_grid);
+        const auto copied_options = *options;
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID,
+            [source, copied_options](dt_task_t& task) {
+                task.grid_result = dt::grid_derive_terrain(
+                    *source, copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+            });
+    });
+}
+
 dt_status DT_CALL dt_tin_from_grid_async(
     dt_grid_handle grid, const dt_grid_to_tin_options* options,
     dt_handle output_tin, dt_task_handle* output_task) {

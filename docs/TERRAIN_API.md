@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.20 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.21 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -94,6 +94,32 @@ dt_task_destroy(task);
 协作式：转换循环会检查请求并返回 `DT_E_CANCELLED`。`dt_task_destroy()` 会请求
 取消并等待工作线程退出。失败信息通过 `dt_task_get_error()` 读取。
 
+v0.21 将全幅 GRID 专题派生接入同一框架：
+
+```cpp
+dt_task_handle task = nullptr;
+dt_grid_derive_terrain_async(source, &terrain_options, &task);
+
+for (;;) {
+    int32_t completed = 0;
+    dt_task_wait(task, 50, &completed);
+    dt_task_info info{};
+    dt_task_get_info(task, &info); // info.progress 为 0～1
+    if (completed) break;
+    // 用户取消时：dt_task_request_cancel(task);
+}
+
+dt_grid_handle derived = nullptr;
+if (dt_task_get_grid_result(task, &derived) == DT_OK) {
+    // 使用并最终 dt_grid_destroy(derived)
+}
+dt_task_destroy(task);
+```
+
+取消检查以输出行为粒度进行，最迟在当前行完成后生效。取消任务不产生可取得的结果
+句柄，`dt_task_info.state/result_status` 分别为 `DT_TASK_CANCELLED` 和
+`DT_E_CANCELLED`。任务运行时源公开句柄可以释放，但不应并发写同一 GRID。
+
 调用方在任务运行期间不应同时修改同一个 GRID；TIN 本身具有读写锁，但并发编辑
 会使转换对应的版本不明确，仍建议先完成或取消转换再编辑。
 
@@ -157,7 +183,8 @@ dt_grid_destroy(derived);
 支持旋转和错切 GRID。中心及所需四邻域任一为 NoData/非有限数时，输出该节点为
 NoData；这会在源空洞外形成一节点安全带，避免跨空洞估算坡面。
 
-调用失败时 `*output_grid` 保持空。宽或高小于 2 返回 `DT_E_EMPTY`，未知 kind、
+同步调用失败时 `*output_grid` 保持空。异步调用启动成功只表示工作线程已建立，
+最终状态应通过任务 API 检查。宽或高小于 2 返回 `DT_E_EMPTY`，未知 kind、
 非法系数或光照参数返回 `DT_E_INVALID_ARGUMENT`。同步调用的时间和额外内存均为
 O(width×height)，其中输出 GRID 占约 8×width×height 字节。
 

@@ -77,6 +77,10 @@ std::unique_ptr<Grid> grid_from_cdt(CdtContext& cdt,
                                     const dt_tin_to_grid_options& options,
                                     const ProgressCallback& progress = {},
                                     const CancelCallback& cancelled = {});
+std::unique_ptr<Grid> grid_derive_terrain(
+    const Grid& source, const dt_grid_terrain_options& options,
+    const ProgressCallback& progress = {},
+    const CancelCallback& cancelled = {});
 std::vector<dt_point3> points_from_grid(
     const Grid& grid, const dt_grid_to_tin_options& options,
     const ProgressCallback& progress = {},

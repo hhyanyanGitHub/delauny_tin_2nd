@@ -688,7 +688,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 16 && patch == 0);
+    assert(major == 0 && minor == 20 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");
@@ -756,6 +756,59 @@ void test_grid_and_contours() {
     assert((grid_analysis.flags & DT_SURFACE_BILINEAR) != 0);
     assert(grid_analysis.support_point_count == 4);
 
+    dt_grid_terrain_options terrain_options{};
+    terrain_options.struct_size = sizeof(terrain_options);
+    terrain_options.kind = DT_GRID_TERRAIN_SLOPE_DEGREES;
+    terrain_options.output_nodata_value = -9999.0;
+    dt_grid_handle terrain_grid = nullptr;
+    require_ok(dt_grid_derive_terrain(grid, &terrain_options, &terrain_grid),
+               "derive slope GRID");
+    dt_grid_info terrain_info{};
+    require_ok(dt_grid_get_info(terrain_grid, &terrain_info),
+               "derived slope info");
+    assert(terrain_info.width == 3 && terrain_info.height == 3);
+    assert(terrain_info.valid_value_count == 9);
+    size_t terrain_crs_size = 0;
+    require_ok(dt_grid_get_crs_wkt(terrain_grid, nullptr, 0,
+                                   &terrain_crs_size),
+               "derived GRID CRS size");
+    std::vector<char> terrain_crs(terrain_crs_size);
+    require_ok(dt_grid_get_crs_wkt(terrain_grid, terrain_crs.data(),
+                                   terrain_crs.size(), nullptr),
+               "derived GRID CRS");
+    assert(std::string(terrain_crs.data()) == test_crs);
+    double terrain_values[9]{};
+    require_ok(dt_grid_read_window(terrain_grid, 0, 0, 3, 3,
+                                   terrain_values, 3),
+               "read slope GRID");
+    const double plane_slope =
+        std::atan(std::sqrt(2.0)) * 180.0 / std::acos(-1.0);
+    for (double value : terrain_values) assert(close(value, plane_slope));
+    dt_grid_destroy(terrain_grid);
+
+    terrain_options.kind = DT_GRID_TERRAIN_ASPECT_DEGREES;
+    require_ok(dt_grid_derive_terrain(grid, &terrain_options, &terrain_grid),
+               "derive aspect GRID");
+    require_ok(dt_grid_read_window(terrain_grid, 0, 0, 3, 3,
+                                   terrain_values, 3),
+               "read aspect GRID");
+    for (double value : terrain_values) assert(close(value, 225.0));
+    dt_grid_destroy(terrain_grid);
+
+    terrain_options.kind = DT_GRID_TERRAIN_HILLSHADE;
+    require_ok(dt_grid_derive_terrain(grid, &terrain_options, &terrain_grid),
+               "derive hillshade GRID");
+    require_ok(dt_grid_read_window(terrain_grid, 0, 0, 3, 3,
+                                   terrain_values, 3),
+               "read hillshade GRID");
+    const double expected_hillshade =
+        255.0 * std::sin(45.0 * std::acos(-1.0) / 180.0) /
+        std::sqrt(3.0);
+    for (double value : terrain_values) {
+        assert(close(value, expected_hillshade));
+    }
+    dt_grid_destroy(terrain_grid);
+
     dt_grid_create_options rotated_options{};
     rotated_options.struct_size = sizeof(rotated_options);
     rotated_options.flags = DT_GRID_HAS_NODATA;
@@ -778,6 +831,20 @@ void test_grid_and_contours() {
                                           &grid_analysis),
                "rotated GRID surface analysis");
     assert_surface_plane(grid_analysis, 79.15, 2.0, 3.0);
+    terrain_options.kind = DT_GRID_TERRAIN_SLOPE_DEGREES;
+    require_ok(dt_grid_derive_terrain(rotated, &terrain_options,
+                                      &terrain_grid),
+               "derive rotated slope GRID");
+    double rotated_terrain_values[4]{};
+    require_ok(dt_grid_read_window(terrain_grid, 0, 0, 2, 2,
+                                   rotated_terrain_values, 2),
+               "read rotated slope GRID");
+    const double rotated_slope =
+        std::atan(std::sqrt(13.0)) * 180.0 / std::acos(-1.0);
+    for (double value : rotated_terrain_values) {
+        assert(close(value, rotated_slope));
+    }
+    dt_grid_destroy(terrain_grid);
     const double flat_values[4] = {42.0, 42.0, 42.0, 42.0};
     require_ok(dt_grid_write_window(rotated, 0, 0, 2, 2, flat_values, 2),
                "write flat GRID");
@@ -790,12 +857,38 @@ void test_grid_and_contours() {
     assert(close(grid_analysis.normal_x, 0.0));
     assert(close(grid_analysis.normal_y, 0.0));
     assert(close(grid_analysis.normal_z, 1.0));
+    terrain_options.kind = DT_GRID_TERRAIN_ASPECT_DEGREES;
+    require_ok(dt_grid_derive_terrain(rotated, &terrain_options,
+                                      &terrain_grid),
+               "derive flat aspect GRID");
+    require_ok(dt_grid_get_info(terrain_grid, &terrain_info),
+               "flat aspect info");
+    assert(terrain_info.valid_value_count == 0);
+    dt_grid_destroy(terrain_grid);
+    terrain_options.output_nodata_value = 0.0;
+    require_ok(dt_grid_derive_terrain(rotated, &terrain_options,
+                                      &terrain_grid),
+               "derive flat aspect GRID with default NoData");
+    require_ok(dt_grid_get_info(terrain_grid, &terrain_info),
+               "default derived NoData info");
+    assert(std::isnan(terrain_info.nodata_value));
+    assert(terrain_info.valid_value_count == 0);
+    dt_grid_destroy(terrain_grid);
+    terrain_options.output_nodata_value = -9999.0;
     const double rotated_nodata_values[4] = {80.0, 83.0, 76.0, -9999.0};
     require_ok(dt_grid_write_window(rotated, 0, 0, 2, 2,
                                     rotated_nodata_values, 2),
                "write rotated GRID NoData");
     assert(dt_grid_analyze_surface_xy(rotated, &rotated_query,
                                       &grid_analysis) == DT_E_NOT_FOUND);
+    terrain_options.kind = DT_GRID_TERRAIN_SLOPE_DEGREES;
+    require_ok(dt_grid_derive_terrain(rotated, &terrain_options,
+                                      &terrain_grid),
+               "derive NoData slope GRID");
+    require_ok(dt_grid_get_info(terrain_grid, &terrain_info),
+               "NoData slope info");
+    assert(terrain_info.valid_value_count == 0);
+    dt_grid_destroy(terrain_grid);
     dt_grid_destroy(rotated);
 
     const char* grid_file = "dterrain_test_grid.dgrid";

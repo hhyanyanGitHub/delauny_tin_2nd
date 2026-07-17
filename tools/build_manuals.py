@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.16.0"
+VERSION = "0.20.0"
 TODAY = date(2026, 7, 17).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.16.0：稳定 C ABI 已统一支持普通 TIN、约束 CDT 和仿射 GRID 的坡度、下坡坡向与单位法向分析；Win32 GUI 可单击显示支撑单元、下坡箭头和数值面板，并保留剖面、面积/土方、GDAL 交换、等高线反向转换和原子批量约束事务。工程级双表面土方、真正局部 CDT 更新和生产级 GPU LOD 属于后续阶段。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.20.0：稳定 C ABI 在普通 TIN、约束 CDT 和仿射 GRID 的局部坡面分析基础上，新增全幅 GRID 坡度、坡向与阴影地形派生；Win32 GUI 提供固定量纲专题色带、图例、高程/专题切换及 DGRID/GeoTIFF 导出，并保留剖面、面积/土方、GDAL 交换、等高线反向转换和原子批量约束事务。工程级双表面土方、真正局部 CDT 更新和生产级 GPU LOD 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
@@ -450,7 +450,7 @@ def build_developer_manual():
     m.cover("DEVELOPER REFERENCE")
     add_document_control(
         m,
-        "架构、构建部署、稳定 C ABI、坡度/坡向/法向分析、约束 Delaunay、GRID/等高线转换、GDAL 格式交换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
+        "架构、构建部署、稳定 C ABI、局部与全幅坡度/坡向/阴影分析、约束 Delaunay、GRID/等高线转换、GDAL 格式交换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
         [
             "首次集成：重点阅读第 3、4、7 章。",
             "地形转换：重点阅读第 4.6 章和第 6 章。",
@@ -471,6 +471,7 @@ def build_developer_manual():
         "GUI 两点定义任意地形剖面，固定 CDT/TIN/GRID 数据源采样、统计并导出 CSV。",
         "GUI 逐点圈定简单多边形，计算平面量并数值估算地表面积和水平基准面挖填方。",
         "普通 TIN、约束 CDT 和仿射 GRID 统一返回局部高程梯度、坡度、下坡坡向、单位法向与支撑单元。",
+        "从任意仿射 GRID 派生全幅坡度角、下坡坡向角或 0～255 分析阴影，并继承 CRS/NoData。",
         "DTIN 二进制保存加载，以及 DTMESH 可读文本三角网交换。",
         "双精度 GRID、仿射节点坐标、NoData、窗口读写和 DGRID 文本往返。",
         "TIN→GRID、GRID→TIN、TIN/GRID→等高线，以及等高线→TIN/GRID 近似重建。",
@@ -498,7 +499,7 @@ def build_developer_manual():
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.16 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。GUI 土方量测针对水平基准面并使用固定预算数值积分，不等同于工程结算。", "gold")
+    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.20 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。GUI 土方量测针对水平基准面并使用固定预算数值积分，不等同于工程结算。", "gold")
 
     m.h1("2 架构与数据模型")
     m.h2("2.1 分层结构")
@@ -811,7 +812,7 @@ dt_cdt_destroy(cdt);""")
     m.para("dt_cdt_get_constraint_vertex_usage() 报告指定点被多少条约束、多少个点序列位置引用，以及是否也是基础地形点。dt_cdt_remove_constraint_vertex() 默认拒绝共享顶点；显式传 DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH 时只从目标约束脱离，其他约束和基础点保持不变。删除后仍统一校验最小点数和拓扑，失败时 generation 不变。")
     m.para("dt_cdt_apply_constraint_edits() 按数组顺序组合 ADD、UPDATE 和 REMOVE。ADD 分配新稳定 ID，UPDATE 保留原类型，REMOVE 不携带几何。任一参数、ID 或最终拓扑失败时整批回滚且不消耗 ID；成功时 generation 只增加一次。output_constraint_ids 和整批 output_effect 均可为空。")
     m.para("dt_cdt_sample_height_xy() 只在有效域内插值；外边界以外和孔洞内部返回 DT_E_NOT_FOUND。dt_grid_from_cdt() 将这些位置写为 NoData，dt_contours_from_cdt() 只遍历域内三角形并继承 CRS。更新和顶点删除的 output_effect 均可为 nullptr。")
-    m.callout("性能与交叉", "v0.16 单项约束编辑仍完整重建候选 CDT；批量事务只重建一次。100,000 基础点添加 12 条断裂线的本机对比为逐条 3.259 s、批量 0.528 s，约 6.17 倍。请求 output_effect 还会计算完整域差异。未分段交叉仍须先加入共享顶点。", "gold")
+    m.callout("性能与交叉", "v0.20 单项约束编辑仍完整重建候选 CDT；批量事务只重建一次。100,000 基础点添加 12 条断裂线的本机对比为逐条 3.259 s、批量 0.528 s，约 6.17 倍。请求 output_effect 还会计算完整域差异。未分段交叉仍须先加入共享顶点。", "gold")
 
     m.h2("4.9 坡度、坡向与地形法向")
     m.para("v0.16 由普通 TIN、约束 CDT 和仿射 GRID 共用 dt_surface_analysis 结果结构。三个入口分别是 dt_analyze_tin_surface_xy()、dt_cdt_analyze_surface_xy() 和 dt_grid_analyze_surface_xy()；查询 Z 被忽略，成功结果给出插值 Z、世界 XY 梯度、坡度角、下坡坡向、向上单位法向和实际支撑点。接口只写调用方结构，不分配跨 DLL 内存。")
@@ -838,6 +839,33 @@ if (s == DT_OK) {
     )
     m.para("TIN 与 CDT 在支撑三角面内使用解析平面梯度；CDT 外域和孔洞返回 DT_E_NOT_FOUND。GRID 先反算完整六参数仿射坐标，在 2×2 单元求双线性导数，再转换到世界 XY；四个支撑节点任一为 NoData 时拒绝分析。成功时 DLL 在 struct_size 中写入本版本结构大小，接口不分配需要调用方释放的内存。")
     m.callout("边和顶点", "分片线性 TIN/CDT 在断裂边两侧可有不同坡度。查询恰落在边或顶点时，本版本确定性选择一个有限有效邻面并返回位置标志，不做跨断裂线平滑平均。", "gold")
+
+    m.h2("4.10 全幅 GRID 地形专题分析")
+    m.para("v0.20 新增 dt_grid_derive_terrain()。它从源高程 GRID 创建同尺寸、同六参数仿射变换和同 CRS 的标准 dt_grid_handle；源句柄保持不变，输出可继续使用窗口读取、DGRID 保存或 GDAL GeoTIFF/COG 导出。输出始终具有 NoData。")
+    m.code("""dt_grid_terrain_options o{};
+o.struct_size = sizeof(o);
+o.kind = DT_GRID_TERRAIN_SLOPE_DEGREES;
+o.z_factor = 1.0;
+o.output_nodata_value = -9999.0;
+
+dt_grid_handle slope = nullptr;
+dt_status s = dt_grid_derive_terrain(elevation, &o, &slope);
+if (s == DT_OK) {
+    dt_grid_save_text(slope, "slope.dgrid");
+    dt_grid_destroy(slope);
+}""")
+    m.table(
+        ["kind", "输出", "特殊语义"],
+        [
+            ("SLOPE_DEGREES", "坡度角 0～90°", "水平面为 0°"),
+            ("ASPECT_DEGREES", "下坡方位角 0～360°", "水平面无唯一坡向，写 NoData"),
+            ("HILLSHADE", "分析阴影 0～255", "默认光源方位/高度 315°/45°"),
+        ],
+        [2600, 3000, 3760],
+        [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    m.para("内部节点采用中心差分，边界采用单边差分；列/行导数通过完整仿射雅可比转换为世界 XY 梯度。中心或所需四邻域含 NoData 时结果节点写 NoData，在空洞边缘形成一节点安全带。z_factor 为零时选择 1.0，否则必须有限且大于零。output_nodata_value 为零时自动选择 NaN，避免与有效 0°/0 灰度冲突。输出句柄必须由 dt_grid_destroy() 释放。")
+    m.callout("内存与量纲", "同步派生时间为 O(width×height)，除源 GRID 外还需一个同尺寸 double 输出 GRID。z_factor 用于高程和平面单位换算；如果 XY 为米而 Z 为毫米，应使用 0.001。专题色彩只属于 GUI，DLL 输出的是可计算的实际角度或阴影值。", "blue")
 
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
@@ -994,7 +1022,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
     m.h2("9.1 自动化测试")
     m.code("""cmake --build build --config Release --parallel 4
 ctest --test-dir build --output-on-failure""")
-    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。v0.16 坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向，并覆盖孔洞/凸包外拒绝、旋转仿射 GRID 梯度变换、双线性标志和 NoData 拒绝。独立剖面数学测试覆盖线性采样、三角形高程、旋转仿射 GRID 双线性插值、NoData 断点和升降/坡度统计；多边形量测测试覆盖凹多边形耳切、大坐标面积稳定性、自相交拒绝、平面解析结果、挖填符号和部分/完全无效域。GDAL 构建还执行 GTiff、COG、GPKG 驱动探测和真实文件往返。")
+    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。局部坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向，并覆盖孔洞/凸包外拒绝、旋转仿射 GRID 梯度变换、双线性标志和 NoData 拒绝。v0.20 全幅测试覆盖坡度、坡向、默认光照阴影、CRS 继承、旋转仿射差分、水平坡向 NoData 和空洞邻域传播。独立剖面数学测试覆盖线性采样、三角形高程、旋转仿射 GRID 双线性插值、NoData 断点和升降/坡度统计；多边形量测测试覆盖凹多边形耳切、大坐标面积稳定性、自相交拒绝、平面解析结果、挖填符号和部分/完全无效域。GDAL 构建还执行 GTiff、COG、GPKG 驱动探测和真实文件往返。")
     m.h2("9.2 集成验收清单")
     for text in (
         "DLL、导入库、头文件和运行库均为相同架构。",
@@ -1034,13 +1062,13 @@ def build_gui_manual():
     m = Manual(
         "dterrain GUI 演示程序\n操作手册与入门教程",
         "GUI 操作入门教程",
-        "从 XYZ 散点导入到动态编辑、坡度/坡向、剖面与土方量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
+        "从 XYZ 散点导入到动态编辑、全幅地形专题图、局部坡面、剖面与土方量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
         "首次使用者、演示人员、算法验证与测绘研究人员",
     )
     m.cover("QUICK START GUIDE")
     add_document_control(
         m,
-        "便携运行、五分钟上手、控件与菜单、XYZ 导入、TIN/GRID/等高线/CDT 图层、坡度/坡向、任意剖面、多边形面积/土方、2D/3D 浏览、查询编辑和数据保存。",
+        "便携运行、五分钟上手、控件与菜单、XYZ 导入、TIN/GRID/等高线/CDT 图层、全幅坡度/坡向/阴影专题图、局部坡面、任意剖面、多边形面积/土方、2D/3D 浏览、查询编辑和数据保存。",
         [
             "第一次体验：直接完成第 2 章的五分钟教程。",
             "已有 XYZ 数据：重点阅读第 5 章。",
@@ -1048,6 +1076,7 @@ def build_gui_manual():
             "任意剖面分析：重点阅读第 6.3 节。",
             "面积与土方量测：重点阅读第 6.4 节。",
             "坡度、坡向与法向：重点阅读第 6.5 节。",
+            "全幅地形专题图：重点阅读第 6.6 节。",
             "TIN/GRID/等高线转换与交换：重点阅读第 4.3 节和第 8 章。",
             "演示动态编辑：重点阅读第 7 章。",
             "百万级数据展示：重点阅读第 9 章。",
@@ -1055,8 +1084,8 @@ def build_gui_manual():
     )
 
     m.h1("1 程序概览")
-    m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.16 功能边界", "当前程序已提供二维/三维浏览、单击坡度/下坡坡向/单位法向分析、任意直线剖面、多边形面积/水平基准面挖填方与 CSV 导出、TIN/GRID/等高线双向转换、DCDT 打开保存、约束编辑和 CDT 影响区显示；启用 GDAL 后可从菜单交换 GeoTIFF/COG GRID 与 GeoPackage 等高线。坡面分析为局部单元结果，面积/周长是边界几何量，地表面积和土方为固定预算积分估算；生产级双表面土方和 GPU/LOD 尚未接入。", "gold")
+    m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
+    m.callout("0.20 功能边界", "当前程序已提供二维/三维浏览、全幅坡度/坡向/阴影专题表达和导出、单击坡度/下坡坡向/单位法向分析、任意直线剖面、多边形面积/水平基准面挖填方与 CSV 导出、TIN/GRID/等高线双向转换、DCDT 打开保存、约束编辑和 CDT 影响区显示；启用 GDAL 后可交换 GeoTIFF/COG GRID、专题 GeoTIFF 与 GeoPackage 等高线。生产级双表面土方和 GPU/LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1099,6 +1128,7 @@ def build_gui_manual():
         "执行“地形转换→约束网 → GRID”和“从约束网生成等高线”，确认孔洞区域保持空白。",
         "单击“查询模式”，在网格内单击；观察白色最近顶点和洋红色覆盖三角形。",
         "选择‘分析→坡度/坡向分析（单击）’，在坡面上单击；观察青色支撑单元、黄色查询点、下坡箭头和右上结果面板。",
+        "选择‘分析→生成全幅坡度专题图’，观察固定色带和右上图例；再依次查看坡向和阴影地形，并用‘恢复显示高程 GRID’返回高程着色。",
         "选择‘分析→任意剖面（两次单击）’，在画布选取 A、B；观察青色定位线、底部曲线和统计，再导出 CSV。",
         "选择‘分析→面积/土方量测（逐点）’，输入基准高程，逐点圈定区域并按 Enter；核对顶部结果面板，再修改基准高程和导出 CSV。",
         "单击“插入模式”，在网格中单击；观察红色旧面、黄色边界和绿色新增面/边。",
@@ -1137,7 +1167,7 @@ def build_gui_manual():
             ("地形转换", "TIN/GRID/等高线双向派生，CDT 域内转换，并自动生成等高线。"),
             ("数据交换", "交换 DGRID、DCONTOUR、DCDT 文本；GDAL 构建还支持 GeoTIFF/COG 与 GeoPackage。"),
             ("约束编辑", "绘制或批量添加断裂线；移动/安全删除顶点，或删除整条约束。"),
-            ("分析", "单击分析坡度、下坡坡向与法向；生成任意 A—B 剖面；逐点圈定多边形并估算面积/土方；导出或清除结果。"),
+            ("分析", "生成全幅坡度/坡向/阴影专题图并导出；单击分析局部坡面；生成任意 A—B 剖面；逐点圈定多边形并估算面积/土方。"),
             ("图层", "分别显示或隐藏 TIN、GRID、等高线和约束 Delaunay。"),
         ],
         [2600, 6760],
@@ -1319,6 +1349,28 @@ def build_gui_manual():
     m.callout("数据源规则", "每次单击按可见 CDT、TIN、GRID 优先，其后才考虑存在但隐藏的图层；选定源在该点无有效表面时本次分析失败，不用其他图层补值。可通过图层显隐明确选择叠加表面。源图层变化后结果自动清除。", "blue")
     m.callout("断裂边", "TIN/CDT 在三角面内坡度恒定。查询恰落在边或顶点时只选择一个有效邻面，不跨断裂线平均；对边两侧分别稍作偏移单击，可比较两个坡面的结果。", "gold")
 
+    m.h2("6.6 全幅坡度、坡向与阴影专题图")
+    for step in (
+        "准备一个高程 GRID；若只有 TIN/CDT，直接选择专题命令，程序会自动生成最长边 401 节点的 GRID。",
+        "选择‘分析→生成全幅坡度专题图’，查看绿色到紫色的 0～60° 固定色带和右上图例。",
+        "选择‘生成全幅坡向专题图’，查看按北→东→南→西循环的方位色相；水平区域显示为 NoData。",
+        "选择‘生成阴影地形图（315°/45°）’，查看 0～255 灰度地形阴影。",
+        "用‘导出当前专题图 DGRID’保存实际数值；GDAL 构建可另存为压缩 GeoTIFF。",
+        "选择‘恢复显示高程 GRID’，回到原高程着色；原 GRID 始终保留。",
+    ):
+        m.number(step)
+    m.table(
+        ["专题", "数值", "屏幕表达"],
+        [
+            ("坡度", "相对水平面 0～90°", "固定 0～60+° 绿—黄—橙—紫"),
+            ("坡向", "+Y 为北，顺时针 0～360°", "环形方位色带"),
+            ("阴影", "光源点积灰度 0～255", "黑—白灰度"),
+        ],
+        [1800, 3600, 3960],
+        [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    m.callout("数据没有被截图化", "导出的 DGRID/GeoTIFF 是坡度角、坡向角或阴影值本身，不是屏幕 RGB。专题句柄独立于高程 GRID，所以三维视图、剖面、量测和局部坡面仍使用原高程。源 GRID 被替换或清除时专题结果自动释放。", "blue")
+
     m.h1("7 动态插入与删除")
     m.h2("7.1 插入点")
     for step in (
@@ -1399,7 +1451,7 @@ def build_gui_manual():
         "约束改变后重新生成 GRID/等高线；程序会自动释放旧派生图层。",
     ):
         m.number(step)
-    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.16 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
+    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.20 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
     m.h2("8.7 往返验证")
     for step in (
         "保存当前网格。",
@@ -1411,7 +1463,7 @@ def build_gui_manual():
         m.number(step)
 
     m.h1("9 大数据量演示建议")
-    m.para("DLL 对当前视口执行精确范围查询。为了避免 GDI 阻塞，二维 TIN/CDT 线框预算各约 45,000 面，三维填充与深度排序预算约 18,000 面，GRID 预览缓存最多 400 万值并缩放到不超过 512×512，等高线绘制预算约 20 万顶点。显示抽样不会删减 DLL 数据或文件导出内容。")
+    m.para("DLL 对当前视口执行精确范围查询。为了避免 GDI 阻塞，二维 TIN/CDT 线框预算各约 45,000 面，三维填充与深度排序预算约 18,000 面，GRID 预览缓存最多 2000 万值并缩放到不超过 512×512，等高线绘制预算约 20 万顶点。显示抽样不会删减 DLL 数据或文件导出内容。")
     m.h2("9.1 百万级点操作顺序")
     for text in (
         "先使用 10 万点确认功能和显示环境，再切换到 100 万点。",
@@ -1419,7 +1471,7 @@ def build_gui_manual():
         "先框选放大到局部，再进行查询或动态编辑。",
         "避免频繁全图复位；局部范围能显示更多真实三角形细节。",
         "三维全图展示优先使用默认抽样；需要生产级连续千万点渲染时应采用 GPU 分块 LOD。",
-        "超过 400 万节点的 GRID 可以保留和导出，但 GUI 不生成着色缓存或等高线。",
+        "超过 2000 万节点的 GRID 可以保留和导出，但 GUI 不生成着色缓存或等高线。",
         "保存超大 DTMESH 前确认磁盘空间；需要紧凑存储时选 DTIN。",
     ):
         m.bullet(text)
@@ -1484,13 +1536,14 @@ def build_gui_manual():
         "生成一条跨越地形的 A—B 剖面，核对曲线、统计并导出 CSV；若有孔洞，再验证断点不被其他图层补齐。",
         "圈定一块多边形，分别用两个基准高程重算并导出 CSV；若跨孔洞，再核对有效覆盖率小于 100%。",
         "分别在 TIN/CDT 和 GRID 坡面执行单点坡度/坡向分析，核对支撑单元、下坡箭头、八方位与法向；按 Esc 清除。",
+        "依次生成全幅坡度、坡向和阴影专题图，检查固定图例；导出 DGRID，GDAL 构建再导出专题 GeoTIFF，最后恢复高程显示。",
         "切换 3D，验证环视、滚轮缩放、WASD 漫游和垂直夸张，再返回 2D。",
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形面积/土方量测、改基准面与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形面积/土方量测、改基准面与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付 2D/3D 浏览，TIN/CDT/GRID 坡面分析、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是局部 CDT 更新、坡度专题图、现状面—设计面精确土方、误差控制、图层样式、GPU 分块 LOD 与贴地碰撞。")
+    m.para("当前已交付 2D/3D 浏览，全幅坡度/坡向/阴影专题图，TIN/CDT/GRID 局部坡面分析、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是异步分块专题计算、局部 CDT 更新、现状面—设计面精确土方、误差控制、可配置图层样式、GPU 分块 LOD 与贴地碰撞。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

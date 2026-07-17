@@ -444,6 +444,22 @@ dt_status DT_CALL dt_grid_analyze_surface_xy(
     });
 }
 
+dt_status DT_CALL dt_grid_derive_terrain(
+    dt_grid_handle source_grid, const dt_grid_terrain_options* options,
+    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_terrain_options");
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::grid_derive_terrain(require_grid(source_grid),
+                                               *options);
+        *output_grid = result.release();
+    });
+}
+
 dt_status DT_CALL dt_grid_save_text(dt_grid_handle grid,
                                     const char* utf8_file_name) {
     return guarded([&] { require_grid(grid).save_text(utf8_file_name); });

@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.12 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.20 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -118,6 +118,48 @@ dt_status status = dt_grid_analyze_surface_xy(grid, &query, &result);
 双线性单元一般不是一个平面，因此梯度、坡度和坡向是查询位置处的局部值；移动
 查询点时这些值可以连续变化。旋转或错切 GRID 不应把列/行导数直接当作世界 X/Y
 导数，本接口已完成该坐标变换。
+
+## 全幅坡度、坡向与阴影 GRID
+
+`dt_grid_derive_terrain()` 生成一个新的标准 GRID 句柄，源 GRID 不变。输出尺寸、
+六参数仿射变换和 CRS 与源一致，并始终设置 `DT_GRID_HAS_NODATA`：
+
+```cpp
+dt_grid_terrain_options options{};
+options.struct_size = sizeof(options);
+options.kind = DT_GRID_TERRAIN_HILLSHADE;
+options.z_factor = 1.0;
+options.sun_azimuth_degrees = 315.0;
+options.sun_altitude_degrees = 45.0;
+options.output_nodata_value = -9999.0;
+
+dt_grid_handle derived = nullptr;
+dt_status status = dt_grid_derive_terrain(source, &options, &derived);
+// derived 可直接传给 dt_grid_save_text()/dt_grid_save_gdal_raster()
+dt_grid_destroy(derived);
+```
+
+`kind` 支持：
+
+| 值 | 输出量纲与范围 |
+|---|---|
+| `DT_GRID_TERRAIN_SLOPE_DEGREES` | 相对水平面的坡度角，0～90° |
+| `DT_GRID_TERRAIN_ASPECT_DEGREES` | 最大下降方向，以 +Y 为北顺时针，0～360°；水平面为 NoData |
+| `DT_GRID_TERRAIN_HILLSHADE` | 分析阴影灰度，0～255 |
+
+`z_factor` 为高程到平面单位的换算系数，零选择 1.0，其余值必须有限且大于零。
+阴影光源方位角按 +Y 为北顺时针，高度角范围为 -90～90°；两角都为零时使用
+315°/45° 默认值。`output_nodata_value` 为零时自动选择 NaN，避免与有效的 0°坡度
+或 0 灰度冲突；否则可以是有限数或 NaN。
+
+每个内部节点分别用左右、上下节点中心差分，边界节点采用单边差分。计算先得到
+`dz/dcolumn`、`dz/drow`，再用仿射雅可比逆转为世界坐标 `dz/dx`、`dz/dy`，因此
+支持旋转和错切 GRID。中心及所需四邻域任一为 NoData/非有限数时，输出该节点为
+NoData；这会在源空洞外形成一节点安全带，避免跨空洞估算坡面。
+
+调用失败时 `*output_grid` 保持空。宽或高小于 2 返回 `DT_E_EMPTY`，未知 kind、
+非法系数或光照参数返回 `DT_E_INVALID_ARGUMENT`。同步调用的时间和额外内存均为
+O(width×height)，其中输出 GRID 占约 8×width×height 字节。
 
 ## 当前复杂度与大数据注意事项
 

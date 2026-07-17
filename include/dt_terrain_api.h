@@ -17,6 +17,16 @@ enum dt_grid_to_tin_flags {
     DT_GRID_TO_TIN_ALLOW_NODATA_BRIDGING = 1u << 0
 };
 
+enum dt_grid_terrain_kind {
+    /* Rise angle from the horizontal, in degrees [0, 90]. */
+    DT_GRID_TERRAIN_SLOPE_DEGREES = 1,
+    /* Downslope azimuth clockwise from north, in degrees [0, 360). Flat
+       cells are written as NoData because their aspect is undefined. */
+    DT_GRID_TERRAIN_ASPECT_DEGREES = 2,
+    /* Grayscale analytical hillshade in [0, 255]. */
+    DT_GRID_TERRAIN_HILLSHADE = 3
+};
+
 typedef struct dt_grid_create_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -57,6 +67,23 @@ typedef struct dt_grid_to_tin_options {
     uint32_t flags;
     uint64_t reserved[6];
 } dt_grid_to_tin_options;
+
+typedef struct dt_grid_terrain_options {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t flags;
+    uint32_t reserved;
+    /* Zero selects 1.0. Otherwise this must be finite and positive. */
+    double z_factor;
+    /* Used by hillshade. If both angles are zero, 315/45 degrees is used. */
+    double sun_azimuth_degrees;
+    double sun_altitude_degrees;
+    /* The derived GRID always has NoData. Zero selects NaN so a zero-filled
+       options structure cannot collide with valid 0-degree/0-gray results;
+       otherwise this may be finite or NaN. */
+    double output_nodata_value;
+    uint64_t reserved2[4];
+} dt_grid_terrain_options;
 
 typedef struct dt_contours_to_tin_options {
     uint32_t struct_size;
@@ -135,6 +162,14 @@ DT_API dt_status DT_CALL dt_grid_write_window(
 DT_API dt_status DT_CALL dt_grid_analyze_surface_xy(
     dt_grid_handle grid, const dt_point3* query,
     dt_surface_analysis* output_analysis);
+
+/* Derives a full-resolution slope, aspect, or hillshade GRID. The affine
+   transform, dimensions and CRS are copied from source_grid. Interior nodes
+   use central differences; border nodes use one-sided differences. Nodes
+   whose required support contains NoData become NoData in the result. */
+DT_API dt_status DT_CALL dt_grid_derive_terrain(
+    dt_grid_handle source_grid, const dt_grid_terrain_options* options,
+    dt_grid_handle* output_grid);
 
 /* DGRID 1 is a portable UTF-8 text format intended for tests and exchange. */
 DT_API dt_status DT_CALL dt_grid_save_text(

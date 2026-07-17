@@ -463,6 +463,131 @@ dt_grid_info Grid::info() const {
     return result;
 }
 
+std::unique_ptr<Grid> grid_derive_terrain(
+    const Grid& source, const dt_grid_terrain_options& options,
+    const ProgressCallback& progress, const CancelCallback& cancelled) {
+    if (source.width() < 2 || source.height() < 2) {
+        throw Exception(DT_E_EMPTY,
+                        "terrain analysis needs at least two rows and columns");
+    }
+    if (options.kind != DT_GRID_TERRAIN_SLOPE_DEGREES &&
+        options.kind != DT_GRID_TERRAIN_ASPECT_DEGREES &&
+        options.kind != DT_GRID_TERRAIN_HILLSHADE) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown GRID terrain analysis kind");
+    }
+    const double z_factor = options.z_factor == 0.0 ? 1.0 : options.z_factor;
+    if (!finite(z_factor) || z_factor <= 0.0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "terrain analysis z_factor must be positive");
+    }
+    const double output_nodata = options.output_nodata_value == 0.0
+                                     ? std::numeric_limits<double>::quiet_NaN()
+                                     : options.output_nodata_value;
+    if (!(finite(output_nodata) || std::isnan(output_nodata))) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "terrain analysis NoData must be finite or NaN");
+    }
+
+    double sun_azimuth = options.sun_azimuth_degrees;
+    double sun_altitude = options.sun_altitude_degrees;
+    if (sun_azimuth == 0.0 && sun_altitude == 0.0) {
+        sun_azimuth = 315.0;
+        sun_altitude = 45.0;
+    }
+    if (!finite(sun_azimuth) || !finite(sun_altitude) ||
+        sun_altitude < -90.0 || sun_altitude > 90.0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "invalid hillshade illumination angles");
+    }
+
+    dt_grid_create_options create{};
+    create.struct_size = sizeof(create);
+    create.flags = DT_GRID_HAS_NODATA;
+    create.width = source.width();
+    create.height = source.height();
+    std::copy(source.transform(), source.transform() + 6,
+              create.geo_transform);
+    create.nodata_value = output_nodata;
+    auto output = std::make_unique<Grid>(create);
+    output->set_crs_wkt(source.crs_wkt());
+
+    const double* gt = source.transform();
+    const double determinant = gt[1] * gt[5] - gt[2] * gt[4];
+    constexpr double kPi = 3.141592653589793238462643383279502884;
+    const double azimuth_radians = sun_azimuth * kPi / 180.0;
+    const double altitude_radians = sun_altitude * kPi / 180.0;
+    const double sun_x = std::sin(azimuth_radians) *
+                         std::cos(altitude_radians);
+    const double sun_y = std::cos(azimuth_radians) *
+                         std::cos(altitude_radians);
+    const double sun_z = std::sin(altitude_radians);
+    const auto& values = source.values();
+    const uint64_t width = source.width();
+    const uint64_t height = source.height();
+    std::vector<double> row_values(static_cast<size_t>(width),
+                                   create.nodata_value);
+    const auto value_at = [&](uint64_t column, uint64_t row) {
+        return values[static_cast<size_t>(row * width + column)];
+    };
+    const auto valid = [&](double value) {
+        return finite(value) && !source.is_nodata(value);
+    };
+
+    report_progress(progress, 0.0);
+    for (uint64_t row = 0; row < height; ++row) {
+        check_cancelled(cancelled);
+        const uint64_t previous_row = row == 0 ? row : row - 1;
+        const uint64_t next_row = row + 1 < height ? row + 1 : row;
+        const double row_span = static_cast<double>(next_row - previous_row);
+        for (uint64_t column = 0; column < width; ++column) {
+            const uint64_t previous_column = column == 0 ? column : column - 1;
+            const uint64_t next_column =
+                column + 1 < width ? column + 1 : column;
+            const double column_span =
+                static_cast<double>(next_column - previous_column);
+            const double center = value_at(column, row);
+            const double left = value_at(previous_column, row);
+            const double right = value_at(next_column, row);
+            const double above = value_at(column, previous_row);
+            const double below = value_at(column, next_row);
+            if (!valid(center) || !valid(left) || !valid(right) ||
+                !valid(above) || !valid(below)) {
+                row_values[static_cast<size_t>(column)] = create.nodata_value;
+                continue;
+            }
+            const double dz_dcolumn =
+                z_factor * (right - left) / column_span;
+            const double dz_drow = z_factor * (below - above) / row_span;
+            const double dz_dx =
+                (dz_dcolumn * gt[5] - gt[4] * dz_drow) / determinant;
+            const double dz_dy =
+                (gt[1] * dz_drow - gt[2] * dz_dcolumn) / determinant;
+            const double gradient = std::hypot(dz_dx, dz_dy);
+            double derived = create.nodata_value;
+            if (options.kind == DT_GRID_TERRAIN_SLOPE_DEGREES) {
+                derived = std::atan(gradient) * 180.0 / kPi;
+            } else if (options.kind == DT_GRID_TERRAIN_ASPECT_DEGREES) {
+                if (gradient > 0.0) {
+                    derived = std::atan2(-dz_dx, -dz_dy) * 180.0 / kPi;
+                    if (derived < 0.0) derived += 360.0;
+                }
+            } else {
+                const double length = std::hypot(gradient, 1.0);
+                const double illumination =
+                    (-dz_dx * sun_x - dz_dy * sun_y + sun_z) / length;
+                derived = 255.0 * std::max(0.0, illumination);
+            }
+            row_values[static_cast<size_t>(column)] = derived;
+        }
+        output->write_window(0, row, width, 1, row_values.data(), width);
+        report_progress(progress,
+                        static_cast<double>(row + 1) /
+                            static_cast<double>(height));
+    }
+    return output;
+}
+
 void Grid::read_window(uint64_t column, uint64_t row, uint64_t width,
                        uint64_t height, double* output, uint64_t stride) const {
     if (!output) throw Exception(DT_E_INVALID_ARGUMENT, "output_values is null");

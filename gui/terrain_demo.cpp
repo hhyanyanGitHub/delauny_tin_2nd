@@ -32,7 +32,7 @@ constexpr int kToolbarHeight = 48;
 constexpr int kStatusHeight = 28;
 constexpr size_t kMaxDrawTriangles = 45000;
 constexpr size_t kMaxDrawTriangles3d = 18000;
-constexpr uint64_t kMaxGridPreviewValues = 4000000;
+constexpr uint64_t kMaxGridPreviewValues = 20000000;
 constexpr uint64_t kMaxContourDrawVertices = 200000;
 
 enum CommandId {
@@ -91,7 +91,13 @@ enum CommandId {
     ID_MEASURE_EXPORT,
     ID_MEASURE_CLEAR,
     ID_SLOPE_MODE,
-    ID_SLOPE_CLEAR
+    ID_SLOPE_CLEAR,
+    ID_TERRAIN_SLOPE_GRID,
+    ID_TERRAIN_ASPECT_GRID,
+    ID_TERRAIN_HILLSHADE_GRID,
+    ID_TERRAIN_SHOW_ELEVATION,
+    ID_TERRAIN_EXPORT_GRID,
+    ID_TERRAIN_EXPORT_GEOTIFF
 };
 
 enum class Mode {
@@ -112,6 +118,7 @@ enum class Mode {
 enum class ViewMode { Map2D, Terrain3D };
 enum class Drag3D { None, Orbit, Pan };
 enum class ProfileSource { None, Cdt, Tin, Grid };
+enum class GridTheme { Elevation, Slope, Aspect, Hillshade };
 
 struct DoublePromptState {
     HWND edit = nullptr;
@@ -321,6 +328,7 @@ public:
     ~DemoApp() {
         dt_cdt_destroy(cdt_);
         dt_contours_destroy(contours_);
+        dt_grid_destroy(terrain_grid_);
         dt_grid_destroy(grid_);
         dt_destroy(mesh_);
     }
@@ -470,6 +478,7 @@ private:
     dt_handle mesh_ = nullptr;
     dt_cdt_handle cdt_ = nullptr;
     dt_grid_handle grid_ = nullptr;
+    dt_grid_handle terrain_grid_ = nullptr;
     dt_contour_handle contours_ = nullptr;
     Mode mode_ = Mode::Query;
     ViewMode view_mode_ = ViewMode::Map2D;
@@ -522,6 +531,7 @@ private:
     uint32_t grid_preview_height_ = 0;
     double grid_zmin_ = 0.0;
     double grid_zmax_ = 1.0;
+    GridTheme grid_theme_ = GridTheme::Elevation;
     dt_contour_info contour_info_{};
     HWND view_button_ = nullptr;
     HWND exaggeration_button_ = nullptr;
@@ -691,6 +701,22 @@ private:
                     L"坡度/坡向分析（单击）");
         AppendMenuW(analysis_menu, MF_STRING, ID_SLOPE_CLEAR,
                     L"清除坡度/坡向结果");
+        AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_SLOPE_GRID,
+                    L"生成全幅坡度专题图");
+        AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_ASPECT_GRID,
+                    L"生成全幅坡向专题图");
+        AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_HILLSHADE_GRID,
+                    L"生成阴影地形图（315°/45°）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_SHOW_ELEVATION,
+                    L"恢复显示高程 GRID");
+        AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(analysis_menu, MF_STRING, ID_TERRAIN_EXPORT_GRID,
+                    L"导出当前专题图 DGRID…");
+        AppendMenuW(analysis_menu,
+                    MF_STRING | (gdal_gtiff_available_ ? MF_ENABLED : MF_GRAYED),
+                    ID_TERRAIN_EXPORT_GEOTIFF,
+                    L"导出当前专题图 GeoTIFF…");
 
         layer_menu_ = CreatePopupMenu();
         AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_TIN,
@@ -717,6 +743,15 @@ private:
 
     void update_layer_menu() const {
         if (!layer_menu_) return;
+        const wchar_t* grid_label = grid_theme_ == GridTheme::Slope
+                                        ? L"GRID 坡度专题"
+                                        : grid_theme_ == GridTheme::Aspect
+                                              ? L"GRID 坡向专题"
+                                              : grid_theme_ == GridTheme::Hillshade
+                                                    ? L"GRID 阴影地形"
+                                                    : L"GRID 高程着色";
+        ModifyMenuW(layer_menu_, ID_LAYER_GRID,
+                    MF_BYCOMMAND | MF_STRING, ID_LAYER_GRID, grid_label);
         CheckMenuItem(layer_menu_, ID_LAYER_TIN,
                       MF_BYCOMMAND | (show_tin_ ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(layer_menu_, ID_LAYER_GRID,
@@ -790,6 +825,9 @@ private:
 
     void destroy_grid_layer() {
         clear_analysis_for_source(ProfileSource::Grid);
+        dt_grid_destroy(terrain_grid_);
+        terrain_grid_ = nullptr;
+        grid_theme_ = GridTheme::Elevation;
         dt_grid_destroy(grid_);
         grid_ = nullptr;
         grid_info_ = {};
@@ -2245,10 +2283,14 @@ private:
     }
 
     bool is_grid_nodata(double value) const {
-        if ((grid_info_.flags & DT_GRID_HAS_NODATA) == 0) return false;
-        return std::isnan(grid_info_.nodata_value)
+        return is_grid_nodata(grid_info_, value);
+    }
+
+    static bool is_grid_nodata(const dt_grid_info& info, double value) {
+        if ((info.flags & DT_GRID_HAS_NODATA) == 0) return false;
+        return std::isnan(info.nodata_value)
                    ? std::isnan(value)
-                   : value == grid_info_.nodata_value;
+                   : value == info.nodata_value;
     }
 
     static uint32_t grid_pixel(double ratio) {
@@ -2269,6 +2311,61 @@ private:
         const uint32_t green = channel(1);
         const uint32_t blue = channel(2);
         return blue | (green << 8U) | (red << 16U);
+    }
+
+    static uint32_t slope_pixel(double slope_degrees) {
+        constexpr std::array<std::array<int, 3>, 7> colors{{
+            {34, 139, 84}, {112, 178, 88}, {214, 211, 92}, {239, 170, 70},
+            {220, 83, 60}, {154, 49, 92}, {83, 32, 92}}};
+        const double scaled = std::clamp(slope_degrees / 60.0, 0.0, 1.0) *
+                              static_cast<double>(colors.size() - 1);
+        const size_t first = static_cast<size_t>(scaled);
+        const size_t second = std::min(first + 1, colors.size() - 1);
+        const double blend = scaled - static_cast<double>(first);
+        const auto channel = [&](size_t value) {
+            return static_cast<uint32_t>(std::lround(
+                colors[first][value] * (1.0 - blend) +
+                colors[second][value] * blend));
+        };
+        const uint32_t red = channel(0), green = channel(1), blue = channel(2);
+        return blue | (green << 8U) | (red << 16U);
+    }
+
+    static uint32_t aspect_pixel(double aspect_degrees) {
+        double hue = std::fmod(aspect_degrees, 360.0);
+        if (hue < 0.0) hue += 360.0;
+        const double h = hue / 60.0;
+        const int sector = static_cast<int>(std::floor(h)) % 6;
+        const double fraction = h - std::floor(h);
+        constexpr double saturation = 0.72;
+        constexpr double brightness = 0.94;
+        const double p = brightness * (1.0 - saturation);
+        const double q = brightness * (1.0 - saturation * fraction);
+        const double t = brightness * (1.0 - saturation * (1.0 - fraction));
+        double red = 0.0, green = 0.0, blue = 0.0;
+        switch (sector) {
+        case 0: red = brightness; green = t; blue = p; break;
+        case 1: red = q; green = brightness; blue = p; break;
+        case 2: red = p; green = brightness; blue = t; break;
+        case 3: red = p; green = q; blue = brightness; break;
+        case 4: red = t; green = p; blue = brightness; break;
+        default: red = brightness; green = p; blue = q; break;
+        }
+        const uint32_t r = static_cast<uint32_t>(std::lround(red * 255.0));
+        const uint32_t g = static_cast<uint32_t>(std::lround(green * 255.0));
+        const uint32_t b = static_cast<uint32_t>(std::lround(blue * 255.0));
+        return b | (g << 8U) | (r << 16U);
+    }
+
+    uint32_t terrain_pixel(double value) const {
+        if (grid_theme_ == GridTheme::Slope) return slope_pixel(value);
+        if (grid_theme_ == GridTheme::Aspect) return aspect_pixel(value);
+        if (grid_theme_ == GridTheme::Hillshade) {
+            const uint32_t gray = static_cast<uint32_t>(std::lround(
+                std::clamp(value, 0.0, 255.0)));
+            return gray | (gray << 8U) | (gray << 16U);
+        }
+        return grid_pixel((value - grid_zmin_) / (grid_zmax_ - grid_zmin_));
     }
 
     bool refresh_grid_cache() {
@@ -2331,6 +2428,90 @@ private:
         return true;
     }
 
+    bool refresh_terrain_cache() {
+        if (!terrain_grid_) return false;
+        dt_grid_info info{};
+        info.struct_size = sizeof(info);
+        if (dt_grid_get_info(terrain_grid_, &info) != DT_OK) return false;
+        grid_preview_.clear();
+        grid_preview_width_ = grid_preview_height_ = 0;
+        if (info.width == 0 || info.height == 0 ||
+            info.width > kMaxGridPreviewValues / info.height ||
+            info.width * info.height > kMaxGridPreviewValues) {
+            return true;
+        }
+        std::vector<double> values(static_cast<size_t>(info.width * info.height));
+        if (dt_grid_read_window(terrain_grid_, 0, 0, info.width, info.height,
+                                values.data(), info.width) != DT_OK) {
+            return false;
+        }
+        grid_preview_width_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.width));
+        grid_preview_height_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.height));
+        grid_preview_.resize(static_cast<size_t>(grid_preview_width_) *
+                             grid_preview_height_);
+        for (uint32_t row = 0; row < grid_preview_height_; ++row) {
+            const uint64_t source_row = grid_preview_height_ == 1 ? 0 :
+                static_cast<uint64_t>(row) * (info.height - 1) /
+                (grid_preview_height_ - 1);
+            for (uint32_t column = 0; column < grid_preview_width_; ++column) {
+                const uint64_t source_column = grid_preview_width_ == 1 ? 0 :
+                    static_cast<uint64_t>(column) * (info.width - 1) /
+                    (grid_preview_width_ - 1);
+                const double value = values[static_cast<size_t>(
+                    source_row * info.width + source_column)];
+                grid_preview_[static_cast<size_t>(row) * grid_preview_width_ +
+                              column] = is_grid_nodata(info, value)
+                                            ? 0x00191f24U
+                                            : terrain_pixel(value);
+            }
+        }
+        return true;
+    }
+
+    static COLORREF pixel_colorref(uint32_t pixel) {
+        return RGB((pixel >> 16U) & 0xffU, (pixel >> 8U) & 0xffU,
+                   pixel & 0xffU);
+    }
+
+    void draw_grid_legend(HDC dc) const {
+        if (grid_theme_ == GridTheme::Elevation || !terrain_grid_) return;
+        RECT canvas = canvas_rect();
+        RECT panel{canvas.right - 190, canvas.top + 14,
+                   canvas.right - 14, canvas.top + 74};
+        HBRUSH background = CreateSolidBrush(RGB(248, 249, 250));
+        FillRect(dc, &panel, background);
+        DeleteObject(background);
+        FrameRect(dc, &panel, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(30, 36, 42));
+        RECT title{panel.left + 8, panel.top + 5, panel.right - 8, panel.top + 24};
+        const wchar_t* label = grid_theme_ == GridTheme::Slope
+                                   ? L"坡度（°）  0 — 60+"
+                                   : grid_theme_ == GridTheme::Aspect
+                                         ? L"坡向（°）  北→东→南→西"
+                                         : L"阴影值  0 — 255";
+        DrawTextW(dc, label, -1, &title, DT_LEFT | DT_SINGLELINE);
+        const int left = panel.left + 8;
+        const int top = panel.top + 31;
+        const int width = panel.right - panel.left - 16;
+        for (int i = 0; i < width; ++i) {
+            const double ratio = static_cast<double>(i) /
+                                 static_cast<double>(std::max(1, width - 1));
+            uint32_t pixel = grid_theme_ == GridTheme::Slope
+                                 ? slope_pixel(ratio * 60.0)
+                                 : grid_theme_ == GridTheme::Aspect
+                                       ? aspect_pixel(ratio * 360.0)
+                                       : static_cast<uint32_t>(ratio * 255.0) *
+                                             0x00010101U;
+            HPEN pen = CreatePen(PS_SOLID, 1, pixel_colorref(pixel));
+            const auto old = SelectObject(dc, pen);
+            MoveToEx(dc, left + i, top, nullptr);
+            LineTo(dc, left + i, top + 13);
+            SelectObject(dc, old);
+            DeleteObject(pen);
+        }
+    }
+
     dt_point3 grid_world(uint64_t column, uint64_t row) const {
         const double c = static_cast<double>(column);
         const double r = static_cast<double>(row);
@@ -2381,6 +2562,7 @@ private:
         Polyline(dc, outline, 5);
         SelectObject(dc, old_pen);
         DeleteObject(pen);
+        draw_grid_legend(dc);
     }
 
     void draw_contours(HDC dc) const {
@@ -3627,7 +3809,7 @@ private:
                 return;
             }
             if (grid_values_.empty()) {
-                action_text_ = L"GRID 超过演示程序 400 万节点缓存上限，未生成等高线";
+                action_text_ = L"GRID 超过演示程序 2000 万节点缓存上限，未生成等高线";
                 return;
             }
             zmin = grid_zmin_;
@@ -3710,6 +3892,129 @@ private:
         action_text_ = text.str();
     }
 
+    void derive_terrain_grid(uint32_t kind) {
+        if (!grid_) {
+            dt_statistics statistics{};
+            dt_get_statistics(mesh_, &statistics);
+            if (cdt_ && cdt_info_.domain_triangle_count > 0) {
+                convert_cdt_to_grid();
+            } else if (statistics.finite_triangle_count > 0) {
+                convert_tin_to_grid();
+            }
+        }
+        if (!grid_) {
+            action_text_ = L"专题分析失败：请先导入 GRID，或构建 TIN/CDT";
+            return;
+        }
+        dt_grid_terrain_options options{};
+        options.struct_size = sizeof(options);
+        options.kind = kind;
+        options.z_factor = 1.0;
+        options.sun_azimuth_degrees = 315.0;
+        options.sun_altitude_degrees = 45.0;
+        options.output_nodata_value = -9999.0;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status =
+            dt_grid_derive_terrain(grid_, &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"专题分析失败：" + last_error_text();
+            return;
+        }
+        dt_grid_destroy(terrain_grid_);
+        terrain_grid_ = output;
+        grid_theme_ = kind == DT_GRID_TERRAIN_SLOPE_DEGREES
+                          ? GridTheme::Slope
+                          : kind == DT_GRID_TERRAIN_ASPECT_DEGREES
+                                ? GridTheme::Aspect
+                                : GridTheme::Hillshade;
+        show_grid_ = true;
+        refresh_terrain_cache();
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        dt_grid_info info{};
+        info.struct_size = sizeof(info);
+        dt_grid_get_info(terrain_grid_, &info);
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        const wchar_t* name = grid_theme_ == GridTheme::Slope
+                                  ? L"坡度"
+                                  : grid_theme_ == GridTheme::Aspect
+                                        ? L"坡向"
+                                        : L"阴影地形";
+        std::wostringstream text;
+        text << name << L"专题图完成：" << info.width << L"×" << info.height
+             << L"，有效节点 " << info.valid_value_count << L"，耗时 "
+             << std::fixed << std::setprecision(1) << ms << L" ms";
+        if (grid_preview_.empty()) text << L"（数据已生成，预览超过 2000 万节点上限）";
+        action_text_ = text.str();
+    }
+
+    void show_elevation_grid() {
+        if (!grid_) {
+            action_text_ = L"当前没有高程 GRID";
+            return;
+        }
+        dt_grid_destroy(terrain_grid_);
+        terrain_grid_ = nullptr;
+        grid_theme_ = GridTheme::Elevation;
+        refresh_grid_cache();
+        show_grid_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        action_text_ = L"已恢复显示高程 GRID";
+    }
+
+    void export_terrain_grid_file() {
+        if (!terrain_grid_) {
+            action_text_ = L"没有可导出的专题图，请先生成坡度、坡向或阴影地形图";
+            return;
+        }
+        const auto file = choose_file(
+            true, L"terrain_analysis.dgrid",
+            L"DGRID 规则网格 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dgrid");
+        if (file.empty()) return;
+        const dt_status status = dt_grid_save_text(
+            terrain_grid_, wide_to_utf8(file.c_str()).c_str());
+        action_text_ = status == DT_OK ? L"已导出专题图：" + file
+                                       : L"专题图导出失败：" + last_error_text();
+    }
+
+    void export_terrain_geotiff() {
+        if (!terrain_grid_) {
+            action_text_ = L"没有可导出的专题图，请先生成分析结果";
+            return;
+        }
+        if (!gdal_gtiff_available_) {
+            action_text_ = L"当前构建未启用 GDAL GeoTIFF 驱动";
+            return;
+        }
+        const auto file = choose_file(
+            true, L"terrain_analysis.tif",
+            L"GeoTIFF (*.tif;*.tiff)\0*.tif;*.tiff\0所有文件 (*.*)\0*.*\0",
+            L"tif");
+        if (file.empty()) return;
+        const char* creation_options[] = {
+            "TILED=YES", "COMPRESS=DEFLATE", "BIGTIFF=IF_SAFER", nullptr};
+        dt_gdal_raster_save_options options{};
+        options.struct_size = sizeof(options);
+        options.driver_name = "GTiff";
+        options.creation_options = creation_options;
+        set_wait_cursor(true);
+        const dt_status status = dt_grid_save_gdal_raster(
+            terrain_grid_, wide_to_utf8(file.c_str()).c_str(), &options);
+        set_wait_cursor(false);
+        action_text_ = status == DT_OK ? L"已导出专题 GeoTIFF：" + file
+                                       : L"专题 GeoTIFF 导出失败：" + last_error_text();
+    }
+
     void import_grid_file() {
         const auto file = choose_file(false, L"terrain.dgrid",
             L"DGRID 规则网格 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
@@ -3736,7 +4041,7 @@ private:
         text << L"已导入 GRID：" << grid_info_.width << L"×"
              << grid_info_.height << L"，有效节点 "
              << grid_info_.valid_value_count;
-        if (grid_values_.empty()) text << L"（超过 400 万节点，仅保留数据层）";
+        if (grid_values_.empty()) text << L"（超过 2000 万节点，仅保留数据层）";
         action_text_ = text.str();
     }
 
@@ -3839,7 +4144,7 @@ private:
              << grid_info_.height << L"，有效节点 "
              << grid_info_.valid_value_count << L"，耗时 " << std::fixed
              << std::setprecision(1) << ms << L" ms";
-        if (grid_values_.empty()) text << L"（超过 400 万节点，仅保留数据层）";
+        if (grid_values_.empty()) text << L"（超过 2000 万节点，仅保留数据层）";
         action_text_ = text.str();
     }
 
@@ -4145,6 +4450,15 @@ private:
             clear_slope_analysis();
             action_text_ = L"坡度/坡向分析结果已清除";
             break;
+        case ID_TERRAIN_SLOPE_GRID:
+            derive_terrain_grid(DT_GRID_TERRAIN_SLOPE_DEGREES); break;
+        case ID_TERRAIN_ASPECT_GRID:
+            derive_terrain_grid(DT_GRID_TERRAIN_ASPECT_DEGREES); break;
+        case ID_TERRAIN_HILLSHADE_GRID:
+            derive_terrain_grid(DT_GRID_TERRAIN_HILLSHADE); break;
+        case ID_TERRAIN_SHOW_ELEVATION: show_elevation_grid(); break;
+        case ID_TERRAIN_EXPORT_GRID: export_terrain_grid_file(); break;
+        case ID_TERRAIN_EXPORT_GEOTIFF: export_terrain_geotiff(); break;
         case ID_TIN_TO_GRID: convert_tin_to_grid(); break;
         case ID_GRID_TO_TIN: convert_grid_to_tin(); break;
         case ID_CONTOURS_FROM_TIN: generate_contours(false); break;

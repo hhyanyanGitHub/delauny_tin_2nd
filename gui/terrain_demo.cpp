@@ -8,12 +8,14 @@
 #include "dt_gdal_api.h"
 #include "dt_terrain_api.h"
 #include "terrain_3d.hpp"
+#include "terrain_profile.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cwctype>
 #include <iomanip>
@@ -77,7 +79,10 @@ enum CommandId {
     ID_CDT_CANCEL,
     ID_CDT_MOVE_VERTEX,
     ID_CDT_REMOVE_VERTEX,
-    ID_CDT_DELETE
+    ID_CDT_DELETE,
+    ID_PROFILE_MODE,
+    ID_PROFILE_EXPORT,
+    ID_PROFILE_CLEAR
 };
 
 enum class Mode {
@@ -90,10 +95,12 @@ enum class Mode {
     CdtHole,
     CdtMoveVertex,
     CdtRemoveVertex,
-    CdtDelete
+    CdtDelete,
+    Profile
 };
 enum class ViewMode { Map2D, Terrain3D };
 enum class Drag3D { None, Orbit, Pan };
+enum class ProfileSource { None, Cdt, Tin, Grid };
 
 std::wstring utf8_to_wide(const char* text) {
     if (!text || !*text) return {};
@@ -266,6 +273,13 @@ public:
                 cancel_box_zoom();
                 action_text_ = L"已取消框选放大";
                 InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            if (wparam == VK_ESCAPE && mode_ == Mode::Profile &&
+                profile_has_start_) {
+                clear_profile();
+                action_text_ = L"已清除当前剖面";
+                InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return 0;
         case WM_DESTROY:
@@ -347,6 +361,13 @@ private:
     double z_exaggeration_ = 1.0;
     double mesh_zmin_ = 0.0;
     double mesh_zmax_ = 1.0;
+    ProfileSource profile_source_ = ProfileSource::None;
+    bool profile_has_start_ = false;
+    bool profile_complete_ = false;
+    dt_point3 profile_start_{};
+    dt_point3 profile_end_{};
+    std::vector<dterrain::profile::Sample> profile_samples_;
+    dterrain::profile::Statistics profile_statistics_{};
 
     RECT canvas_rect() const {
         RECT rect{};
@@ -464,6 +485,14 @@ private:
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DELETE,
                     L"选择删除约束");
 
+        HMENU analysis_menu = CreatePopupMenu();
+        AppendMenuW(analysis_menu, MF_STRING, ID_PROFILE_MODE,
+                    L"任意剖面（两次单击）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_PROFILE_EXPORT,
+                    L"导出剖面 CSV…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_PROFILE_CLEAR,
+                    L"清除剖面");
+
         layer_menu_ = CreatePopupMenu();
         AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_TIN,
                     L"TIN 三角网");
@@ -480,6 +509,8 @@ private:
                     L"数据交换(&E)");
         AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(cdt_edit_menu),
                     L"约束编辑(&C)");
+        AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(analysis_menu),
+                    L"分析(&A)");
         AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu_),
                     L"图层(&L)");
         SetMenu(hwnd_, menu_bar);
@@ -511,7 +542,22 @@ private:
         SetCursor(LoadCursorW(nullptr, waiting ? IDC_WAIT : IDC_ARROW));
     }
 
+    void clear_profile() {
+        profile_source_ = ProfileSource::None;
+        profile_has_start_ = false;
+        profile_complete_ = false;
+        profile_start_ = {};
+        profile_end_ = {};
+        profile_samples_.clear();
+        profile_statistics_ = {};
+    }
+
+    void clear_profile_for_source(ProfileSource source) {
+        if (profile_source_ == source) clear_profile();
+    }
+
     void destroy_grid_layer() {
+        clear_profile_for_source(ProfileSource::Grid);
         dt_grid_destroy(grid_);
         grid_ = nullptr;
         grid_info_ = {};
@@ -528,11 +574,13 @@ private:
 
     void clear_derived_layers(bool clear_grid = true,
                               bool clear_contours = true) {
+        clear_profile_for_source(ProfileSource::Tin);
         if (clear_grid) destroy_grid_layer();
         if (clear_contours) destroy_contour_layer();
     }
 
     void clear_cdt_layer() {
+        clear_profile_for_source(ProfileSource::Cdt);
         if (cdt_) dt_cdt_clear(cdt_);
         cdt_triangles_.clear();
         constraint_lines_.clear();
@@ -665,6 +713,7 @@ private:
     }
 
     void copy_effect(dt_edit_result effect) {
+        clear_profile();
         clear_overlays();
         if (!effect) return;
         dt_edit_result_view view{};
@@ -801,6 +850,7 @@ private:
             action_text_ = L"添加约束失败：" + last_error_text();
             return;
         }
+        clear_profile_for_source(ProfileSource::Cdt);
         cdt_draft_.clear();
         destroy_grid_layer();
         destroy_contour_layer();
@@ -866,6 +916,7 @@ private:
             action_text_ = L"批量添加示例断裂线失败：" + last_error_text();
             return;
         }
+        clear_profile_for_source(ProfileSource::Cdt);
         destroy_grid_layer();
         destroy_contour_layer();
         refresh_cdt_constraints();
@@ -1120,6 +1171,7 @@ private:
             action_text_ = L"删除约束失败：" + last_error_text();
             return;
         }
+        clear_profile_for_source(ProfileSource::Cdt);
         destroy_grid_layer();
         destroy_contour_layer();
         refresh_cdt_constraints();
@@ -1129,11 +1181,259 @@ private:
         action_text_ = text.str();
     }
 
+    const wchar_t* profile_source_name() const {
+        switch (profile_source_) {
+        case ProfileSource::Cdt: return L"约束网有效域";
+        case ProfileSource::Tin: return L"TIN";
+        case ProfileSource::Grid: return L"GRID";
+        default: return L"无";
+        }
+    }
+
+    ProfileSource select_profile_source() const {
+        dt_cdt_statistics cdt_stats{};
+        cdt_stats.struct_size = sizeof(cdt_stats);
+        const bool has_cdt = cdt_ &&
+            dt_cdt_get_statistics(cdt_, &cdt_stats) == DT_OK &&
+            cdt_stats.domain_triangle_count != 0;
+        dt_statistics tin_stats{};
+        const bool has_tin = dt_get_statistics(mesh_, &tin_stats) == DT_OK &&
+                             tin_stats.dimension == 2;
+        if (show_cdt_ && has_cdt) return ProfileSource::Cdt;
+        if (show_tin_ && has_tin) return ProfileSource::Tin;
+        if (show_grid_ && grid_) return ProfileSource::Grid;
+        if (has_cdt) return ProfileSource::Cdt;
+        if (has_tin) return ProfileSource::Tin;
+        if (grid_) return ProfileSource::Grid;
+        return ProfileSource::None;
+    }
+
+    bool sample_tin_profile(const dterrain::profile::Point& point,
+                            double& output_z) const {
+        dt_point3 query{point.x, point.y, 0.0};
+        dt_location_result location{};
+        if (dt_locate_point_xy(mesh_, &query, &location) != DT_OK) return false;
+        if (location.type == DT_LOCATION_VERTEX) {
+            output_z = location.vertex.point.z;
+            return std::isfinite(output_z);
+        }
+        if (location.type == DT_LOCATION_EDGE) {
+            const auto& edge = location.edge;
+            if (edge.vertex[0].id == 0 || edge.vertex[1].id == 0) return false;
+            return dterrain::profile::segment_height(
+                point, {edge.vertex[0].point.x, edge.vertex[0].point.y},
+                edge.vertex[0].point.z,
+                {edge.vertex[1].point.x, edge.vertex[1].point.y},
+                edge.vertex[1].point.z, output_z);
+        }
+        if (location.type == DT_LOCATION_FACE) {
+            const auto& triangle = location.triangle;
+            if (triangle.vertex[0].id == 0 || triangle.vertex[1].id == 0 ||
+                triangle.vertex[2].id == 0) {
+                return false;
+            }
+            return dterrain::profile::triangle_height(
+                point,
+                {triangle.vertex[0].point.x, triangle.vertex[0].point.y},
+                triangle.vertex[0].point.z,
+                {triangle.vertex[1].point.x, triangle.vertex[1].point.y},
+                triangle.vertex[1].point.z,
+                {triangle.vertex[2].point.x, triangle.vertex[2].point.y},
+                triangle.vertex[2].point.z, output_z);
+        }
+        return false;
+    }
+
+    bool sample_grid_profile(const dterrain::profile::Point& point,
+                             double& output_z) {
+        if (!grid_) return false;
+        grid_info_ = {};
+        grid_info_.struct_size = sizeof(grid_info_);
+        if (dt_grid_get_info(grid_, &grid_info_) != DT_OK ||
+            grid_info_.width == 0 || grid_info_.height == 0) {
+            return false;
+        }
+        double column = 0.0;
+        double row = 0.0;
+        if (!dterrain::profile::grid_coordinates(
+                grid_info_.geo_transform, point, column, row)) {
+            return false;
+        }
+        constexpr double tolerance = 1.0e-9;
+        if (column < -tolerance || row < -tolerance ||
+            column > static_cast<double>(grid_info_.width - 1) + tolerance ||
+            row > static_cast<double>(grid_info_.height - 1) + tolerance) {
+            return false;
+        }
+        column = std::clamp(column, 0.0,
+                            static_cast<double>(grid_info_.width - 1));
+        row = std::clamp(row, 0.0,
+                         static_cast<double>(grid_info_.height - 1));
+        const uint64_t column0 = static_cast<uint64_t>(std::floor(column));
+        const uint64_t row0 = static_cast<uint64_t>(std::floor(row));
+        const uint64_t column1 = std::min(column0 + 1, grid_info_.width - 1);
+        const uint64_t row1 = std::min(row0 + 1, grid_info_.height - 1);
+        const uint64_t width = column1 - column0 + 1;
+        const uint64_t height = row1 - row0 + 1;
+        double values[4]{};
+        if (dt_grid_read_window(grid_, column0, row0, width, height,
+                                values, width) != DT_OK) {
+            return false;
+        }
+        auto value = [&](uint64_t x, uint64_t y) {
+            return values[static_cast<size_t>(y * width + x)];
+        };
+        const double z00 = value(0, 0);
+        const double z10 = value(width - 1, 0);
+        const double z01 = value(0, height - 1);
+        const double z11 = value(width - 1, height - 1);
+        if (is_grid_nodata(z00) || is_grid_nodata(z10) ||
+            is_grid_nodata(z01) || is_grid_nodata(z11)) {
+            return false;
+        }
+        output_z = dterrain::profile::bilinear(
+            z00, z10, z01, z11, column - static_cast<double>(column0),
+            row - static_cast<double>(row0));
+        return std::isfinite(output_z);
+    }
+
+    bool sample_profile_point(const dterrain::profile::Point& point,
+                              double& output_z) {
+        if (profile_source_ == ProfileSource::Cdt) {
+            dt_point3 query{point.x, point.y, 0.0};
+            return dt_cdt_sample_height_xy(cdt_, &query, &output_z) == DT_OK;
+        }
+        if (profile_source_ == ProfileSource::Tin)
+            return sample_tin_profile(point, output_z);
+        if (profile_source_ == ProfileSource::Grid)
+            return sample_grid_profile(point, output_z);
+        return false;
+    }
+
+    bool calculate_profile() {
+        profile_source_ = select_profile_source();
+        if (profile_source_ == ProfileSource::None) {
+            action_text_ = L"剖面分析失败：当前没有可采样的 TIN、GRID 或 CDT";
+            return false;
+        }
+        const double dx = profile_end_.x - profile_start_.x;
+        const double dy = profile_end_.y - profile_start_.y;
+        const double distance = std::hypot(dx, dy);
+        const double coordinate_scale = std::max(
+            {1.0, std::abs(profile_start_.x), std::abs(profile_start_.y),
+             std::abs(profile_end_.x), std::abs(profile_end_.y)});
+        if (!(distance > std::numeric_limits<double>::epsilon() *
+                         coordinate_scale * 32.0)) {
+            action_text_ = L"剖面终点与起点过近，请重新单击终点";
+            return false;
+        }
+        constexpr size_t kSampleCount = 401;
+        const auto points = dterrain::profile::line_points(
+            {profile_start_.x, profile_start_.y},
+            {profile_end_.x, profile_end_.y}, kSampleCount);
+        profile_samples_.clear();
+        profile_samples_.reserve(points.size());
+        set_wait_cursor(true);
+        for (size_t index = 0; index < points.size(); ++index) {
+            dterrain::profile::Sample sample{};
+            sample.distance = distance * static_cast<double>(index) /
+                              static_cast<double>(points.size() - 1);
+            sample.x = points[index].x;
+            sample.y = points[index].y;
+            sample.valid = sample_profile_point(points[index], sample.z);
+            profile_samples_.push_back(sample);
+        }
+        set_wait_cursor(false);
+        profile_statistics_ = dterrain::profile::summarize(profile_samples_);
+        if (profile_statistics_.valid_count < 2) {
+            profile_samples_.clear();
+            profile_statistics_ = {};
+            action_text_ = L"剖面分析失败：选线在当前采样表面上没有足够有效点";
+            return false;
+        }
+        profile_complete_ = true;
+        if (profile_samples_.front().valid)
+            profile_start_.z = profile_samples_.front().z;
+        if (profile_samples_.back().valid)
+            profile_end_.z = profile_samples_.back().z;
+        std::wostringstream text;
+        text << L"剖面完成（" << profile_source_name() << L"）：距离 "
+             << std::fixed << std::setprecision(2)
+             << profile_statistics_.horizontal_distance << L"，有效 "
+             << profile_statistics_.valid_count << L"/" << kSampleCount
+             << L"，高程 " << profile_statistics_.minimum_z << L"～"
+             << profile_statistics_.maximum_z;
+        if (std::isfinite(profile_statistics_.elevation_difference))
+            text << L"，高差 " << profile_statistics_.elevation_difference;
+        text << L"，最大分段坡度 " << std::setprecision(1)
+             << profile_statistics_.maximum_absolute_grade_percent << L"%";
+        action_text_ = text.str();
+        return true;
+    }
+
+    void profile_click(const dt_point3& world) {
+        if (!profile_has_start_ || profile_complete_) {
+            clear_profile();
+            profile_has_start_ = true;
+            profile_start_ = world;
+            action_text_ = L"剖面起点已选择，请单击终点；Esc 清除";
+            return;
+        }
+        profile_end_ = world;
+        calculate_profile();
+    }
+
+    void export_profile_csv() {
+        if (!profile_complete_ || profile_samples_.empty()) {
+            action_text_ = L"没有可导出的剖面，请先完成两次单击";
+            return;
+        }
+        const auto file = choose_file(
+            true, L"terrain_profile.csv",
+            L"CSV 剖面 (*.csv)\0*.csv\0所有文件 (*.*)\0*.*\0", L"csv");
+        if (file.empty()) return;
+        std::ostringstream output;
+        output << std::setprecision(17);
+        output << "# source," << wide_to_utf8(profile_source_name()) << "\r\n";
+        output << "index,distance,x,y,z,valid,grade_percent\r\n";
+        for (size_t index = 0; index < profile_samples_.size(); ++index) {
+            const auto& sample = profile_samples_[index];
+            output << index << ',' << sample.distance << ',' << sample.x << ','
+                   << sample.y << ',';
+            if (sample.valid && std::isfinite(sample.z)) output << sample.z;
+            output << ',' << (sample.valid ? 1 : 0) << ',';
+            if (index != 0 && sample.valid &&
+                profile_samples_[index - 1].valid) {
+                const double run = sample.distance -
+                                   profile_samples_[index - 1].distance;
+                if (run > 0.0)
+                    output << (sample.z - profile_samples_[index - 1].z) /
+                                  run * 100.0;
+            }
+            output << "\r\n";
+        }
+        const std::string bytes = output.str();
+        FILE* stream = _wfopen(file.c_str(), L"wb");
+        if (!stream) {
+            action_text_ = L"剖面 CSV 导出失败：无法创建文件";
+            return;
+        }
+        const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), stream);
+        const int close_status = std::fclose(stream);
+        if (written != bytes.size() || close_status != 0) {
+            action_text_ = L"剖面 CSV 导出失败：文件写入不完整";
+            return;
+        }
+        action_text_ = L"已导出剖面 CSV：" + file;
+    }
+
     void on_left_click(int x, int y) {
         if (!view_valid_) return;
         const dt_point3 world = screen_to_world(x, y);
         const auto begin = std::chrono::steady_clock::now();
-        if (is_cdt_draw_mode()) {
+        if (mode_ == Mode::Profile) {
+            profile_click(world);
+        } else if (is_cdt_draw_mode()) {
             append_cdt_draft_point(world);
         } else if (mode_ == Mode::CdtMoveVertex) {
             move_cdt_vertex_at(x, y, world);
@@ -1993,6 +2293,127 @@ private:
         DeleteObject(pen);
     }
 
+    void draw_profile(HDC dc, const RECT& canvas) const {
+        if (!profile_has_start_) return;
+        const POINT start = world_to_screen(profile_start_);
+        HPEN line_pen = CreatePen(PS_SOLID, 3, RGB(70, 235, 255));
+        const auto old_pen = SelectObject(dc, line_pen);
+        if (profile_complete_) {
+            const POINT end = world_to_screen(profile_end_);
+            MoveToEx(dc, start.x, start.y, nullptr);
+            LineTo(dc, end.x, end.y);
+        }
+        HBRUSH start_brush = CreateSolidBrush(RGB(60, 235, 120));
+        const auto old_brush = SelectObject(dc, start_brush);
+        Ellipse(dc, start.x - 6, start.y - 6, start.x + 7, start.y + 7);
+        SelectObject(dc, old_brush);
+        DeleteObject(start_brush);
+        if (profile_complete_) {
+            const POINT end = world_to_screen(profile_end_);
+            HBRUSH end_brush = CreateSolidBrush(RGB(255, 105, 80));
+            const auto previous_brush = SelectObject(dc, end_brush);
+            Ellipse(dc, end.x - 6, end.y - 6, end.x + 7, end.y + 7);
+            SelectObject(dc, previous_brush);
+            DeleteObject(end_brush);
+        }
+        SelectObject(dc, old_pen);
+        DeleteObject(line_pen);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(235, 245, 250));
+        TextOutW(dc, start.x + 8, start.y - 18, L"A", 1);
+        if (!profile_complete_ || profile_samples_.empty()) return;
+        const POINT end = world_to_screen(profile_end_);
+        TextOutW(dc, end.x + 8, end.y - 18, L"B", 1);
+
+        RECT panel = canvas;
+        panel.left += 16;
+        panel.right -= 16;
+        panel.bottom -= 16;
+        panel.top = std::max<LONG>(canvas.top + 16, panel.bottom - 210);
+        HBRUSH panel_brush = CreateSolidBrush(RGB(24, 31, 39));
+        FillRect(dc, &panel, panel_brush);
+        DeleteObject(panel_brush);
+        HPEN border_pen = CreatePen(PS_SOLID, 1, RGB(80, 155, 180));
+        const auto previous_pen = SelectObject(dc, border_pen);
+        const auto hollow_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, panel.left, panel.top, panel.right, panel.bottom);
+        SelectObject(dc, hollow_brush);
+
+        RECT plot{panel.left + 62, panel.top + 48,
+                  panel.right - 24, panel.bottom - 30};
+        const double raw_minimum = profile_statistics_.minimum_z;
+        const double raw_maximum = profile_statistics_.maximum_z;
+        const double range = std::max(1.0e-12, raw_maximum - raw_minimum);
+        const double minimum = raw_minimum - range * 0.06;
+        const double maximum = raw_maximum + range * 0.06;
+        const double distance = std::max(
+            1.0e-12, profile_statistics_.horizontal_distance);
+
+        HPEN grid_pen = CreatePen(PS_DOT, 1, RGB(72, 82, 92));
+        SelectObject(dc, grid_pen);
+        SetTextColor(dc, RGB(190, 202, 212));
+        for (int index = 0; index <= 4; ++index) {
+            const LONG y = plot.bottom -
+                (plot.bottom - plot.top) * index / 4;
+            MoveToEx(dc, plot.left, y, nullptr);
+            LineTo(dc, plot.right, y);
+            std::wostringstream label;
+            label << std::fixed << std::setprecision(1)
+                  << (minimum + (maximum - minimum) * index / 4.0);
+            RECT label_rect{panel.left + 4, y - 9, plot.left - 5, y + 10};
+            DrawTextW(dc, label.str().c_str(), -1, &label_rect,
+                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+        SelectObject(dc, border_pen);
+        DeleteObject(grid_pen);
+
+        HPEN profile_pen = CreatePen(PS_SOLID, 2, RGB(255, 210, 70));
+        SelectObject(dc, profile_pen);
+        bool previous_valid = false;
+        for (const auto& sample : profile_samples_) {
+            if (!sample.valid || !std::isfinite(sample.z)) {
+                previous_valid = false;
+                continue;
+            }
+            const LONG x = plot.left + static_cast<LONG>(std::lround(
+                sample.distance / distance * (plot.right - plot.left)));
+            const LONG y = plot.bottom - static_cast<LONG>(std::lround(
+                (sample.z - minimum) / (maximum - minimum) *
+                (plot.bottom - plot.top)));
+            if (previous_valid) LineTo(dc, x, y);
+            else MoveToEx(dc, x, y, nullptr);
+            previous_valid = true;
+        }
+        SelectObject(dc, border_pen);
+        DeleteObject(profile_pen);
+        SelectObject(dc, previous_pen);
+        DeleteObject(border_pen);
+
+        SetTextColor(dc, RGB(232, 239, 244));
+        std::wostringstream title;
+        title << L"剖面 A→B｜" << profile_source_name() << L"｜距离 "
+              << std::fixed << std::setprecision(2)
+              << profile_statistics_.horizontal_distance << L"｜高程 "
+              << raw_minimum << L"～" << raw_maximum;
+        if (std::isfinite(profile_statistics_.elevation_difference))
+            title << L"｜高差 " << profile_statistics_.elevation_difference;
+        title << L"｜累计升/降 " << profile_statistics_.ascent << L"/"
+              << profile_statistics_.descent << L"｜最大坡度 "
+              << std::setprecision(1)
+              << profile_statistics_.maximum_absolute_grade_percent << L"%";
+        RECT title_rect{panel.left + 12, panel.top + 10,
+                        panel.right - 12, panel.top + 38};
+        DrawTextW(dc, title.str().c_str(), -1, &title_rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        TextOutW(dc, plot.left, plot.bottom + 6, L"0", 1);
+        std::wostringstream distance_label;
+        distance_label << std::fixed << std::setprecision(2) << distance;
+        RECT end_label{plot.right - 150, plot.bottom + 4,
+                       plot.right, panel.bottom - 4};
+        DrawTextW(dc, distance_label.str().c_str(), -1, &end_label,
+                  DT_RIGHT | DT_TOP | DT_SINGLELINE);
+    }
+
     void paint() {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd_, &ps);
@@ -2033,6 +2454,7 @@ private:
             draw_highlight(dc);
             draw_contours(dc);
             draw_box_zoom(dc);
+            draw_profile(dc, canvas);
         }
         RestoreDC(dc, saved);
 
@@ -2054,7 +2476,8 @@ private:
                               mode_ == Mode::CdtHole ? L"绘制孔洞" :
                               mode_ == Mode::CdtMoveVertex ? L"移动约束顶点" :
                               mode_ == Mode::CdtRemoveVertex ? L"删除约束顶点" :
-                              mode_ == Mode::CdtDelete ? L"删除约束" : L"查询";
+                              mode_ == Mode::CdtDelete ? L"删除约束" :
+                              mode_ == Mode::Profile ? L"任意剖面" : L"查询";
         std::wostringstream text;
         text << L"  视图: "
              << (view_mode_ == ViewMode::Terrain3D ? L"3D" : L"2D")
@@ -2266,6 +2689,7 @@ private:
         const dt_status status = dt_cdt_build_from_tin(cdt_, mesh_);
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
+        if (status == DT_OK) clear_profile_for_source(ProfileSource::Cdt);
         if (status != DT_OK || !refresh_cdt_constraints()) {
             action_text_ = L"创建约束网失败：" + last_error_text();
             return;
@@ -2417,6 +2841,7 @@ private:
             action_text_ = L"GRID→TIN 失败：" + last_error_text();
             return;
         }
+        clear_profile_for_source(ProfileSource::Tin);
         destroy_contour_layer();
         clear_overlays();
         show_tin_ = true;
@@ -2452,6 +2877,7 @@ private:
             action_text_ = L"等高线→TIN 失败：" + last_error_text();
             return;
         }
+        clear_profile_for_source(ProfileSource::Tin);
         destroy_grid_layer();
         clear_cdt_layer();
         clear_overlays();
@@ -2933,6 +3359,7 @@ private:
             cdt_, wide_to_utf8(file.c_str()).c_str(), nullptr);
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
+        if (status == DT_OK) clear_profile_for_source(ProfileSource::Cdt);
         if (status != DT_OK || !refresh_cdt_constraints()) {
             action_text_ = L"约束网导入失败：" + last_error_text();
             return;
@@ -3035,6 +3462,21 @@ private:
         case ID_LOAD: load_file(); break;
         case ID_VIEW_3D: toggle_view_mode(); break;
         case ID_Z_EXAGGERATION: change_exaggeration(1); break;
+        case ID_PROFILE_MODE:
+            enter_2d_view();
+            cdt_draft_.clear();
+            reset_cdt_move_selection();
+            cancel_box_zoom();
+            mode_ = Mode::Profile;
+            action_text_ = profile_complete_
+                ? L"单击新的剖面起点；现有结果可先导出 CSV"
+                : L"单击剖面起点，再单击终点；Esc 清除";
+            break;
+        case ID_PROFILE_EXPORT: export_profile_csv(); break;
+        case ID_PROFILE_CLEAR:
+            clear_profile();
+            action_text_ = L"剖面已清除";
+            break;
         case ID_TIN_TO_GRID: convert_tin_to_grid(); break;
         case ID_GRID_TO_TIN: convert_grid_to_tin(); break;
         case ID_CONTOURS_FROM_TIN: generate_contours(false); break;

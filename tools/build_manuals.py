@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 TODAY = date(2026, 7, 17).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.13.0：Win32 GUI 已接入 GeoTIFF/COG GRID 与 GeoPackage 等高线交换，并保留等高线反向转换和原子批量约束事务。GDAL 菜单按运行环境驱动能力启用；真正局部 CDT 更新和生产级 GPU LOD 属于后续阶段。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.14.0：Win32 GUI 已接入任意直线剖面分析及 CSV 导出，并保留 GeoTIFF/COG、GeoPackage、等高线反向转换和原子批量约束事务。剖面复用既有稳定 ABI；真正局部 CDT 更新和生产级 GPU LOD 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
@@ -468,6 +468,7 @@ def build_developer_manual():
         "动态插入、按 XY 最近点删除、按稳定 ID 删除以及高程更新。",
         "返回编辑前后受影响三角形、边界边、删除边与新增边。",
         "最近顶点、点定位、矩形范围三角形查询、统计与完整校验。",
+        "GUI 两点定义任意地形剖面，固定 CDT/TIN/GRID 数据源采样、统计并导出 CSV。",
         "DTIN 二进制保存加载，以及 DTMESH 可读文本三角网交换。",
         "双精度 GRID、仿射节点坐标、NoData、窗口读写和 DGRID 文本往返。",
         "TIN→GRID、GRID→TIN、TIN/GRID→等高线，以及等高线→TIN/GRID 近似重建。",
@@ -495,7 +496,7 @@ def build_developer_manual():
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.13 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。", "gold")
+    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.14 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。", "gold")
 
     m.h1("2 架构与数据模型")
     m.h2("2.1 分层结构")
@@ -965,7 +966,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
     m.h2("9.1 自动化测试")
     m.code("""cmake --build build --config Release --parallel 4
 ctest --test-dir build --output-on-failure""")
-    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。GDAL 构建还执行 GTiff、COG、GPKG 驱动探测和真实文件往返。")
+    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。独立剖面数学测试覆盖线性采样、三角形高程、旋转仿射 GRID 双线性插值、NoData 断点和升降/坡度统计；GDAL 构建还执行 GTiff、COG、GPKG 驱动探测和真实文件往返。")
     m.h2("9.2 集成验收清单")
     for text in (
         "DLL、导入库、头文件和运行库均为相同架构。",
@@ -1004,17 +1005,18 @@ def build_gui_manual():
     m = Manual(
         "dterrain GUI 演示程序\n操作手册与入门教程",
         "GUI 操作入门教程",
-        "从 XYZ 散点导入到动态编辑、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
+        "从 XYZ 散点导入到动态编辑、地形剖面、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
         "首次使用者、演示人员、算法验证与测绘研究人员",
     )
     m.cover("QUICK START GUIDE")
     add_document_control(
         m,
-        "便携运行、五分钟上手、控件与菜单、XYZ 导入、TIN/GRID/等高线/CDT 图层、2D/3D 浏览、查询编辑和数据保存。",
+        "便携运行、五分钟上手、控件与菜单、XYZ 导入、TIN/GRID/等高线/CDT 图层、任意剖面、2D/3D 浏览、查询编辑和数据保存。",
         [
             "第一次体验：直接完成第 2 章的五分钟教程。",
             "已有 XYZ 数据：重点阅读第 5 章。",
             "三维地形展示：重点阅读第 4 章。",
+            "任意剖面分析：重点阅读第 6.3 节。",
             "TIN/GRID/等高线转换与交换：重点阅读第 4.3 节和第 8 章。",
             "演示动态编辑：重点阅读第 7 章。",
             "百万级数据展示：重点阅读第 9 章。",
@@ -1022,8 +1024,8 @@ def build_gui_manual():
     )
 
     m.h1("1 程序概览")
-    m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.13 功能边界", "当前程序已提供二维/三维浏览、TIN/GRID/等高线双向转换、DCDT 打开保存、约束编辑和 CDT 影响区显示；启用 GDAL 后可从菜单交换 GeoTIFF/COG GRID 与 GeoPackage 等高线。等高线反向转换是折点近似重建；生产级 GPU/LOD 尚未接入。", "gold")
+    m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、任意地形剖面、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
+    m.callout("0.14 功能边界", "当前程序已提供二维/三维浏览、任意直线剖面与 CSV 导出、TIN/GRID/等高线双向转换、DCDT 打开保存、约束编辑和 CDT 影响区显示；启用 GDAL 后可从菜单交换 GeoTIFF/COG GRID 与 GeoPackage 等高线。等高线反向转换是折点近似重建；生产级 GPU/LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1065,6 +1067,7 @@ def build_gui_manual():
         "选择“删除约束顶点（单击）”并拾取白色折点；共享顶点确认后只从当前约束脱离。",
         "执行“地形转换→约束网 → GRID”和“从约束网生成等高线”，确认孔洞区域保持空白。",
         "单击“查询模式”，在网格内单击；观察白色最近顶点和洋红色覆盖三角形。",
+        "选择‘分析→任意剖面（两次单击）’，在画布选取 A、B；观察青色定位线、底部曲线和统计，再导出 CSV。",
         "单击“插入模式”，在网格中单击；观察红色旧面、黄色边界和绿色新增面/边。",
         "单击“删除模式”，在目标附近单击；程序删除 XY 最近顶点并显示局部变化。",
         "单击“保存网格”，保存为 terrain.dtmesh；然后单击“清空”和“打开网格”验证加载。",
@@ -1101,6 +1104,7 @@ def build_gui_manual():
             ("地形转换", "TIN/GRID/等高线双向派生，CDT 域内转换，并自动生成等高线。"),
             ("数据交换", "交换 DGRID、DCONTOUR、DCDT 文本；GDAL 构建还支持 GeoTIFF/COG 与 GeoPackage。"),
             ("约束编辑", "绘制或批量添加断裂线；移动/安全删除顶点，或删除整条约束。"),
+            ("分析", "两次单击生成任意 A—B 地形剖面，导出 CSV 或清除结果。"),
             ("图层", "分别显示或隐藏 TIN、GRID、等高线和约束 Delaunay。"),
         ],
         [2600, 6760],
@@ -1208,6 +1212,29 @@ def build_gui_manual():
     m.callout("注意", "查询使用 XY 投影距离，鼠标点击没有输入 Z；状态栏显示的是最近网格顶点自身的 Z。", "gold")
     m.h2("6.2 凸包外查询")
     m.para("在三角网凸包外单击时，仍可能找到最近顶点，但没有严格覆盖查询点的有限三角形。此时不会显示洋红色覆盖面。")
+    m.h2("6.3 任意地形剖面")
+    for step in (
+        "选择‘分析→任意剖面（两次单击）’；程序自动返回二维视图。",
+        "在画布单击剖面起点 A，再单击终点 B；程序沿直线建立 401 个等距样本。",
+        "观察青色 A—B 定位线和端点；底部深色面板中的黄色线为高程曲线。",
+        "查看状态栏或面板中的平距、有效样本、高程范围、净高差、累计上升/下降和最大绝对坡度。",
+        "选择‘分析→导出剖面 CSV’，保存距离、XYZ、有效标志和相邻坡度。",
+        "完成后再次单击可开始新剖面；第一点选取后按 Esc 取消，或用‘清除剖面’清除全部结果。",
+    ):
+        m.number(step)
+    m.table(
+        ["顺序", "数据源选择", "无效区域"],
+        [
+            ("1", "当前可见 CDT 有效域", "域外或孔洞保留断点"),
+            ("2", "当前可见普通 TIN", "凸包外保留断点"),
+            ("3", "当前可见 GRID", "NoData 保留断点"),
+            ("4", "再按 CDT、TIN、GRID 考虑隐藏但存在的图层", "仍不逐点混用其他表面"),
+        ],
+        [1200, 4200, 3960],
+        [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    m.callout("一致性规则", "整条剖面只选一次数据源，断点不会用其他图层补齐。坡度按 ΔZ/Δ平距×100% 计算，断点两侧不跨段累计。GRID 使用六参数仿射反算和邻近 1×1/2×2 小窗口读取，不复制整幅大栅格。", "blue")
+    m.code("index,distance,x,y,z,valid,grade_percent\n0,0.000000,500000.000000,3200000.000000,103.250000,1,\n1,2.500000,500002.500000,3200000.000000,103.650000,1,16.000000")
 
     m.h1("7 动态插入与删除")
     m.h2("7.1 插入点")
@@ -1289,7 +1316,7 @@ def build_gui_manual():
         "约束改变后重新生成 GRID/等高线；程序会自动释放旧派生图层。",
     ):
         m.number(step)
-    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.13 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
+    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.14 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
     m.h2("8.7 往返验证")
     for step in (
         "保存当前网格。",
@@ -1337,6 +1364,8 @@ def build_gui_manual():
         ("共享顶点无法删除", "这是默认保护；GUI 会询问是否只从当前约束脱离。取消时所有约束不变，确认后其他约束仍保留该点。"),
         ("约束顶点删除失败", "删除后可能少于最小点数或产生非法拓扑；原约束和基础地形点均不会被部分删除。"),
         ("批量示例被拒绝", "为避免与已有线交叉，GUI 只在当前约束为空时生成 12 条平行断裂线；可重新从 TIN 创建约束网后再试。"),
+        ("剖面曲线有断点", "当前固定数据源存在 CDT 孔洞/域外、TIN 凸包外或 GRID NoData；程序不会用其他图层逐点补齐。"),
+        ("剖面菜单无法导出", "先完成 A、B 两次单击并确认至少一个有效样本；源图层被编辑或替换后旧剖面会自动清除。"),
         ("框选后没有变化", "选框宽或高可能小于 8 像素；重新拖出更大矩形。"),
         ("无法退出框选", "单击“查询模式”等其他模式；拖动中可按 Esc。"),
         ("导入后旧网消失", "成功导入会整体替换当前网，这是设计行为；先保存需要保留的网格。"),
@@ -1363,13 +1392,14 @@ def build_gui_manual():
         "移动一个约束顶点，确认约束 ID 不变，并检查红色旧面、黄色边界和绿色新增面/边。",
         "删除一个普通约束顶点；若准备了共享点数据，再验证保护提示与单约束脱离。",
         "由 CDT 生成 GRID 和等高线，确认孔洞/域外没有有效 GRID 节点或跨越等高线。",
+        "生成一条跨越地形的 A—B 剖面，核对曲线、统计并导出 CSV；若有孔洞，再验证断点不被其他图层补齐。",
         "切换 3D，验证环视、滚轮缩放、WASD 漫游和垂直夸张，再返回 2D。",
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → 任意 A—B 剖面与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付轻量三维查看、TIN/GRID/等高线双向转换、GeoTIFF/COG/GeoPackage 菜单、CDT 派生转换、DCDT 图层、批量约束事务、约束顶点移动、安全删除和完整差异显示。后续将把单项全量候选重建升级为真正的局部拓扑更新，并增加图层树与样式面板、GPU 分块 LOD、拾取测量和贴地碰撞。")
+    m.para("当前已交付轻量三维查看、任意地形剖面与 CSV、TIN/GRID/等高线双向转换、GeoTIFF/COG/GeoPackage 菜单、CDT 派生转换、DCDT 图层、批量约束事务、约束顶点移动、安全删除和完整差异显示。后续将把单项全量候选重建升级为真正的局部拓扑更新，并增加图层树与样式面板、GPU 分块 LOD、面积/体积量测和贴地碰撞。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

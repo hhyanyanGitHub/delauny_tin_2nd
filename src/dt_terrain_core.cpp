@@ -1,5 +1,6 @@
 #include "dt_terrain_core.hpp"
 #include "dt_cdt_core.hpp"
+#include "dt_surface_analysis.hpp"
 
 #include <algorithm>
 #include <array>
@@ -368,6 +369,71 @@ dt_point3 Grid::point(uint64_t column, uint64_t row, double z) const noexcept {
             options_.geo_transform[3] + c * options_.geo_transform[4] +
                 r * options_.geo_transform[5],
             z};
+}
+
+dt_surface_analysis Grid::analyze_surface_xy(
+    const dt_point3& query) const {
+    if (!std::isfinite(query.x) || !std::isfinite(query.y)) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID analysis query must be finite");
+    }
+    if (options_.width < 2 || options_.height < 2) {
+        throw Exception(DT_E_EMPTY,
+                        "GRID needs at least two rows and columns");
+    }
+    const double* gt = options_.geo_transform;
+    const double determinant = gt[1] * gt[5] - gt[2] * gt[4];
+    const double dx = query.x - gt[0];
+    const double dy = query.y - gt[3];
+    double column = (dx * gt[5] - dy * gt[2]) / determinant;
+    double row = (dy * gt[1] - dx * gt[4]) / determinant;
+    const double max_column = static_cast<double>(options_.width - 1);
+    const double max_row = static_cast<double>(options_.height - 1);
+    const double scale = std::max({1.0, std::abs(column), std::abs(row),
+                                   max_column, max_row});
+    const double tolerance =
+        std::numeric_limits<double>::epsilon() * scale * 64.0;
+    if (column < -tolerance || column > max_column + tolerance ||
+        row < -tolerance || row > max_row + tolerance) {
+        throw Exception(DT_E_NOT_FOUND, "query point is outside the GRID");
+    }
+    column = std::clamp(column, 0.0, max_column);
+    row = std::clamp(row, 0.0, max_row);
+    uint64_t cell_column = static_cast<uint64_t>(std::floor(column));
+    uint64_t cell_row = static_cast<uint64_t>(std::floor(row));
+    if (cell_column + 1 >= options_.width) cell_column = options_.width - 2;
+    if (cell_row + 1 >= options_.height) cell_row = options_.height - 2;
+    const double u = column - static_cast<double>(cell_column);
+    const double v = row - static_cast<double>(cell_row);
+    const double z00 = values_[offset(cell_column, cell_row)];
+    const double z10 = values_[offset(cell_column + 1, cell_row)];
+    const double z01 = values_[offset(cell_column, cell_row + 1)];
+    const double z11 = values_[offset(cell_column + 1, cell_row + 1)];
+    const double values[4] = {z00, z10, z01, z11};
+    for (const double value : values) {
+        if (!std::isfinite(value) || is_nodata(value)) {
+            throw Exception(DT_E_NOT_FOUND,
+                            "GRID analysis support cell contains NoData");
+        }
+    }
+    const double z = (1.0 - u) * (1.0 - v) * z00 +
+                     u * (1.0 - v) * z10 +
+                     (1.0 - u) * v * z01 + u * v * z11;
+    const double dz_dcolumn =
+        (1.0 - v) * (z10 - z00) + v * (z11 - z01);
+    const double dz_drow =
+        (1.0 - u) * (z01 - z00) + u * (z11 - z10);
+    const double dz_dx =
+        (dz_dcolumn * gt[5] - gt[4] * dz_drow) / determinant;
+    const double dz_dy =
+        (gt[1] * dz_drow - gt[2] * dz_dcolumn) / determinant;
+    const dt_point3 support[4] = {
+        point(cell_column, cell_row, z00),
+        point(cell_column + 1, cell_row, z10),
+        point(cell_column, cell_row + 1, z01),
+        point(cell_column + 1, cell_row + 1, z11)};
+    return make_surface_analysis(query, z, dz_dx, dz_dy, support, 4,
+                                 DT_SURFACE_BILINEAR);
 }
 
 dt_grid_info Grid::info() const {

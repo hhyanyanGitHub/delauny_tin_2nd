@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -27,6 +28,25 @@ void require_ok(dt_status status, const char* operation) {
 
 bool close(double a, double b) {
     return std::abs(a - b) < 1e-12;
+}
+
+void assert_surface_plane(const dt_surface_analysis& analysis,
+                          double z, double dz_dx, double dz_dy) {
+    constexpr double radians_to_degrees =
+        180.0 / 3.141592653589793238462643383279502884;
+    assert(std::abs(analysis.point.z - z) < 1e-10);
+    assert(std::abs(analysis.dz_dx - dz_dx) < 1e-10);
+    assert(std::abs(analysis.dz_dy - dz_dy) < 1e-10);
+    assert(std::abs(analysis.slope_degrees -
+                    std::atan(std::hypot(dz_dx, dz_dy)) *
+                        radians_to_degrees) < 1e-10);
+    double aspect = std::atan2(-dz_dx, -dz_dy) * radians_to_degrees;
+    if (aspect < 0.0) aspect += 360.0;
+    assert(std::abs(analysis.aspect_degrees - aspect) < 1e-10);
+    const double length = std::sqrt(1.0 + dz_dx * dz_dx + dz_dy * dz_dy);
+    assert(std::abs(analysis.normal_x + dz_dx / length) < 1e-10);
+    assert(std::abs(analysis.normal_y + dz_dy / length) < 1e-10);
+    assert(std::abs(analysis.normal_z - 1.0 / length) < 1e-10);
 }
 
 void test_cdt_api() {
@@ -76,6 +96,18 @@ void test_cdt_api() {
     assert(stats.domain_triangle_count < stats.finite_triangle_count);
     assert(close(stats.bounds.xmin, 0.0) && close(stats.bounds.xmax, 6.0));
     require_ok(dt_cdt_validate(cdt, 0), "CDT validation");
+
+    const dt_point3 analysis_query{
+        1.2, 1.4, std::numeric_limits<double>::quiet_NaN()};
+    dt_surface_analysis cdt_analysis{};
+    require_ok(dt_cdt_analyze_surface_xy(cdt, &analysis_query,
+                                         &cdt_analysis),
+               "CDT surface analysis");
+    assert_surface_plane(cdt_analysis, 106.6, 2.0, 3.0);
+    assert(cdt_analysis.support_point_count == 3);
+    const dt_point3 analysis_hole_query{3.0, 3.0, 0.0};
+    assert(dt_cdt_analyze_surface_xy(cdt, &analysis_hole_query, &cdt_analysis) ==
+           DT_E_NOT_FOUND);
 
     dt_constraint_info constraint_info{};
     require_ok(dt_cdt_get_constraint_info(cdt, 1, &constraint_info),
@@ -656,7 +688,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 15 && patch == 0);
+    assert(major == 0 && minor == 16 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");
@@ -664,6 +696,22 @@ void test_grid_and_contours() {
         {0.0, 0.0, 0.0}, {1.0, 0.0, 1.0},
         {1.0, 1.0, 2.0}, {0.0, 1.0, 1.0}};
     require_ok(dt_build(plane, plane_points, 4, nullptr), "terrain build plane");
+    const dt_point3 tin_analysis_query{
+        0.25, 0.4, std::numeric_limits<double>::quiet_NaN()};
+    dt_surface_analysis tin_analysis{};
+    require_ok(dt_analyze_tin_surface_xy(plane, &tin_analysis_query,
+                                         &tin_analysis),
+               "TIN surface analysis");
+    assert_surface_plane(tin_analysis, 0.65, 1.0, 1.0);
+    assert(tin_analysis.support_point_count == 3);
+    const dt_point3 tin_vertex_query{0.0, 0.0, 0.0};
+    require_ok(dt_analyze_tin_surface_xy(plane, &tin_vertex_query,
+                                         &tin_analysis),
+               "TIN vertex surface analysis");
+    assert((tin_analysis.flags & DT_SURFACE_QUERY_ON_VERTEX) != 0);
+    const dt_point3 outside_tin{-0.1, 0.5, 0.0};
+    assert(dt_analyze_tin_surface_xy(plane, &outside_tin, &tin_analysis) ==
+           DT_E_NOT_FOUND);
     const char* test_crs = "LOCAL_CS[\"dterrain test\",UNIT[\"metre\",1]]";
     require_ok(dt_set_crs_wkt(plane, test_crs), "set TIN CRS");
 
@@ -699,6 +747,56 @@ void test_grid_and_contours() {
                             (static_cast<double>(row + column) * 0.5)) < 1e-10);
         }
     }
+    const dt_point3 grid_analysis_query{0.25, 0.4, 0.0};
+    dt_surface_analysis grid_analysis{};
+    require_ok(dt_grid_analyze_surface_xy(grid, &grid_analysis_query,
+                                          &grid_analysis),
+               "GRID surface analysis");
+    assert_surface_plane(grid_analysis, 0.65, 1.0, 1.0);
+    assert((grid_analysis.flags & DT_SURFACE_BILINEAR) != 0);
+    assert(grid_analysis.support_point_count == 4);
+
+    dt_grid_create_options rotated_options{};
+    rotated_options.struct_size = sizeof(rotated_options);
+    rotated_options.flags = DT_GRID_HAS_NODATA;
+    rotated_options.width = 2;
+    rotated_options.height = 2;
+    rotated_options.geo_transform[0] = 10.0;
+    rotated_options.geo_transform[2] = -2.0;
+    rotated_options.geo_transform[3] = 20.0;
+    rotated_options.geo_transform[4] = 1.0;
+    rotated_options.nodata_value = -9999.0;
+    dt_grid_handle rotated = nullptr;
+    require_ok(dt_grid_create(&rotated_options, &rotated),
+               "create rotated GRID");
+    const double rotated_values[4] = {80.0, 83.0, 76.0, 79.0};
+    require_ok(dt_grid_write_window(rotated, 0, 0, 2, 2,
+                                    rotated_values, 2),
+               "write rotated GRID");
+    const dt_point3 rotated_query{9.2, 20.25, 0.0};
+    require_ok(dt_grid_analyze_surface_xy(rotated, &rotated_query,
+                                          &grid_analysis),
+               "rotated GRID surface analysis");
+    assert_surface_plane(grid_analysis, 79.15, 2.0, 3.0);
+    const double flat_values[4] = {42.0, 42.0, 42.0, 42.0};
+    require_ok(dt_grid_write_window(rotated, 0, 0, 2, 2, flat_values, 2),
+               "write flat GRID");
+    require_ok(dt_grid_analyze_surface_xy(rotated, &rotated_query,
+                                          &grid_analysis),
+               "flat GRID surface analysis");
+    assert(close(grid_analysis.point.z, 42.0));
+    assert(close(grid_analysis.slope_degrees, 0.0));
+    assert((grid_analysis.flags & DT_SURFACE_ASPECT_UNDEFINED) != 0);
+    assert(close(grid_analysis.normal_x, 0.0));
+    assert(close(grid_analysis.normal_y, 0.0));
+    assert(close(grid_analysis.normal_z, 1.0));
+    const double rotated_nodata_values[4] = {80.0, 83.0, 76.0, -9999.0};
+    require_ok(dt_grid_write_window(rotated, 0, 0, 2, 2,
+                                    rotated_nodata_values, 2),
+               "write rotated GRID NoData");
+    assert(dt_grid_analyze_surface_xy(rotated, &rotated_query,
+                                      &grid_analysis) == DT_E_NOT_FOUND);
+    dt_grid_destroy(rotated);
 
     const char* grid_file = "dterrain_test_grid.dgrid";
     require_ok(dt_grid_save_text(grid, grid_file), "dt_grid_save_text");

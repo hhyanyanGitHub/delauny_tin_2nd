@@ -166,6 +166,9 @@ DT_API void DT_CALL dt_cdt_release_query_result(dt_cdt_query_result result);
    or inside holes return DT_E_NOT_FOUND. Query Z is ignored. */
 DT_API dt_status DT_CALL dt_cdt_sample_height_xy(
     dt_cdt_handle cdt, const dt_point3* query, double* output_z);
+DT_API dt_status DT_CALL dt_cdt_analyze_surface_xy(
+    dt_cdt_handle cdt, const dt_point3* query,
+    dt_surface_analysis* output_analysis);
 
 /* Derived products honor the active CDT domain. GRID nodes outside the domain
    become NoData; contours stop at outer and hole boundaries. */

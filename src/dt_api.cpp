@@ -432,6 +432,18 @@ dt_status DT_CALL dt_grid_write_window(dt_grid_handle grid, uint64_t column,
     });
 }
 
+dt_status DT_CALL dt_grid_analyze_surface_xy(
+    dt_grid_handle grid, const dt_point3* query,
+    dt_surface_analysis* output_analysis) {
+    return guarded([&] {
+        if (!query || !output_analysis) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "query or output_analysis is null");
+        }
+        *output_analysis = require_grid(grid).analyze_surface_xy(*query);
+    });
+}
+
 dt_status DT_CALL dt_grid_save_text(dt_grid_handle grid,
                                     const char* utf8_file_name) {
     return guarded([&] { require_grid(grid).save_text(utf8_file_name); });
@@ -974,6 +986,18 @@ dt_status DT_CALL dt_locate_point_xy(dt_handle handle, const dt_point3* query,
     });
 }
 
+dt_status DT_CALL dt_analyze_tin_surface_xy(
+    dt_handle handle, const dt_point3* query,
+    dt_surface_analysis* output_analysis) {
+    return guarded([&] {
+        if (!query || !output_analysis) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "query or output_analysis is null");
+        }
+        *output_analysis = require_context(handle).analyze_surface_xy(*query);
+    });
+}
+
 dt_status DT_CALL dt_query_triangles(dt_handle handle, const dt_bounds2* bounds,
                                      dt_query_result* output_result) {
     if (output_result) *output_result = nullptr;
@@ -1331,6 +1355,18 @@ dt_status DT_CALL dt_cdt_sample_height_xy(dt_cdt_handle cdt,
                                 "query or output_z is null");
         }
         *output_z = require_cdt(cdt).sample_height_xy(*query);
+    });
+}
+
+dt_status DT_CALL dt_cdt_analyze_surface_xy(
+    dt_cdt_handle cdt, const dt_point3* query,
+    dt_surface_analysis* output_analysis) {
+    return guarded([&] {
+        if (!query || !output_analysis) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "query or output_analysis is null");
+        }
+        *output_analysis = require_cdt(cdt).analyze_surface_xy(*query);
     });
 }
 

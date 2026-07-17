@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define DT_VERSION_MAJOR 0
-#define DT_VERSION_MINOR 15
+#define DT_VERSION_MINOR 16
 #define DT_VERSION_PATCH 0
 
 typedef int32_t dt_status;
@@ -102,6 +102,35 @@ typedef struct dt_location_result {
     dt_triangle3 triangle;
 } dt_location_result;
 
+enum dt_surface_analysis_flags {
+    /* A horizontal surface has no unique downslope azimuth. */
+    DT_SURFACE_ASPECT_UNDEFINED = 1u << 0,
+    /* The query lies exactly on a TIN/CDT edge or vertex. One adjacent
+       finite active face is selected deterministically as support. */
+    DT_SURFACE_QUERY_ON_EDGE = 1u << 1,
+    DT_SURFACE_QUERY_ON_VERTEX = 1u << 2,
+    /* GRID derivatives come from the local bilinear cell, not one plane. */
+    DT_SURFACE_BILINEAR = 1u << 3
+};
+
+typedef struct dt_surface_analysis {
+    uint32_t struct_size;
+    uint32_t flags;
+    dt_point3 point;
+    double dz_dx;
+    double dz_dy;
+    double slope_degrees;
+    /* Downslope azimuth clockwise from +Y (north), in [0,360). Zero when
+       DT_SURFACE_ASPECT_UNDEFINED is set. */
+    double aspect_degrees;
+    double normal_x;
+    double normal_y;
+    double normal_z;
+    dt_point3 support_points[4];
+    uint32_t support_point_count;
+    uint32_t reserved;
+} dt_surface_analysis;
+
 typedef struct dt_edit_result_view {
     uint32_t struct_size;
     uint32_t reserved;
@@ -164,6 +193,9 @@ DT_API dt_status DT_CALL dt_find_nearest_vertex_xy(dt_handle handle,
 DT_API dt_status DT_CALL dt_locate_point_xy(dt_handle handle,
                                             const dt_point3* query,
                                             dt_location_result* output_result);
+DT_API dt_status DT_CALL dt_analyze_tin_surface_xy(
+    dt_handle handle, const dt_point3* query,
+    dt_surface_analysis* output_analysis);
 DT_API dt_status DT_CALL dt_query_triangles(dt_handle handle,
                                             const dt_bounds2* bounds,
                                             dt_query_result* output_result);

@@ -54,6 +54,7 @@ public:
     CdtConstraint constraint_by_id(dt_constraint_id id) const;
     std::unique_ptr<CdtQueryData> query(const dt_bounds2& bounds) const;
     double sample_height_xy(const dt_point3& query) const;
+    dt_surface_analysis analyze_surface_xy(const dt_point3& query) const;
     void visit_domain_triangles(
         const std::function<void(const dt_triangle3&)>& visitor) const;
     bool validate(bool verbose) const;

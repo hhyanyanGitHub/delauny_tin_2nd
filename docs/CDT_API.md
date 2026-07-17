@@ -127,6 +127,20 @@ dt_cdt_release_query_result(result);
 `dt_cdt_sample_height_xy()` 对有效域内点执行三角面线性插值。查询点在外边界外或
 孔洞内部时返回 `DT_E_NOT_FOUND`；位于有效域边界和孔洞边界上时可取得边高程。
 
+`dt_cdt_analyze_surface_xy()` 在同一个有效域三角面上返回采样 Z、世界 XY 梯度、
+坡度角、下坡坡向、向上单位法向和 3 个支撑顶点。成功结果会填写公共结构尺寸：
+
+```cpp
+dt_surface_analysis result{};
+dt_status status = dt_cdt_analyze_surface_xy(cdt, &query, &result);
+```
+
+查询点在外边界外或孔洞内返回 `DT_E_NOT_FOUND`。查询落在约束边、普通网边或顶点
+时只从有效域邻面中选择一个支撑面，并设置 `DT_SURFACE_QUERY_ON_EDGE` 或
+`DT_SURFACE_QUERY_ON_VERTEX`；外边界和孔洞边界上的有效侧仍可分析。坡向以 +Y
+为北顺时针计量，表示最大下降方向；水平面设置
+`DT_SURFACE_ASPECT_UNDEFINED`。完整字段与公式见 [API.md](API.md)。
+
 `dt_grid_from_cdt()` 与 `dt_contours_from_cdt()` 直接使用域内三角形：
 
 - GRID 仍使用 `dt_tin_to_grid_options` 指定尺寸、仿射变换和 NoData；

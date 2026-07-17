@@ -64,6 +64,37 @@ dt_release_edit_result(result);
 当前范围结果会一次性保存在结果对象中。GUI 应按当前视口查询，避免对千万级全网
 一次性生成约 1.4GB 的 XYZ 输出。
 
+## 地表坡度、坡向与法向
+
+`dt_analyze_tin_surface_xy()` 在查询 XY 所在的普通 TIN 三角面上进行解析分析：
+
+```cpp
+dt_point3 query{500000.0, 3200000.0, 0.0}; // 输入 Z 被忽略
+dt_surface_analysis result{};
+dt_status status = dt_analyze_tin_surface_xy(mesh, &query, &result);
+```
+
+`dt_surface_analysis` 也是 CDT 和 GRID 分析接口的统一结果结构：
+
+| 字段 | 含义 |
+|---|---|
+| `point` | 查询 XY 和地表插值得到的 Z |
+| `dz_dx`, `dz_dy` | 世界 XY 坐标中的局部高程梯度 |
+| `slope_degrees` | 相对水平面的坡度角，范围 0～90° |
+| `aspect_degrees` | 最大下降方向，以 +Y 为北、顺时针 0～360° |
+| `normal_x/y/z` | 指向上方的单位法向 `normalize(-dz_dx,-dz_dy,1)` |
+| `support_points` | 实际参与计算的三角面 3 点或 GRID 单元 4 点 |
+
+坡度为 `atan(hypot(dz_dx,dz_dy))`。水平面没有唯一坡向，此时
+`DT_SURFACE_ASPECT_UNDEFINED` 置位且 `aspect_degrees` 为 0。查询恰落在 TIN
+边或顶点时选择一个有限邻面，并设置 `DT_SURFACE_QUERY_ON_EDGE` 或
+`DT_SURFACE_QUERY_ON_VERTEX`；因此折线处的坡度可能随所选邻面而变，调用方可用
+标志向用户说明。凸包外返回 `DT_E_NOT_FOUND`。
+
+`struct_size` 由 DLL 在成功结果中填写，便于调用方核对 ABI。空指针或非有限 XY
+返回 `DT_E_INVALID_ARGUMENT`；成功才可读取其他字段。接口不分配内存，不需要
+额外释放。
+
 ## 保存加载
 
 `.dtin` v1 保存顶点 ID 和 XYZ。加载时重新构建一个有效的 Delaunay 网并进行

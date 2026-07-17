@@ -97,6 +97,28 @@ dt_task_destroy(task);
 调用方在任务运行期间不应同时修改同一个 GRID；TIN 本身具有读写锁，但并发编辑
 会使转换对应的版本不明确，仍建议先完成或取消转换再编辑。
 
+## GRID 地表坡度、坡向与法向
+
+`dt_grid_analyze_surface_xy()` 反算完整六参数仿射变换，在查询点所在 2×2 节点
+单元内对高程进行双线性插值，并将列/行方向导数转换为世界 XY 的 `dz/dx`、
+`dz/dy`。它返回公共头文件中的 `dt_surface_analysis`：
+
+```cpp
+dt_surface_analysis result{};
+dt_point3 query{x, y, 0.0};
+dt_status status = dt_grid_analyze_surface_xy(grid, &query, &result);
+```
+
+成功结果设置 `DT_SURFACE_BILINEAR`，`support_point_count` 为 4，支撑点顺序为
+左上、右上、左下、右下的局部单元节点。边界节点由相邻的最后一个有效单元分析；
+范围外、仿射变换不可逆或四个支撑节点中任一为 NoData/非有限值时返回错误，其中
+无可用表面为 `DT_E_NOT_FOUND`。坡向定义、水平面标志和单位法向与普通 TIN 接口
+完全一致，详见 [API.md](API.md)。
+
+双线性单元一般不是一个平面，因此梯度、坡度和坡向是查询位置处的局部值；移动
+查询点时这些值可以连续变化。旋转或错切 GRID 不应把列/行导数直接当作世界 X/Y
+导数，本接口已完成该坐标变换。
+
 ## 当前复杂度与大数据注意事项
 
 - GRID 存储为连续 `double` 数组，约占 `8 * width * height` 字节；

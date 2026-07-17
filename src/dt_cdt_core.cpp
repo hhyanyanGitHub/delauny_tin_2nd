@@ -1,4 +1,5 @@
 #include "dt_cdt_core.hpp"
+#include "dt_surface_analysis.hpp"
 
 #include <CGAL/Constrained_Delaunay_triangulation_2.h>
 #include <CGAL/Constrained_triangulation_face_base_2.h>
@@ -837,6 +838,51 @@ double CdtContext::sample_height_xy(const dt_point3& query_point) const {
     }
     throw Exception(DT_E_NOT_FOUND,
                     "query point is outside the active CDT domain");
+}
+
+dt_surface_analysis CdtContext::analyze_surface_xy(
+    const dt_point3& query_point) const {
+    if (!finite_value(query_point.x) || !finite_value(query_point.y)) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "CDT surface analysis XY must be finite");
+    }
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (state_->triangulation.dimension() != 2) {
+        throw Exception(DT_E_EMPTY, "CDT has no two-dimensional surface");
+    }
+    Cdt::Locate_type type;
+    int index = 0;
+    const auto face = state_->triangulation.locate(
+        Kernel::Point_2(query_point.x, query_point.y), type, index);
+    CdtFaceHandle support;
+    uint32_t flags = 0;
+    if (type == Cdt::FACE) {
+        if (domain_face(*state_, face)) support = face;
+    } else if (type == Cdt::EDGE) {
+        flags |= DT_SURFACE_QUERY_ON_EDGE;
+        if (domain_face(*state_, face)) support = face;
+        else if (domain_face(*state_, face->neighbor(index)))
+            support = face->neighbor(index);
+    } else if (type == Cdt::VERTEX) {
+        flags |= DT_SURFACE_QUERY_ON_VERTEX;
+        const auto vertex = face->vertex(index);
+        auto incident = state_->triangulation.incident_faces(vertex);
+        if (incident != 0) {
+            const auto begin = incident;
+            do {
+                if (domain_face(*state_, incident)) {
+                    support = incident;
+                    break;
+                }
+                ++incident;
+            } while (incident != begin);
+        }
+    }
+    if (support == CdtFaceHandle()) {
+        throw Exception(DT_E_NOT_FOUND,
+                        "query point is outside the active CDT domain");
+    }
+    return analyze_triangle_surface(to_triangle(support), query_point, flags);
 }
 
 void CdtContext::visit_domain_triangles(

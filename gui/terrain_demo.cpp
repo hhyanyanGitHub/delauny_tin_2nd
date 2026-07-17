@@ -89,7 +89,9 @@ enum CommandId {
     ID_MEASURE_FINISH,
     ID_MEASURE_DATUM,
     ID_MEASURE_EXPORT,
-    ID_MEASURE_CLEAR
+    ID_MEASURE_CLEAR,
+    ID_SLOPE_MODE,
+    ID_SLOPE_CLEAR
 };
 
 enum class Mode {
@@ -104,7 +106,8 @@ enum class Mode {
     CdtRemoveVertex,
     CdtDelete,
     Profile,
-    Measure
+    Measure,
+    Slope
 };
 enum class ViewMode { Map2D, Terrain3D };
 enum class Drag3D { None, Orbit, Pan };
@@ -441,6 +444,12 @@ public:
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return 0;
             }
+            if (wparam == VK_ESCAPE && mode_ == Mode::Slope && slope_valid_) {
+                clear_slope_analysis();
+                action_text_ = L"已清除当前坡度/坡向分析结果";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (wparam == VK_ESCAPE && mode_ == Mode::Profile &&
                 profile_has_start_) {
                 clear_profile();
@@ -539,6 +548,9 @@ private:
     double measurement_datum_z_ = 0.0;
     std::vector<dt_point3> measurement_polygon_;
     dterrain::measurement::Statistics measurement_statistics_{};
+    ProfileSource slope_source_ = ProfileSource::None;
+    bool slope_valid_ = false;
+    dt_surface_analysis slope_analysis_{};
 
     RECT canvas_rect() const {
         RECT rect{};
@@ -674,6 +686,11 @@ private:
                     L"导出量测 CSV…");
         AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_CLEAR,
                     L"清除面积/土方量测");
+        AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(analysis_menu, MF_STRING, ID_SLOPE_MODE,
+                    L"坡度/坡向分析（单击）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_SLOPE_CLEAR,
+                    L"清除坡度/坡向结果");
 
         layer_menu_ = CreatePopupMenu();
         AppendMenuW(layer_menu_, MF_STRING | MF_CHECKED, ID_LAYER_TIN,
@@ -749,14 +766,26 @@ private:
         if (measurement_source_ == source) clear_measurement();
     }
 
+    void clear_slope_analysis() {
+        slope_source_ = ProfileSource::None;
+        slope_valid_ = false;
+        slope_analysis_ = {};
+    }
+
+    void clear_slope_for_source(ProfileSource source) {
+        if (slope_source_ == source) clear_slope_analysis();
+    }
+
     void clear_analysis_for_source(ProfileSource source) {
         clear_profile_for_source(source);
         clear_measurement_for_source(source);
+        clear_slope_for_source(source);
     }
 
     void clear_analysis() {
         clear_profile();
         clear_measurement();
+        clear_slope_analysis();
     }
 
     void destroy_grid_layer() {
@@ -1518,6 +1547,52 @@ private:
         return false;
     }
 
+    static const wchar_t* aspect_direction(double degrees) {
+        static const wchar_t* directions[8] = {
+            L"北", L"东北", L"东", L"东南",
+            L"南", L"西南", L"西", L"西北"};
+        const int index = static_cast<int>(
+            std::floor((degrees + 22.5) / 45.0)) % 8;
+        return directions[index];
+    }
+
+    void analyze_slope_at(const dt_point3& world) {
+        const ProfileSource source = select_profile_source();
+        if (source == ProfileSource::None) {
+            clear_slope_analysis();
+            action_text_ = L"坡度/坡向分析失败：当前没有可分析地形表面";
+            return;
+        }
+        dt_point3 query{world.x, world.y, 0.0};
+        dt_surface_analysis analysis{};
+        dt_status status = DT_E_NOT_FOUND;
+        if (source == ProfileSource::Cdt)
+            status = dt_cdt_analyze_surface_xy(cdt_, &query, &analysis);
+        else if (source == ProfileSource::Tin)
+            status = dt_analyze_tin_surface_xy(mesh_, &query, &analysis);
+        else if (source == ProfileSource::Grid)
+            status = dt_grid_analyze_surface_xy(grid_, &query, &analysis);
+        if (status != DT_OK) {
+            clear_slope_analysis();
+            action_text_ = L"坡度/坡向分析失败：" + last_error_text();
+            return;
+        }
+        slope_source_ = source;
+        slope_analysis_ = analysis;
+        slope_valid_ = true;
+        std::wostringstream text;
+        text << L"坡面分析（" << surface_source_name(source) << L"）：Z="
+             << std::fixed << std::setprecision(3) << analysis.point.z
+             << L"，坡度=" << analysis.slope_degrees << L"°";
+        if ((analysis.flags & DT_SURFACE_ASPECT_UNDEFINED) != 0) {
+            text << L"，水平面无唯一坡向";
+        } else {
+            text << L"，坡向=" << analysis.aspect_degrees << L"°（"
+                 << aspect_direction(analysis.aspect_degrees) << L"）";
+        }
+        action_text_ = text.str();
+    }
+
     bool sample_profile_point(const dterrain::profile::Point& point,
                               double& output_z) {
         return sample_surface_point(profile_source_, point, output_z);
@@ -1831,6 +1906,8 @@ private:
             profile_click(world);
         } else if (mode_ == Mode::Measure) {
             measurement_click(world);
+        } else if (mode_ == Mode::Slope) {
+            analyze_slope_at(world);
         } else if (is_cdt_draw_mode()) {
             append_cdt_draft_point(world);
         } else if (mode_ == Mode::CdtMoveVertex) {
@@ -2884,6 +2961,103 @@ private:
                   DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
     }
 
+    void draw_slope_analysis(HDC dc, const RECT& canvas) const {
+        if (!slope_valid_) return;
+        SetBkMode(dc, TRANSPARENT);
+        std::vector<POINT> support;
+        if (slope_analysis_.support_point_count == 3) {
+            for (uint32_t index = 0; index < 3; ++index)
+                support.push_back(world_to_screen(
+                    slope_analysis_.support_points[index]));
+        } else if (slope_analysis_.support_point_count == 4) {
+            constexpr uint32_t order[4] = {0, 1, 3, 2};
+            for (const uint32_t index : order)
+                support.push_back(world_to_screen(
+                    slope_analysis_.support_points[index]));
+        }
+        if (support.size() >= 3) {
+            HPEN support_pen = CreatePen(PS_DOT, 1, RGB(100, 220, 220));
+            const auto previous_pen = SelectObject(dc, support_pen);
+            const auto previous_brush =
+                SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            Polygon(dc, support.data(), static_cast<int>(support.size()));
+            SelectObject(dc, previous_brush);
+            SelectObject(dc, previous_pen);
+            DeleteObject(support_pen);
+        }
+
+        const POINT origin = world_to_screen(slope_analysis_.point);
+        HPEN arrow_pen = CreatePen(PS_SOLID, 3, RGB(70, 235, 210));
+        const auto previous_pen = SelectObject(dc, arrow_pen);
+        HBRUSH marker = CreateSolidBrush(RGB(255, 245, 150));
+        const auto previous_brush = SelectObject(dc, marker);
+        Ellipse(dc, origin.x - 6, origin.y - 6,
+                origin.x + 7, origin.y + 7);
+        SelectObject(dc, previous_brush);
+        DeleteObject(marker);
+        if ((slope_analysis_.flags & DT_SURFACE_ASPECT_UNDEFINED) == 0) {
+            constexpr double degrees_to_radians =
+                3.141592653589793238462643383279502884 / 180.0;
+            const double radians =
+                slope_analysis_.aspect_degrees * degrees_to_radians;
+            POINT end{origin.x + static_cast<LONG>(std::lround(
+                          std::sin(radians) * 64.0)),
+                      origin.y - static_cast<LONG>(std::lround(
+                          std::cos(radians) * 64.0))};
+            MoveToEx(dc, origin.x, origin.y, nullptr);
+            LineTo(dc, end.x, end.y);
+            const double screen_angle = std::atan2(
+                static_cast<double>(end.y - origin.y),
+                static_cast<double>(end.x - origin.x));
+            for (const double offset : {2.55, -2.55}) {
+                MoveToEx(dc, end.x, end.y, nullptr);
+                LineTo(dc,
+                       end.x + static_cast<LONG>(std::lround(
+                           std::cos(screen_angle + offset) * 14.0)),
+                       end.y + static_cast<LONG>(std::lround(
+                           std::sin(screen_angle + offset) * 14.0)));
+            }
+        }
+        SelectObject(dc, previous_pen);
+        DeleteObject(arrow_pen);
+
+        const LONG panel_top = canvas.top +
+            (measurement_complete_ ? 108 : 16);
+        RECT panel{std::max<LONG>(canvas.left + 16, canvas.right - 520),
+                   panel_top, canvas.right - 16, panel_top + 82};
+        HBRUSH panel_brush = CreateSolidBrush(RGB(24, 45, 51));
+        FillRect(dc, &panel, panel_brush);
+        DeleteObject(panel_brush);
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(70, 210, 200));
+        const auto old_border = SelectObject(dc, border);
+        const auto hollow = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, panel.left, panel.top, panel.right, panel.bottom);
+        SelectObject(dc, hollow);
+        SelectObject(dc, old_border);
+        DeleteObject(border);
+
+        std::wostringstream text;
+        text << L"坡度/坡向｜" << surface_source_name(slope_source_)
+             << L"｜Z " << std::fixed << std::setprecision(3)
+             << slope_analysis_.point.z << L"｜坡度 "
+             << slope_analysis_.slope_degrees << L"°｜坡向 ";
+        if ((slope_analysis_.flags & DT_SURFACE_ASPECT_UNDEFINED) != 0)
+            text << L"平坦（无唯一方向）";
+        else
+            text << slope_analysis_.aspect_degrees << L"° "
+                 << aspect_direction(slope_analysis_.aspect_degrees);
+        text << L"\n∂Z/∂X " << slope_analysis_.dz_dx
+             << L"｜∂Z/∂Y " << slope_analysis_.dz_dy
+             << L"｜法向 (" << slope_analysis_.normal_x << L", "
+             << slope_analysis_.normal_y << L", "
+             << slope_analysis_.normal_z << L")";
+        SetTextColor(dc, RGB(224, 250, 246));
+        RECT text_rect{panel.left + 10, panel.top + 8,
+                       panel.right - 10, panel.bottom - 6};
+        DrawTextW(dc, text.str().c_str(), -1, &text_rect,
+                  DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+    }
+
     void paint() {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd_, &ps);
@@ -2925,6 +3099,7 @@ private:
             draw_contours(dc);
             draw_box_zoom(dc);
             draw_measurement(dc, canvas);
+            draw_slope_analysis(dc, canvas);
             draw_profile(dc, canvas);
         }
         RestoreDC(dc, saved);
@@ -2949,7 +3124,8 @@ private:
                               mode_ == Mode::CdtRemoveVertex ? L"删除约束顶点" :
                               mode_ == Mode::CdtDelete ? L"删除约束" :
                               mode_ == Mode::Profile ? L"任意剖面" :
-                              mode_ == Mode::Measure ? L"面积/土方" : L"查询";
+                              mode_ == Mode::Measure ? L"面积/土方" :
+                              mode_ == Mode::Slope ? L"坡度/坡向" : L"查询";
         std::wostringstream text;
         text << L"  视图: "
              << (view_mode_ == ViewMode::Terrain3D ? L"3D" : L"2D")
@@ -3956,6 +4132,18 @@ private:
         case ID_MEASURE_CLEAR:
             clear_measurement();
             action_text_ = L"面积/土方量测已清除";
+            break;
+        case ID_SLOPE_MODE:
+            enter_2d_view();
+            cdt_draft_.clear();
+            reset_cdt_move_selection();
+            cancel_box_zoom();
+            mode_ = Mode::Slope;
+            action_text_ = L"单击地形表面查询坡度、坡向和法向；Esc 清除结果";
+            break;
+        case ID_SLOPE_CLEAR:
+            clear_slope_analysis();
+            action_text_ = L"坡度/坡向分析结果已清除";
             break;
         case ID_TIN_TO_GRID: convert_tin_to_grid(); break;
         case ID_GRID_TO_TIN: convert_grid_to_tin(); break;

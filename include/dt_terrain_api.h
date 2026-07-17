@@ -130,6 +130,12 @@ DT_API dt_status DT_CALL dt_grid_write_window(
     uint64_t width, uint64_t height, const double* values,
     uint64_t row_stride);
 
+/* Bilinearly samples the containing GRID cell and reports local derivatives.
+   Returns DT_E_NOT_FOUND outside the GRID or when any support node is NoData. */
+DT_API dt_status DT_CALL dt_grid_analyze_surface_xy(
+    dt_grid_handle grid, const dt_point3* query,
+    dt_surface_analysis* output_analysis);
+
 /* DGRID 1 is a portable UTF-8 text format intended for tests and exchange. */
 DT_API dt_status DT_CALL dt_grid_save_text(
     dt_grid_handle grid, const char* utf8_file_name);

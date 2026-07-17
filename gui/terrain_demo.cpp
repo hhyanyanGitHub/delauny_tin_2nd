@@ -5,6 +5,7 @@
 
 #include "dt_api.h"
 #include "dt_cdt_api.h"
+#include "dt_gdal_api.h"
 #include "dt_terrain_api.h"
 #include "terrain_3d.hpp"
 
@@ -57,6 +58,11 @@ enum CommandId {
     ID_EXPORT_GRID,
     ID_IMPORT_CONTOURS,
     ID_EXPORT_CONTOURS,
+    ID_IMPORT_GDAL_RASTER,
+    ID_EXPORT_GEOTIFF,
+    ID_EXPORT_COG,
+    ID_IMPORT_GDAL_CONTOURS,
+    ID_EXPORT_GPKG_CONTOURS,
     ID_IMPORT_CDT,
     ID_EXPORT_CDT,
     ID_LAYER_TIN,
@@ -143,6 +149,17 @@ public:
     DemoApp() {
         dt_create(nullptr, &mesh_);
         dt_cdt_create(nullptr, &cdt_);
+        if (dt_gdal_initialize() == DT_OK) {
+            int32_t available = 0;
+            if (dt_gdal_is_driver_available("GTiff", &available) == DT_OK)
+                gdal_gtiff_available_ = available != 0;
+            available = 0;
+            if (dt_gdal_is_driver_available("COG", &available) == DT_OK)
+                gdal_cog_available_ = available != 0;
+            available = 0;
+            if (dt_gdal_is_driver_available("GPKG", &available) == DT_OK)
+                gdal_gpkg_available_ = available != 0;
+        }
     }
     ~DemoApp() {
         dt_cdt_destroy(cdt_);
@@ -306,6 +323,9 @@ private:
     bool show_grid_ = true;
     bool show_contours_ = true;
     bool show_cdt_ = true;
+    bool gdal_gtiff_available_ = false;
+    bool gdal_cog_available_ = false;
+    bool gdal_gpkg_available_ = false;
     dt_grid_info grid_info_{};
     std::vector<double> grid_values_;
     std::vector<uint32_t> grid_preview_;
@@ -398,6 +418,24 @@ private:
                     L"导入等高线文本…");
         AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_CONTOURS,
                     L"导出等高线文本…");
+        AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
+        const UINT gtiff_flags = MF_STRING |
+            (gdal_gtiff_available_ ? MF_ENABLED : MF_GRAYED);
+        const UINT cog_flags = MF_STRING |
+            (gdal_cog_available_ ? MF_ENABLED : MF_GRAYED);
+        const UINT gpkg_flags = MF_STRING |
+            (gdal_gpkg_available_ ? MF_ENABLED : MF_GRAYED);
+        AppendMenuW(exchange_menu, gtiff_flags, ID_IMPORT_GDAL_RASTER,
+                    L"导入 GeoTIFF / COG…");
+        AppendMenuW(exchange_menu, gtiff_flags, ID_EXPORT_GEOTIFF,
+                    L"导出 GeoTIFF（DEFLATE）…");
+        AppendMenuW(exchange_menu, cog_flags, ID_EXPORT_COG,
+                    L"导出 Cloud Optimized GeoTIFF…");
+        AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(exchange_menu, gpkg_flags, ID_IMPORT_GDAL_CONTOURS,
+                    L"导入 GeoPackage 等高线…");
+        AppendMenuW(exchange_menu, gpkg_flags, ID_EXPORT_GPKG_CONTOURS,
+                    L"导出 GeoPackage 等高线…");
         AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CDT,
                     L"打开约束网 DCDT…");
@@ -2688,6 +2726,174 @@ private:
                                        : L"等高线导出失败：" + last_error_text();
     }
 
+    void import_gdal_raster() {
+        if (!gdal_gtiff_available_) {
+            action_text_ = L"当前构建未启用 GDAL GeoTIFF 驱动";
+            return;
+        }
+        const auto file = choose_file(
+            false, L"terrain.tif",
+            L"GeoTIFF / COG (*.tif;*.tiff)\0*.tif;*.tiff\0所有文件 (*.*)\0*.*\0",
+            L"tif");
+        if (file.empty()) return;
+        dt_gdal_raster_load_options options{};
+        options.struct_size = sizeof(options);
+        options.band_index = 1;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_grid_load_gdal_raster(
+            wide_to_utf8(file.c_str()).c_str(), &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"GeoTIFF/COG 导入失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        grid_ = output;
+        show_grid_ = true;
+        update_layer_menu();
+        refresh_grid_cache();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"已导入 GeoTIFF/COG：" << grid_info_.width << L"×"
+             << grid_info_.height << L"，有效节点 "
+             << grid_info_.valid_value_count << L"，耗时 " << std::fixed
+             << std::setprecision(1) << ms << L" ms";
+        if (grid_values_.empty()) text << L"（超过 400 万节点，仅保留数据层）";
+        action_text_ = text.str();
+    }
+
+    void export_gdal_raster(bool cog) {
+        if (!grid_) {
+            action_text_ = L"没有可导出的 GRID";
+            return;
+        }
+        if ((cog && !gdal_cog_available_) ||
+            (!cog && !gdal_gtiff_available_)) {
+            action_text_ = L"当前构建没有所需的 GDAL 栅格驱动";
+            return;
+        }
+        const auto file = choose_file(
+            true, cog ? L"terrain_cog.tif" : L"terrain.tif",
+            L"GeoTIFF (*.tif;*.tiff)\0*.tif;*.tiff\0所有文件 (*.*)\0*.*\0",
+            L"tif");
+        if (file.empty()) return;
+        const char* gtiff_options[] = {
+            "TILED=YES", "COMPRESS=DEFLATE", "BIGTIFF=IF_SAFER", nullptr};
+        const char* cog_options[] = {
+            "COMPRESS=DEFLATE", "BIGTIFF=IF_SAFER", nullptr};
+        dt_gdal_raster_save_options options{};
+        options.struct_size = sizeof(options);
+        options.driver_name = cog ? "COG" : "GTiff";
+        options.creation_options = cog ? cog_options : gtiff_options;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_grid_save_gdal_raster(
+            grid_, wide_to_utf8(file.c_str()).c_str(), &options);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = (cog ? L"COG 导出失败：" : L"GeoTIFF 导出失败：") +
+                           last_error_text();
+            return;
+        }
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << (cog ? L"已导出 COG：" : L"已导出 GeoTIFF：") << file
+             << L"，耗时 " << std::fixed << std::setprecision(1) << ms
+             << L" ms";
+        action_text_ = text.str();
+    }
+
+    void import_gdal_contours() {
+        if (!gdal_gpkg_available_) {
+            action_text_ = L"当前构建未启用 GDAL GeoPackage 驱动";
+            return;
+        }
+        const auto file = choose_file(
+            false, L"terrain_contours.gpkg",
+            L"GeoPackage (*.gpkg)\0*.gpkg\0所有矢量文件 (*.*)\0*.*\0",
+            L"gpkg");
+        if (file.empty()) return;
+        dt_gdal_contour_load_options options{};
+        options.struct_size = sizeof(options);
+        options.elevation_field = "elevation";
+        dt_contour_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_contours_load_gdal_vector(
+            wide_to_utf8(file.c_str()).c_str(), &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"GeoPackage 等高线导入失败：" + last_error_text();
+            return;
+        }
+        destroy_contour_layer();
+        contours_ = output;
+        contour_info_ = {};
+        contour_info_.struct_size = sizeof(contour_info_);
+        dt_contours_get_info(contours_, &contour_info_);
+        show_contours_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"已导入 GeoPackage 等高线：" << contour_info_.line_count
+             << L" 条，" << contour_info_.vertex_count << L" 点，耗时 "
+             << std::fixed << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
+    void export_gdal_contours() {
+        if (!contours_) {
+            action_text_ = L"没有可导出的等高线";
+            return;
+        }
+        if (!gdal_gpkg_available_) {
+            action_text_ = L"当前构建未启用 GDAL GeoPackage 驱动";
+            return;
+        }
+        const auto file = choose_file(
+            true, L"terrain_contours.gpkg",
+            L"GeoPackage (*.gpkg)\0*.gpkg\0所有矢量文件 (*.*)\0*.*\0",
+            L"gpkg");
+        if (file.empty()) return;
+        const char* layer_options[] = {"SPATIAL_INDEX=YES", nullptr};
+        dt_gdal_contour_save_options options{};
+        options.struct_size = sizeof(options);
+        options.driver_name = "GPKG";
+        options.layer_name = "contours";
+        options.elevation_field = "elevation";
+        options.layer_creation_options = layer_options;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_contours_save_gdal_vector(
+            contours_, wide_to_utf8(file.c_str()).c_str(), &options);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"GeoPackage 等高线导出失败：" + last_error_text();
+            return;
+        }
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"已导出 GeoPackage 等高线：" << file << L"，耗时 "
+             << std::fixed << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
     bool refresh_cdt_constraints() {
         cdt_triangles_.clear();
         constraint_lines_.clear();
@@ -2842,6 +3048,11 @@ private:
         case ID_EXPORT_GRID: export_grid_file(); break;
         case ID_IMPORT_CONTOURS: import_contour_file(); break;
         case ID_EXPORT_CONTOURS: export_contour_file(); break;
+        case ID_IMPORT_GDAL_RASTER: import_gdal_raster(); break;
+        case ID_EXPORT_GEOTIFF: export_gdal_raster(false); break;
+        case ID_EXPORT_COG: export_gdal_raster(true); break;
+        case ID_IMPORT_GDAL_CONTOURS: import_gdal_contours(); break;
+        case ID_EXPORT_GPKG_CONTOURS: export_gdal_contours(); break;
         case ID_IMPORT_CDT: import_cdt_file(); break;
         case ID_EXPORT_CDT: export_cdt_file(); break;
         case ID_CDT_DRAW_BREAKLINE:

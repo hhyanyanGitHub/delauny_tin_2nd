@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 TODAY = date(2026, 7, 17).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.12.0：新增等高线折点/加密样本反向生成普通 TIN 和 GRID，并保留 v0.11 原子批量约束事务。反向转换是近似重建，不强制原等高线成为普通 TIN 网边；真正局部 CDT 更新和生产级 GPU LOD 属于后续阶段。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.13.0：Win32 GUI 已接入 GeoTIFF/COG GRID 与 GeoPackage 等高线交换，并保留等高线反向转换和原子批量约束事务。GDAL 菜单按运行环境驱动能力启用；真正局部 CDT 更新和生产级 GPU LOD 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
@@ -495,7 +495,7 @@ def build_developer_manual():
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.12 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。", "gold")
+    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.13 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。", "gold")
 
     m.h1("2 架构与数据模型")
     m.h2("2.1 分层结构")
@@ -744,6 +744,7 @@ dt_grid_destroy(loaded);""")
         [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
     )
     m.callout("部署", "启用 GDAL 的便携目录必须携带构建目录复制出的 GDAL、PROJ、SQLite、GeoTIFF 等运行时 DLL，以及 DLL 同级 share/proj/proj.db。COG 使用 CreateCopy，会比普通 GTiff 需要更多临时内存/存储。", "gold")
+    m.callout("GUI 集成", "v0.13 的演示程序启动时探测 GTiff、COG、GPKG 驱动，按能力启用五个数据交换菜单。栅格导入只替换 GRID，GeoPackage 导入只替换等高线，普通 TIN、CDT 和无关图层保持不变。", "blue")
 
     m.h2("4.8 约束 Delaunay")
     m.para("dt_cdt_api.h 提供独立 dt_cdt_handle。基础点与普通 TIN 相互独立；断裂线只强制成边，外边界和孔洞通过奇偶嵌套层级决定有效域。没有外边界时全部有限面均为有效域。")
@@ -1022,7 +1023,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.12 功能边界", "当前程序已提供二维/三维浏览、TIN/GRID/等高线双向转换、DCDT 打开保存、约束绘制、批量示例、顶点移动、安全删除、整条删除和 CDT 影响区显示。等高线反向转换是折点近似重建；GeoTIFF/GeoPackage 菜单和生产级 GPU/LOD 尚未接入。", "gold")
+    m.callout("0.13 功能边界", "当前程序已提供二维/三维浏览、TIN/GRID/等高线双向转换、DCDT 打开保存、约束编辑和 CDT 影响区显示；启用 GDAL 后可从菜单交换 GeoTIFF/COG GRID 与 GeoPackage 等高线。等高线反向转换是折点近似重建；生产级 GPU/LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1057,6 +1058,7 @@ def build_gui_manual():
         "打开“地形转换”菜单，依次执行“TIN → GRID”和“从 GRID 生成等高线”，观察三类图层叠加。",
         "继续执行“等高线 → TIN”和“等高线 → GRID”，观察源等高线保留并与近似重建结果叠加。",
         "打开“图层”菜单，分别隐藏和显示 TIN、GRID、等高线，再用“全图”恢复联合范围。",
+        "若当前为 GDAL 构建，执行‘数据交换→导出 GeoTIFF（DEFLATE）’和‘导出 GeoPackage 等高线’，再重新导入检查图层叠加。",
         "打开“数据交换→打开约束网 DCDT”，选择 sample_constraints.dcdt，观察孔洞和断裂线。",
         "打开“约束编辑→绘制断裂线”，在画布逐点单击，按 Enter 完成；用 Backspace 撤点、Esc 取消。",
         "选择“移动约束顶点（两次单击）”，第一次单击白色约束顶点使其变黄，第二次单击目标位置；观察红色旧面、黄色边界和绿色新增面/边。",
@@ -1097,7 +1099,7 @@ def build_gui_manual():
         ["菜单", "主要命令"],
         [
             ("地形转换", "TIN/GRID/等高线双向派生，CDT 域内转换，并自动生成等高线。"),
-            ("数据交换", "导入或导出 DGRID、DCONTOUR 和 DCDT 文本。"),
+            ("数据交换", "交换 DGRID、DCONTOUR、DCDT 文本；GDAL 构建还支持 GeoTIFF/COG 与 GeoPackage。"),
             ("约束编辑", "绘制或批量添加断裂线；移动/安全删除顶点，或删除整条约束。"),
             ("图层", "分别显示或隐藏 TIN、GRID、等高线和约束 Delaunay。"),
         ],
@@ -1256,10 +1258,21 @@ def build_gui_manual():
     m.h2("8.3 DGRID 与 DCONTOUR 文本")
     m.para("通过“数据交换”菜单可独立导入或导出 DGRID 规则高程节点文本和 DCONTOUR 等高线文本。导入这些图层不会删除现有 TIN，因此适合叠加检查。GRID 支持完整六参数仿射变换；旋转或错切数据会按实际三个角点映射显示。安装目录的 sample_data/sample_grid.dgrid 和 sample_contours.dcontour 可直接用于验证。")
     m.callout("等高线反向转换", "导入 DCONTOUR 后，可执行‘等高线 → TIN’或‘等高线 → GRID’。GUI 使用原折点和 LINE elevation；输入共线或同一 XY 高程冲突时拒绝转换，原数据保持不变。", "blue")
-    m.callout("格式边界", "GUI 当前只接入 DGRID/DCONTOUR 文本；DLL 已提供的 GeoTIFF/COG/GeoPackage 接口将在后续菜单中开放。", "gold")
-    m.h2("8.4 DCDT 约束网")
+    m.h2("8.4 GeoTIFF、COG 与 GeoPackage")
+    m.para("启用 DT_WITH_GDAL 后，数据交换菜单增加五个命令：导入 GeoTIFF/COG、导出 DEFLATE GeoTIFF、导出 Cloud Optimized GeoTIFF、导入 GeoPackage 等高线和导出 GeoPackage 等高线。程序分别探测 GTiff、COG、GPKG 驱动；普通构建或缺少驱动时，相应命令置灰而不是在运行时失败。")
+    m.table(
+        ["对象", "导入行为", "导出设置"],
+        [
+            ("GeoTIFF / COG GRID", "读取第 1 波段；只替换 GRID，保留 TIN、CDT 和等高线。", "GTiff：TILED、DEFLATE、BIGTIFF=IF_SAFER；COG：DEFLATE、BIGTIFF=IF_SAFER。"),
+            ("GeoPackage 等高线", "读取 elevation 与 LineStringZ；只替换等高线。", "contours 图层、elevation/closed 字段、空间索引。"),
+        ],
+        [2200, 3500, 3660],
+        [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    m.callout("图层安全", "导入失败时原图层保持不变。GDAL 栅格像元中心与 GRID 节点自动完成半像元换算；当前 GUI 不执行坐标重投影。", "blue")
+    m.h2("8.5 DCDT 约束网")
     m.para("选择“数据交换→打开约束网 DCDT”可加载基础点、外边界、孔洞、断裂线和 CRS。域内网为紫色，外边界青色，孔洞洋红，断裂线橙色。sample_constraints.dcdt 可直接验证；“保存约束网 DCDT”执行完整文本往返。")
-    m.h2("8.5 批量事务、交互绘制、移动与安全删除")
+    m.h2("8.6 批量事务、交互绘制、移动与安全删除")
     for step in (
         "先打开 DCDT，或执行‘地形转换→从当前 TIN 创建约束网’。",
         "当前约束为空时可选择‘批量添加 12 条示例断裂线’；程序在有效范围内生成互不相交的平行线，用一次事务提交并报告耗时。",
@@ -1276,8 +1289,8 @@ def build_gui_manual():
         "约束改变后重新生成 GRID/等高线；程序会自动释放旧派生图层。",
     ):
         m.number(step)
-    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.12 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
-    m.h2("8.6 往返验证")
+    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.13 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
+    m.h2("8.7 往返验证")
     for step in (
         "保存当前网格。",
         "记录状态栏的顶点数和三角形数。",
@@ -1314,6 +1327,8 @@ def build_gui_manual():
         ("编辑后 GRID 消失", "GRID/等高线是旧 TIN 的派生结果；TIN 改变后程序自动释放，需重新生成。"),
         ("GRID→TIN 提示跨 NoData", "普通 TIN 会跨空白构网；真实孔洞和硬边界请使用独立 DCDT 约束网。"),
         ("等高线→TIN 失败", "至少需要三个不共线的唯一 XY；同一位置不能属于不同高程。普通 TIN 不强制保留原等高线边。"),
+        ("GDAL 菜单是灰色", "当前构建未启用 GDAL，或运行环境缺少 GTiff、COG、GPKG 对应驱动；DGRID/DCONTOUR 文本仍可使用。"),
+        ("导入 GeoPackage 没有高程", "确认矢量层包含 elevation 字段和有效 LineString/LineStringZ；GUI 默认读取 elevation。"),
         ("DCDT 孔洞仍有线框", "确认显示的是紫色 CDT 域内网；底下叠加的普通 TIN 可通过图层菜单隐藏。"),
         ("无法选中约束", "删除时应靠近青、洋红或橙色约束线；移动时应靠近白色约束顶点。两者拾取范围均约 14 像素。"),
         ("外边界删除失败", "仍有孔洞依赖外边界；先删除孔洞约束，再删除外边界。"),
@@ -1340,6 +1355,7 @@ def build_gui_manual():
         "使用框选放大展示局部细节，并用“全图”恢复。",
         "依次生成 GRID 和等高线，用“图层”菜单验证 T/G/C 叠加与显隐。",
         "至少导出一次 DGRID 和 DCONTOUR，并重新导入检查范围和数量。",
+        "若使用 GDAL 构建，确认五个格式菜单已启用；往返一次 GeoTIFF/COG 和 GeoPackage，并检查 TIN/CDT 未被替换。",
         "从导入的等高线反向生成一次 TIN 和 GRID，确认源等高线仍可叠加显示。",
         "打开 sample_constraints.dcdt，隐藏普通 TIN 后确认孔洞为空、三类约束颜色正确。",
         "从 TIN 创建空约束网，批量添加 12 条示例断裂线并记录状态栏事务耗时。",
@@ -1351,9 +1367,9 @@ def build_gui_manual():
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加 12 条断裂线并记录耗时 → 打开示例 DCDT → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游 → 保存文本。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付轻量三维查看、TIN/GRID/等高线双向转换、CDT 派生转换、DCDT 图层、批量约束事务、约束顶点移动、安全删除和完整差异显示。后续将把单项全量候选重建升级为真正的局部拓扑更新，并增加图层树与样式面板、GeoTIFF/GeoPackage 菜单、GPU 分块 LOD、拾取测量和贴地碰撞。")
+    m.para("当前已交付轻量三维查看、TIN/GRID/等高线双向转换、GeoTIFF/COG/GeoPackage 菜单、CDT 派生转换、DCDT 图层、批量约束事务、约束顶点移动、安全删除和完整差异显示。后续将把单项全量候选重建升级为真正的局部拓扑更新，并增加图层树与样式面板、GPU 分块 LOD、拾取测量和贴地碰撞。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

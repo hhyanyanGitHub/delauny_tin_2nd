@@ -1,6 +1,6 @@
 {
   "name": "dterrain",
-  "version-string": "0.12.0",
+  "version-string": "0.13.0",
   "description": "Dynamic 2.5D terrain TIN, GRID and contour processing DLL",
   "dependencies": [
     "cgal"

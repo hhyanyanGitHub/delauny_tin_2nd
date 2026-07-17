@@ -58,6 +58,18 @@ typedef struct dt_grid_to_tin_options {
     uint64_t reserved[6];
 } dt_grid_to_tin_options;
 
+typedef struct dt_contours_to_tin_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Zero keeps source vertices only. Positive values add samples so no
+       source contour segment is longer than this XY distance. */
+    double maximum_segment_length;
+    /* Zero merges exact duplicate XY only. Positive values merge vertices
+       within this XY distance when their contour elevations agree. */
+    double merge_tolerance;
+    uint64_t reserved[4];
+} dt_contours_to_tin_options;
+
 typedef struct dt_contour_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -134,6 +146,21 @@ DT_API dt_status DT_CALL dt_grid_from_tin(
 DT_API dt_status DT_CALL dt_tin_from_grid(
     dt_grid_handle grid, const dt_grid_to_tin_options* options,
     dt_handle output_tin);
+
+/* Replaces output_tin atomically with an ordinary Delaunay TIN sampled from
+   contour vertices. LINE elevation is authoritative. Contour polylines are
+   not forced to become TIN edges; use a CDT when hard constraints are needed. */
+DT_API dt_status DT_CALL dt_tin_from_contours(
+    dt_contour_handle contours,
+    const dt_contours_to_tin_options* options, dt_handle output_tin);
+
+/* Builds the same intermediate contour-sampled TIN and samples it at the
+   requested GRID nodes. */
+DT_API dt_status DT_CALL dt_grid_from_contours(
+    dt_contour_handle contours,
+    const dt_contours_to_tin_options* tin_options,
+    const dt_tin_to_grid_options* grid_options,
+    dt_grid_handle* output_grid);
 
 DT_API dt_status DT_CALL dt_contours_from_tin(
     dt_handle tin, const dt_contour_options* options,

@@ -135,6 +135,24 @@ struct PointKeyHash {
     }
 };
 
+struct ExactPointKey {
+    double x = 0.0;
+    double y = 0.0;
+
+    bool operator==(const ExactPointKey& other) const noexcept {
+        return x == other.x && y == other.y;
+    }
+};
+
+struct ExactPointKeyHash {
+    size_t operator()(const ExactPointKey& key) const noexcept {
+        const size_t a = std::hash<double>{}(key.x);
+        const size_t b = std::hash<double>{}(key.y);
+        return a ^ (b + static_cast<size_t>(0x9e3779b9U) + (a << 6U) +
+                    (a >> 2U));
+    }
+};
+
 PointKey point_key(const dt_point3& point, double origin_x, double origin_y,
                    double tolerance) {
     return {static_cast<int64_t>(std::llround((point.x - origin_x) / tolerance)),
@@ -708,6 +726,175 @@ std::vector<dt_point3> points_from_grid(
     }
     if (points.size() < 3) {
         throw Exception(DT_E_EMPTY, "GRID has fewer than three valid nodes");
+    }
+    return points;
+}
+
+std::vector<dt_point3> points_from_contours(
+    const ContourSet& contours,
+    const dt_contours_to_tin_options& options) {
+    if (options.flags != 0 || !finite(options.maximum_segment_length) ||
+        options.maximum_segment_length < 0.0 ||
+        !finite(options.merge_tolerance) || options.merge_tolerance < 0.0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "invalid contour-to-TIN options");
+    }
+    if (contours.lines.empty()) {
+        throw Exception(DT_E_EMPTY, "contour set is empty");
+    }
+
+    const auto metadata = contours.info();
+    if (metadata.vertex_count == 0) {
+        throw Exception(DT_E_EMPTY, "contour set contains no vertices");
+    }
+    if (options.merge_tolerance > 0.0) {
+        const double extent = std::max(metadata.bounds.xmax - metadata.bounds.xmin,
+                                       metadata.bounds.ymax - metadata.bounds.ymin);
+        validate_stitch_scale(extent, options.merge_tolerance);
+    }
+
+    std::vector<dt_point3> points;
+    points.reserve(static_cast<size_t>(std::min<uint64_t>(
+        metadata.vertex_count, kMaximumContourVertices)));
+    std::unordered_map<ExactPointKey, size_t, ExactPointKeyHash> exact;
+    std::unordered_map<PointKey, std::vector<size_t>, PointKeyHash> cells;
+    const double tolerance_squared =
+        options.merge_tolerance * options.merge_tolerance;
+
+    auto elevations_agree = [](double a, double b) {
+        const double scale = std::max({1.0, std::abs(a), std::abs(b)});
+        return std::abs(a - b) <= scale * 1.0e-10;
+    };
+    auto append_point = [&](dt_point3 point) {
+        point.x = point.x == 0.0 ? 0.0 : point.x;
+        point.y = point.y == 0.0 ? 0.0 : point.y;
+        if (!finite(point.x) || !finite(point.y) || !finite(point.z)) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "contour contains a non-finite sample");
+        }
+
+        if (options.merge_tolerance == 0.0) {
+            const ExactPointKey key{point.x, point.y};
+            const auto found = exact.find(key);
+            if (found != exact.end()) {
+                if (!elevations_agree(points[found->second].z, point.z)) {
+                    throw Exception(DT_E_CORRUPTED_DATA,
+                                    "duplicate contour XY has conflicting elevations");
+                }
+                return;
+            }
+            if (points.size() >= kMaximumContourVertices) {
+                throw Exception(DT_E_LIMIT_EXCEEDED,
+                                "too many contour-to-TIN samples");
+            }
+            exact.emplace(key, points.size());
+            points.push_back(point);
+            return;
+        }
+
+        const PointKey key = point_key(point, metadata.bounds.xmin,
+                                       metadata.bounds.ymin,
+                                       options.merge_tolerance);
+        bool matched = false;
+        for (int64_t dy = -1; dy <= 1; ++dy) {
+            for (int64_t dx = -1; dx <= 1; ++dx) {
+                const auto found = cells.find({key.x + dx, key.y + dy});
+                if (found == cells.end()) continue;
+                for (size_t index : found->second) {
+                    const double x = points[index].x - point.x;
+                    const double y = points[index].y - point.y;
+                    if (x * x + y * y > tolerance_squared) continue;
+                    if (!elevations_agree(points[index].z, point.z)) {
+                        throw Exception(DT_E_CORRUPTED_DATA,
+                                        "nearby contour vertices have conflicting elevations");
+                    }
+                    matched = true;
+                }
+            }
+        }
+        if (matched) return;
+        if (points.size() >= kMaximumContourVertices) {
+            throw Exception(DT_E_LIMIT_EXCEEDED,
+                            "too many contour-to-TIN samples");
+        }
+        cells[key].push_back(points.size());
+        points.push_back(point);
+    };
+
+    auto append_segment = [&](const dt_point3& source_a,
+                              const dt_point3& source_b,
+                              double elevation) {
+        const double dx = source_b.x - source_a.x;
+        const double dy = source_b.y - source_a.y;
+        const double length = std::hypot(dx, dy);
+        if (!finite(length)) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "contour segment length is invalid");
+        }
+        uint64_t divisions = 1;
+        if (options.maximum_segment_length > 0.0) {
+            const double required =
+                std::ceil(length / options.maximum_segment_length);
+            if (!finite(required) ||
+                required > static_cast<double>(kMaximumContourVertices)) {
+                throw Exception(DT_E_LIMIT_EXCEEDED,
+                                "contour segment creates too many samples");
+            }
+            divisions = std::max<uint64_t>(1, static_cast<uint64_t>(required));
+        }
+        for (uint64_t i = 1; i <= divisions; ++i) {
+            const double t = static_cast<double>(i) /
+                             static_cast<double>(divisions);
+            append_point({source_a.x + t * dx, source_a.y + t * dy,
+                          elevation});
+        }
+    };
+
+    for (const auto& line : contours.lines) {
+        if (!finite(line.elevation) || line.points.size() < 2) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "invalid contour line geometry");
+        }
+        append_point({line.points.front().x, line.points.front().y,
+                      line.elevation});
+        for (size_t i = 1; i < line.points.size(); ++i) {
+            append_segment(line.points[i - 1], line.points[i],
+                           line.elevation);
+        }
+        if ((line.flags & DT_CONTOUR_LINE_CLOSED) != 0) {
+            append_segment(line.points.back(), line.points.front(),
+                           line.elevation);
+        }
+    }
+
+    if (points.size() < 3) {
+        throw Exception(DT_E_EMPTY,
+                        "contours do not provide enough unique XY samples");
+    }
+    const Kernel::Point_2 first(points[0].x, points[0].y);
+    size_t second_index = 1;
+    while (second_index < points.size() &&
+           points[second_index].x == points[0].x &&
+           points[second_index].y == points[0].y) {
+        ++second_index;
+    }
+    if (second_index == points.size()) {
+        throw Exception(DT_E_EMPTY, "all contour samples share one XY");
+    }
+    const Kernel::Point_2 second(points[second_index].x,
+                                 points[second_index].y);
+    bool two_dimensional = false;
+    for (size_t i = second_index + 1; i < points.size(); ++i) {
+        if (CGAL::orientation(first, second,
+                              Kernel::Point_2(points[i].x, points[i].y)) !=
+            CGAL::COLLINEAR) {
+            two_dimensional = true;
+            break;
+        }
+    }
+    if (!two_dimensional) {
+        throw Exception(DT_E_EMPTY,
+                        "contour samples are collinear and cannot form a TIN");
     }
     return points;
 }

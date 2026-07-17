@@ -1,6 +1,6 @@
 # 约束 Delaunay API
 
-本文说明 dterrain 0.11 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
+本文说明 dterrain 0.12 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
 改变普通 `dt_handle`、旧 12 接口或 TIN/GRID/等高线 API 的行为。
 
 ## 数据模型

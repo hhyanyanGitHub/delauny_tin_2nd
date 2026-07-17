@@ -48,6 +48,8 @@ enum CommandId {
     ID_GRID_TO_TIN,
     ID_CONTOURS_FROM_TIN,
     ID_CONTOURS_FROM_GRID,
+    ID_TIN_FROM_CONTOURS,
+    ID_GRID_FROM_CONTOURS,
     ID_CDT_FROM_TIN,
     ID_GRID_FROM_CDT,
     ID_CONTOURS_FROM_CDT,
@@ -374,6 +376,10 @@ private:
                     L"从 TIN 生成等高线（自动间隔）");
         AppendMenuW(terrain_menu, MF_STRING, ID_CONTOURS_FROM_GRID,
                     L"从 GRID 生成等高线（自动间隔）");
+        AppendMenuW(terrain_menu, MF_STRING, ID_TIN_FROM_CONTOURS,
+                    L"等高线 → TIN（按折点重建）");
+        AppendMenuW(terrain_menu, MF_STRING, ID_GRID_FROM_CONTOURS,
+                    L"等高线 → GRID（自动 401）");
         AppendMenuW(terrain_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(terrain_menu, MF_STRING, ID_CDT_FROM_TIN,
                     L"从当前 TIN 创建约束网");
@@ -2391,6 +2397,111 @@ private:
         action_text_ = text.str();
     }
 
+    void convert_contours_to_tin() {
+        if (!contours_ || contour_info_.line_count == 0) {
+            action_text_ = L"等高线→TIN 失败：请先生成或导入等高线";
+            return;
+        }
+        dt_contours_to_tin_options options{};
+        options.struct_size = sizeof(options);
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status =
+            dt_tin_from_contours(contours_, &options, mesh_);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"等高线→TIN 失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        clear_cdt_layer();
+        clear_overlays();
+        show_tin_ = true;
+        show_contours_ = true;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        dt_statistics stats{};
+        dt_get_statistics(mesh_, &stats);
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"等高线→TIN 完成：" << stats.vertex_count << L" 顶点，"
+             << stats.finite_triangle_count << L" 面，耗时 " << std::fixed
+             << std::setprecision(1) << ms
+             << L" ms（普通 Delaunay，不强制保留等高线边）";
+        action_text_ = text.str();
+    }
+
+    void convert_contours_to_grid() {
+        if (!contours_ || contour_info_.line_count == 0) {
+            action_text_ = L"等高线→GRID 失败：请先生成或导入等高线";
+            return;
+        }
+        const double x_range =
+            contour_info_.bounds.xmax - contour_info_.bounds.xmin;
+        const double y_range =
+            contour_info_.bounds.ymax - contour_info_.bounds.ymin;
+        if (!(x_range > 0.0) || !(y_range > 0.0)) {
+            action_text_ = L"等高线→GRID 失败：等高线范围无效";
+            return;
+        }
+        dt_contours_to_tin_options tin_options{};
+        tin_options.struct_size = sizeof(tin_options);
+        dt_tin_to_grid_options grid_options{};
+        grid_options.struct_size = sizeof(grid_options);
+        if (x_range >= y_range) {
+            grid_options.width = 401;
+            grid_options.height = std::max<uint64_t>(
+                2, static_cast<uint64_t>(
+                       std::llround(y_range / x_range * 400.0)) +
+                       1);
+        } else {
+            grid_options.height = 401;
+            grid_options.width = std::max<uint64_t>(
+                2, static_cast<uint64_t>(
+                       std::llround(x_range / y_range * 400.0)) +
+                       1);
+        }
+        grid_options.geo_transform[0] = contour_info_.bounds.xmin;
+        grid_options.geo_transform[1] =
+            x_range / static_cast<double>(grid_options.width - 1);
+        grid_options.geo_transform[3] = contour_info_.bounds.ymin;
+        grid_options.geo_transform[5] =
+            y_range / static_cast<double>(grid_options.height - 1);
+        grid_options.nodata_value = -9999.0;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_grid_from_contours(
+            contours_, &tin_options, &grid_options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"等高线→GRID 失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        grid_ = output;
+        show_grid_ = true;
+        show_contours_ = true;
+        update_layer_menu();
+        refresh_grid_cache();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"等高线→GRID 完成：" << grid_info_.width << L"×"
+             << grid_info_.height << L"，有效节点 "
+             << grid_info_.valid_value_count << L"，耗时 " << std::fixed
+             << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+    }
+
     void generate_contours(bool from_grid) {
         double zmin = 0.0;
         double zmax = 0.0;
@@ -2722,6 +2833,8 @@ private:
         case ID_GRID_TO_TIN: convert_grid_to_tin(); break;
         case ID_CONTOURS_FROM_TIN: generate_contours(false); break;
         case ID_CONTOURS_FROM_GRID: generate_contours(true); break;
+        case ID_TIN_FROM_CONTOURS: convert_contours_to_tin(); break;
+        case ID_GRID_FROM_CONTOURS: convert_contours_to_grid(); break;
         case ID_CDT_FROM_TIN: create_cdt_from_tin(); break;
         case ID_GRID_FROM_CDT: convert_cdt_to_grid(); break;
         case ID_CONTOURS_FROM_CDT: generate_cdt_contours(); break;

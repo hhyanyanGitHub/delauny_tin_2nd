@@ -656,7 +656,7 @@ void test_random_dynamic_sequence() {
 void test_grid_and_contours() {
     uint32_t major = 0, minor = 0, patch = 0;
     dt_get_version(&major, &minor, &patch);
-    assert(major == 0 && minor == 11 && patch == 0);
+    assert(major == 0 && minor == 12 && patch == 0);
 
     dt_handle plane = nullptr;
     require_ok(dt_create(nullptr, &plane), "terrain create plane");
@@ -829,6 +829,103 @@ void test_grid_and_contours() {
     assert(loaded_contour_info.vertex_count == contour_info.vertex_count);
     std::remove(contour_file);
 
+    dt_contours_to_tin_options contour_tin_options{};
+    contour_tin_options.struct_size = sizeof(contour_tin_options);
+    contour_tin_options.maximum_segment_length = 0.2;
+    contour_tin_options.merge_tolerance = 1.0e-12;
+    dt_handle contour_tin = nullptr;
+    require_ok(dt_create(nullptr, &contour_tin), "contour TIN create");
+    require_ok(dt_tin_from_contours(grid_contours, &contour_tin_options,
+                                    contour_tin),
+               "dt_tin_from_contours");
+    dt_statistics contour_tin_statistics{};
+    require_ok(dt_get_statistics(contour_tin, &contour_tin_statistics),
+               "contour TIN statistics");
+    assert(contour_tin_statistics.dimension == 2);
+    assert(contour_tin_statistics.vertex_count >= 8);
+    require_ok(dt_validate(contour_tin, 0), "contour TIN validate");
+    require_ok(dt_get_crs_wkt(contour_tin, nullptr, 0, &crs_size),
+               "contour TIN CRS size");
+    crs.assign(crs_size, '\0');
+    require_ok(dt_get_crs_wkt(contour_tin, crs.data(), crs.size(), nullptr),
+               "contour TIN CRS");
+    assert(std::string(crs.data()) == test_crs);
+
+    dt_grid_handle contour_grid = nullptr;
+    require_ok(dt_grid_from_contours(grid_contours, &contour_tin_options,
+                                     &raster_options, &contour_grid),
+               "dt_grid_from_contours");
+    dt_grid_info contour_grid_info{};
+    require_ok(dt_grid_get_info(contour_grid, &contour_grid_info),
+               "contour GRID info");
+    assert(contour_grid_info.width == 3 && contour_grid_info.height == 3);
+    assert(contour_grid_info.valid_value_count > 0);
+    double contour_grid_values[9]{};
+    require_ok(dt_grid_read_window(contour_grid, 0, 0, 3, 3,
+                                   contour_grid_values, 3),
+               "contour GRID values");
+    assert(std::abs(contour_grid_values[4] - 1.0) < 1.0e-10);
+
+    const char* conflicting_contour_file =
+        "dterrain_test_conflicting_contours.dcontour";
+    {
+        std::ofstream stream(conflicting_contour_file,
+                             std::ios::binary | std::ios::trunc);
+        stream << "DCONTOUR 1\nLINES 2\n"
+                  "LINE 10 0 2\n0 0 10\n1 0 10\n"
+                  "LINE 20 0 2\n0 0 20\n0 1 20\nEND\n";
+    }
+    dt_contour_handle conflicting_contours = nullptr;
+    require_ok(dt_contours_load_text(conflicting_contour_file,
+                                     &conflicting_contours),
+               "load conflicting contours");
+    const uint64_t contour_generation = contour_tin_statistics.generation;
+    assert(dt_tin_from_contours(conflicting_contours, &contour_tin_options,
+                                contour_tin) == DT_E_CORRUPTED_DATA);
+    require_ok(dt_get_statistics(contour_tin, &contour_tin_statistics),
+               "contour TIN rollback statistics");
+    assert(contour_tin_statistics.generation == contour_generation);
+    assert(contour_tin_statistics.dimension == 2);
+    dt_contours_destroy(conflicting_contours);
+    std::remove(conflicting_contour_file);
+
+    const char* nearby_conflicting_contour_file =
+        "dterrain_test_nearby_conflicting_contours.dcontour";
+    {
+        std::ofstream stream(nearby_conflicting_contour_file,
+                             std::ios::binary | std::ios::trunc);
+        stream << "DCONTOUR 1\nLINES 3\n"
+                  "LINE 10 0 2\n0 0 10\n0 1 10\n"
+                  "LINE 20 0 2\n2 0 20\n2 1 20\n"
+                  "LINE 10 0 2\n1 0 10\n1 1 10\nEND\n";
+    }
+    dt_contour_handle nearby_conflicting_contours = nullptr;
+    require_ok(dt_contours_load_text(nearby_conflicting_contour_file,
+                                     &nearby_conflicting_contours),
+               "load nearby conflicting contours");
+    dt_contours_to_tin_options nearby_options{};
+    nearby_options.struct_size = sizeof(nearby_options);
+    nearby_options.merge_tolerance = 1.1;
+    assert(dt_tin_from_contours(nearby_conflicting_contours,
+                                &nearby_options,
+                                contour_tin) == DT_E_CORRUPTED_DATA);
+    require_ok(dt_get_statistics(contour_tin, &contour_tin_statistics),
+               "nearby contour TIN rollback statistics");
+    assert(contour_tin_statistics.generation == contour_generation);
+    dt_contours_destroy(nearby_conflicting_contours);
+    std::remove(nearby_conflicting_contour_file);
+
+    dt_contours_to_tin_options invalid_contour_tin_options{};
+    invalid_contour_tin_options.struct_size =
+        sizeof(invalid_contour_tin_options);
+    invalid_contour_tin_options.maximum_segment_length = -1.0;
+    assert(dt_tin_from_contours(grid_contours,
+                                &invalid_contour_tin_options,
+                                contour_tin) == DT_E_INVALID_ARGUMENT);
+    assert(dt_grid_from_contours(grid_contours, &contour_tin_options,
+                                 &raster_options, nullptr) ==
+           DT_E_INVALID_ARGUMENT);
+
     dt_handle grid_tin = nullptr;
     require_ok(dt_create(nullptr, &grid_tin), "grid TIN create");
     dt_grid_to_tin_options tin_options{};
@@ -927,6 +1024,8 @@ void test_grid_and_contours() {
 
     dt_grid_destroy(nodata_grid);
     dt_destroy(grid_tin);
+    dt_grid_destroy(contour_grid);
+    dt_destroy(contour_tin);
     dt_contours_destroy(loaded_contours);
     dt_contours_destroy(grid_contours);
     dt_contours_destroy(tin_contours);

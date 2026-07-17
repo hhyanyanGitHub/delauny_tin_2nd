@@ -477,6 +477,43 @@ dt_status DT_CALL dt_tin_from_grid(dt_grid_handle grid,
     });
 }
 
+dt_status DT_CALL dt_tin_from_contours(
+    dt_contour_handle contours,
+    const dt_contours_to_tin_options* options, dt_handle output_tin) {
+    return guarded([&] {
+        validate_options(options, "dt_contours_to_tin_options");
+        auto points =
+            dt::points_from_contours(require_contours(contours), *options);
+        auto& destination = require_context(output_tin);
+        destination.build(points.data(), points.size(), nullptr);
+        destination.set_crs_wkt(require_contours(contours).crs_wkt);
+    });
+}
+
+dt_status DT_CALL dt_grid_from_contours(
+    dt_contour_handle contours,
+    const dt_contours_to_tin_options* tin_options,
+    const dt_tin_to_grid_options* grid_options,
+    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        validate_options(tin_options, "dt_contours_to_tin_options");
+        validate_options(grid_options, "dt_tin_to_grid_options");
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_grid is null");
+        }
+        auto points = dt::points_from_contours(require_contours(contours),
+                                               *tin_options);
+        dt::Context sampled_tin;
+        sampled_tin.build(points.data(), points.size(), nullptr);
+        sampled_tin.set_crs_wkt(require_contours(contours).crs_wkt);
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::grid_from_tin(sampled_tin, *grid_options);
+        *output_grid = result.release();
+    });
+}
+
 dt_status DT_CALL dt_contours_from_tin(dt_handle tin,
                                        const dt_contour_options* options,
                                        dt_contour_handle* output_contours) {

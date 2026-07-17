@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.4 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.12 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -17,8 +17,8 @@ Y = gt[3] + column * gt[4] + row * gt[5]
 
 TIN、GRID 和等高线句柄都可保存可选 CRS WKT。使用 `dt_set_crs_wkt()`、
 `dt_grid_set_crs_wkt()`、`dt_contours_set_crs_wkt()` 设置；对应 getter 采用先查询
-所需字节数、再写入调用方缓冲区的方式。TIN→GRID/等高线、GRID→TIN/等高线会
-传播 CRS，但不执行重投影。
+所需字节数、再写入调用方缓冲区的方式。TIN、GRID、等高线之间的转换会传播 CRS，
+但不执行重投影。
 
 `dt_grid_read_window()`、`dt_grid_write_window()` 支持局部窗口；`row_stride`
 以 `double` 个数计，零表示紧密排列。GRID 句柄由 `dt_grid_destroy()` 释放。
@@ -50,6 +50,25 @@ TIN、GRID 和等高线句柄都可保存可选 CRS WKT。使用 `dt_set_crs_wkt
 
 当前版本对完全水平的平台三角形不输出平台边界；此类平台、断裂线和严格拓扑规则
 将在 CDT/等高线增强阶段处理。
+
+## 等高线反向生成 TIN/GRID
+
+`dt_tin_from_contours()` 把等高线折点作为高程样本，原子替换调用方提供的普通
+TIN。`dt_grid_from_contours()` 使用同一采样规则构造临时 TIN，再按
+`dt_tin_to_grid_options` 插值 GRID。两者都以每条线的 `elevation` 为权威 Z，
+不会信任点数组中可能不一致的 Z。
+
+`dt_contours_to_tin_options` 控制采样：
+
+- `maximum_segment_length == 0`：只使用原折点；正值会沿每段等距加点，保证采样
+  段长不超过该值；
+- `merge_tolerance == 0`：只合并完全相同 XY；正值会合并容差内且高程一致的点；
+- 相同或容差内 XY 出现冲突高程时返回 `DT_E_CORRUPTED_DATA`；样本不足或全部共线
+  时返回 `DT_E_EMPTY`。
+
+反向转换并非数学逆运算：等高线之间和高低极值处的信息已经丢失，只能由采样点
+恢复分片线性近似表面。输出是普通 Delaunay，原等高线段不一定成为三角网边；需要
+硬边、外边界或孔洞时，应把折线作为约束加入 `dt_cdt_handle`。
 
 ## 异步任务
 
@@ -85,6 +104,8 @@ dt_task_destroy(task);
   分块光栅化；
 - 等高线生成不复制完整 GRID 三角面集，TIN 等高线也通过两次流式遍历三角形；
 - 等高线线段及最终折线仍需驻留内存，后续将增加瓦片输出游标；
+- 等高线反向转换的内存与加密后的唯一 XY 样本数近似线性；调用方应根据点数设置
+  `maximum_segment_length`，避免过密采样；
 - 单个 GRID 当前限制为十亿节点，实际应用还应根据 16GB 内存主动设置更低上限。
 
 ## 资源释放对照

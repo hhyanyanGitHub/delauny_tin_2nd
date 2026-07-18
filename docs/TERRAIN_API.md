@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.22 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.23 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -33,6 +33,78 @@ TIN、GRID 和等高线句柄都可保存可选 CRS WKT。使用 `dt_set_crs_wkt
 节点可能共圆，因此不承诺使用哪条单元对角线。包含 NoData 时默认返回
 `DT_E_UNSUPPORTED`，原因是普通 Delaunay 会跨越空洞。只有调用方接受该语义时，
 才能设置 `DT_GRID_TO_TIN_ALLOW_NODATA_BRIDGING`。边界和孔洞将在 CDT 阶段解决。
+
+## 现状面—设计面双 GRID 土方
+
+`dt_grid_compare_earthwork()` 比较两个节点对齐的 GRID：
+
+```cpp
+dt_grid_earthwork_options options{};
+options.struct_size = sizeof(options);
+options.flags = DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID;
+options.worker_count = 0;   // 自动，最多 32
+options.tile_row_count = 0; // 默认 64 个单元行
+
+dt_grid_earthwork_result result{};
+dt_grid_handle difference = nullptr;
+dt_status status = dt_grid_compare_earthwork(
+    existing, design, &options, &result, &difference);
+if (status == DT_OK) {
+    // result.cut_volume / fill_volume / net_volume
+    dt_grid_destroy(difference);
+}
+```
+
+输入约束：
+
+- `width/height` 必须相同且至少为 2×2；
+- 六参数仿射变换按相对 `1e-12` 容差一致，CRS WKT 必须完全一致；库不在分析时
+  重采样或重投影；
+- `existing_z_factor/design_z_factor` 的零值均表示 1.0，非零值必须有限且大于零；
+- `worker_count=0` 自动、`1` 串行、显式最大 64；`tile_row_count=0` 表示 64 行；
+- 未知标志、过大块高、几何或 CRS 不兼容返回 `DT_E_INVALID_ARGUMENT`。
+
+每个单元沿左上—右下固定对角线分成两片线性三角面。高差定义为经过各自
+z-factor 后的 `existing-design`：正高差体积为挖方，负高差绝对体积为填方，
+`net_volume=cut_volume-fill_volume`。若三角形跨越零高差，库解析计算两条边上的
+零点并分别积分正负子多边形，因此结果不依赖抽样密度。世界平面面积使用完整仿射
+行列式，旋转或错切 GRID 无需特殊处理。
+
+`dt_grid_earthwork_result` 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `cell_count` | 全部四节点单元数 |
+| `valid_triangle_count/skipped_triangle_count` | 参与或因 NoData 跳过的半单元数 |
+| `total_plan_area/valid_plan_area/coverage_ratio` | 全域面积、有效积分面积及覆盖率 |
+| `cut_volume/fill_volume/net_volume` | 挖方、填方与挖减填净方 |
+| `minimum/maximum/mean_difference` | 有效区域高差范围及面积加权均值 |
+| `rmse_difference` | 面积加权高差均方根 |
+
+默认只要单元四对节点之一无效就跳过两片三角形，避免沿对角线产生半单元碎片。
+设置 `DT_GRID_EARTHWORK_ALLOW_PARTIAL_CELLS` 后改为逐三角形检查，可保留三个角点
+都有效的半单元。无有效面积时覆盖率和体积为 0，高差统计为 NaN。
+
+`DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID` 请求节点级高差 GRID，其尺寸、仿射与
+CRS 继承现状面，任一输入节点无效时输出 NoData。同步调用必须同时传入
+`output_difference_grid`；成功句柄归调用方并由 `dt_grid_destroy()` 释放。未设置该
+标志时不会分配第二幅完整 GRID。
+
+异步入口及结果取得方式：
+
+```cpp
+dt_task_handle task = nullptr;
+dt_grid_compare_earthwork_async(existing, design, &options, &task);
+// wait / progress / cancel
+dt_grid_earthwork_result result{};
+dt_grid_handle difference = nullptr;
+dt_task_get_earthwork_result(task, &result, &difference);
+dt_task_destroy(task);
+```
+
+任务结果类型为 `DT_TASK_RESULT_EARTHWORK`。任务持有两个源 GRID；取消或失败时不
+发布统计或半成品高差 GRID。结果 getter 的高差输出参数可为 null；非空句柄仍归
+调用方所有。
 
 ## 等高线
 

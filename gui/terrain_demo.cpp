@@ -100,7 +100,13 @@ enum CommandId {
     ID_TERRAIN_CANCEL,
     ID_TERRAIN_SHOW_ELEVATION,
     ID_TERRAIN_EXPORT_GRID,
-    ID_TERRAIN_EXPORT_GEOTIFF
+    ID_TERRAIN_EXPORT_GEOTIFF,
+    ID_EARTHWORK_LOAD_DESIGN,
+    ID_EARTHWORK_LOAD_DESIGN_GDAL,
+    ID_EARTHWORK_OFFSET_DESIGN,
+    ID_EARTHWORK_RUN,
+    ID_EARTHWORK_EXPORT,
+    ID_EARTHWORK_CLEAR
 };
 
 enum class Mode {
@@ -121,7 +127,7 @@ enum class Mode {
 enum class ViewMode { Map2D, Terrain3D };
 enum class Drag3D { None, Orbit, Pan };
 enum class ProfileSource { None, Cdt, Tin, Grid };
-enum class GridTheme { Elevation, Slope, Aspect, Hillshade };
+enum class GridTheme { Elevation, Slope, Aspect, Hillshade, Difference };
 
 struct DoublePromptState {
     HWND edit = nullptr;
@@ -332,6 +338,7 @@ public:
         dt_cdt_destroy(cdt_);
         dt_contours_destroy(contours_);
         dt_grid_destroy(terrain_grid_);
+        dt_grid_destroy(design_grid_);
         dt_grid_destroy(grid_);
         dt_destroy(mesh_);
     }
@@ -500,6 +507,7 @@ private:
     dt_cdt_handle cdt_ = nullptr;
     dt_grid_handle grid_ = nullptr;
     dt_grid_handle terrain_grid_ = nullptr;
+    dt_grid_handle design_grid_ = nullptr;
     dt_contour_handle contours_ = nullptr;
     Mode mode_ = Mode::Query;
     ViewMode view_mode_ = ViewMode::Map2D;
@@ -561,6 +569,8 @@ private:
     double terrain_sun_altitude_ = 45.0;
     uint32_t terrain_worker_count_ = 0;
     uint32_t terrain_tile_rows_ = 0;
+    dt_grid_earthwork_result earthwork_result_{};
+    bool earthwork_result_valid_ = false;
     dt_contour_info contour_info_{};
     HWND view_button_ = nullptr;
     HWND exaggeration_button_ = nullptr;
@@ -726,6 +736,21 @@ private:
         AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_CLEAR,
                     L"清除面积/土方量测");
         AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_LOAD_DESIGN,
+                    L"加载设计面 DGRID…");
+        AppendMenuW(analysis_menu,
+                    MF_STRING | (gdal_gtiff_available_ ? MF_ENABLED : MF_GRAYED),
+                    ID_EARTHWORK_LOAD_DESIGN_GDAL,
+                    L"加载设计面 GeoTIFF/COG…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_OFFSET_DESIGN,
+                    L"从现状 GRID 创建偏移设计面…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_RUN,
+                    L"计算现状面—设计面挖填方");
+        AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_EXPORT,
+                    L"导出双表面土方摘要 CSV…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_CLEAR,
+                    L"清除设计面与双表面结果");
+        AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(analysis_menu, MF_STRING, ID_SLOPE_MODE,
                     L"坡度/坡向分析（单击）");
         AppendMenuW(analysis_menu, MF_STRING, ID_SLOPE_CLEAR,
@@ -782,7 +807,9 @@ private:
                                               ? L"GRID 坡向专题"
                                               : grid_theme_ == GridTheme::Hillshade
                                                     ? L"GRID 阴影地形"
-                                                    : L"GRID 高程着色";
+                                                    : grid_theme_ == GridTheme::Difference
+                                                          ? L"GRID 现状-设计高差"
+                                                          : L"GRID 高程着色";
         ModifyMenuW(layer_menu_, ID_LAYER_GRID,
                     MF_BYCOMMAND | MF_STRING, ID_LAYER_GRID, grid_label);
         CheckMenuItem(layer_menu_, ID_LAYER_TIN,
@@ -860,6 +887,10 @@ private:
         clear_analysis_for_source(ProfileSource::Grid);
         dt_grid_destroy(terrain_grid_);
         terrain_grid_ = nullptr;
+        dt_grid_destroy(design_grid_);
+        design_grid_ = nullptr;
+        earthwork_result_ = {};
+        earthwork_result_valid_ = false;
         grid_theme_ = GridTheme::Elevation;
         dt_grid_destroy(grid_);
         grid_ = nullptr;
@@ -2390,6 +2421,17 @@ private:
         return b | (g << 8U) | (r << 16U);
     }
 
+    double earthwork_difference_scale() const {
+        if (!earthwork_result_valid_ ||
+            !std::isfinite(earthwork_result_.minimum_difference) ||
+            !std::isfinite(earthwork_result_.maximum_difference)) {
+            return 1.0;
+        }
+        return std::max(
+            1e-12, std::max(std::abs(earthwork_result_.minimum_difference),
+                            std::abs(earthwork_result_.maximum_difference)));
+    }
+
     uint32_t terrain_pixel(double value) const {
         if (grid_theme_ == GridTheme::Slope) return slope_pixel(value);
         if (grid_theme_ == GridTheme::Aspect) return aspect_pixel(value);
@@ -2397,6 +2439,23 @@ private:
             const uint32_t gray = static_cast<uint32_t>(std::lround(
                 std::clamp(value, 0.0, 255.0)));
             return gray | (gray << 8U) | (gray << 16U);
+        }
+        if (grid_theme_ == GridTheme::Difference) {
+            const double scale = earthwork_difference_scale();
+            const double ratio =
+                std::clamp(std::abs(value) / scale, 0.0, 1.0);
+            const std::array<int, 3> neutral{245, 245, 245};
+            const std::array<int, 3> end = value >= 0.0
+                ? std::array<int, 3>{210, 45, 45}
+                : std::array<int, 3>{49, 110, 189};
+            const auto channel = [&](size_t index) {
+                return static_cast<uint32_t>(std::lround(
+                    neutral[index] * (1.0 - ratio) + end[index] * ratio));
+            };
+            const uint32_t red = channel(0);
+            const uint32_t green = channel(1);
+            const uint32_t blue = channel(2);
+            return blue | (green << 8U) | (red << 16U);
         }
         return grid_pixel((value - grid_zmin_) / (grid_zmax_ - grid_zmin_));
     }
@@ -2522,7 +2581,9 @@ private:
                                    ? L"坡度（°）  0 — 60+"
                                    : grid_theme_ == GridTheme::Aspect
                                          ? L"坡向（°）  北→东→南→西"
-                                         : L"阴影值  0 — 255";
+                                         : grid_theme_ == GridTheme::Difference
+                                               ? L"高差  蓝=填  白=0  红=挖"
+                                               : L"阴影值  0 — 255";
         DrawTextW(dc, label, -1, &title, DT_LEFT | DT_SINGLELINE);
         const int left = panel.left + 8;
         const int top = panel.top + 31;
@@ -2534,8 +2595,11 @@ private:
                                  ? slope_pixel(ratio * 60.0)
                                  : grid_theme_ == GridTheme::Aspect
                                        ? aspect_pixel(ratio * 360.0)
-                                       : static_cast<uint32_t>(ratio * 255.0) *
-                                             0x00010101U;
+                                       : grid_theme_ == GridTheme::Difference
+                                             ? terrain_pixel((ratio * 2.0 - 1.0) *
+                                                   earthwork_difference_scale())
+                                             : static_cast<uint32_t>(ratio * 255.0) *
+                                                   0x00010101U;
             HPEN pen = CreatePen(PS_SOLID, 1, pixel_colorref(pixel));
             const auto old = SelectObject(dc, pen);
             MoveToEx(dc, left + i, top, nullptr);
@@ -3997,6 +4061,337 @@ private:
         action_text_ = text.str();
     }
 
+    std::string grid_crs_wkt(dt_grid_handle grid) const {
+        size_t required = 0;
+        if (!grid || dt_grid_get_crs_wkt(grid, nullptr, 0, &required) != DT_OK ||
+            required <= 1) {
+            return {};
+        }
+        std::vector<char> buffer(required);
+        if (dt_grid_get_crs_wkt(grid, buffer.data(), buffer.size(), nullptr) !=
+            DT_OK) {
+            return {};
+        }
+        return buffer.data();
+    }
+
+    bool earthwork_grids_compatible(dt_grid_handle design,
+                                    std::wstring& reason) const {
+        dt_grid_info existing_info{};
+        dt_grid_info design_info{};
+        existing_info.struct_size = sizeof(existing_info);
+        design_info.struct_size = sizeof(design_info);
+        if (!grid_ || !design ||
+            dt_grid_get_info(grid_, &existing_info) != DT_OK ||
+            dt_grid_get_info(design, &design_info) != DT_OK) {
+            reason = L"无法读取 GRID 元数据";
+            return false;
+        }
+        if (existing_info.width != design_info.width ||
+            existing_info.height != design_info.height) {
+            reason = L"行列数不一致";
+            return false;
+        }
+        for (int i = 0; i < 6; ++i) {
+            const double a = existing_info.geo_transform[i];
+            const double b = design_info.geo_transform[i];
+            if (std::abs(a - b) >
+                1e-12 * std::max({1.0, std::abs(a), std::abs(b)})) {
+                reason = L"六参数仿射变换不一致";
+                return false;
+            }
+        }
+        if (grid_crs_wkt(grid_) != grid_crs_wkt(design)) {
+            reason = L"坐标参考系不一致";
+            return false;
+        }
+        return true;
+    }
+
+    void clear_earthwork_output(bool clear_design) {
+        if (grid_theme_ == GridTheme::Difference) {
+            dt_grid_destroy(terrain_grid_);
+            terrain_grid_ = nullptr;
+            grid_theme_ = GridTheme::Elevation;
+            refresh_grid_cache();
+        }
+        earthwork_result_ = {};
+        earthwork_result_valid_ = false;
+        if (clear_design) {
+            dt_grid_destroy(design_grid_);
+            design_grid_ = nullptr;
+        }
+        update_layer_menu();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void load_earthwork_design(bool gdal) {
+        if (!grid_) {
+            action_text_ = L"加载设计面失败：请先生成或导入现状 GRID";
+            return;
+        }
+        if (gdal && !gdal_gtiff_available_) {
+            action_text_ = L"当前构建未启用 GDAL GeoTIFF 驱动";
+            return;
+        }
+        const auto file = gdal
+            ? choose_file(false, L"design.tif",
+                  L"GeoTIFF/COG (*.tif;*.tiff)\0*.tif;*.tiff\0所有文件 (*.*)\0*.*\0",
+                  L"tif")
+            : choose_file(false, L"design.dgrid",
+                  L"DGRID 规则网格 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
+                  L"dgrid");
+        if (file.empty()) return;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        dt_status status = DT_OK;
+        if (gdal) {
+            dt_gdal_raster_load_options options{};
+            options.struct_size = sizeof(options);
+            options.band_index = 1;
+            status = dt_grid_load_gdal_raster(
+                wide_to_utf8(file.c_str()).c_str(), &options, &output);
+        } else {
+            status = dt_grid_load_text(wide_to_utf8(file.c_str()).c_str(),
+                                       &output);
+        }
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"设计面加载失败：" + last_error_text();
+            return;
+        }
+        std::wstring reason;
+        if (!earthwork_grids_compatible(output, reason)) {
+            dt_grid_destroy(output);
+            action_text_ = L"设计面与现状面不兼容：" + reason;
+            return;
+        }
+        clear_earthwork_output(true);
+        design_grid_ = output;
+        dt_grid_info info{};
+        info.struct_size = sizeof(info);
+        dt_grid_get_info(design_grid_, &info);
+        std::wostringstream text;
+        text << L"已加载设计面：" << info.width << L"×" << info.height
+             << L"，有效节点 " << info.valid_value_count
+             << L"；可执行双表面挖填方分析";
+        action_text_ = text.str();
+    }
+
+    void create_offset_design_grid() {
+        if (!grid_ || !refresh_grid_cache()) {
+            action_text_ = L"创建设计面失败：请先生成或导入现状 GRID";
+            return;
+        }
+        double offset = 5.0;
+        if (!prompt_double(hwnd_, L"创建偏移设计面",
+                           L"设计面相对现状面的高程偏移（正值表示填高）：",
+                           offset)) {
+            return;
+        }
+        dt_grid_create_options create{};
+        create.struct_size = sizeof(create);
+        create.flags = grid_info_.flags;
+        create.width = grid_info_.width;
+        create.height = grid_info_.height;
+        std::copy(std::begin(grid_info_.geo_transform),
+                  std::end(grid_info_.geo_transform), create.geo_transform);
+        create.nodata_value = grid_info_.nodata_value;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        dt_status status = dt_grid_create(&create, &output);
+        std::vector<double> row;
+        try {
+            row.resize(static_cast<size_t>(grid_info_.width));
+        } catch (...) {
+            status = DT_E_OUT_OF_MEMORY;
+        }
+        for (uint64_t y = 0; status == DT_OK && y < grid_info_.height; ++y) {
+            status = dt_grid_read_window(grid_, 0, y, grid_info_.width, 1,
+                                         row.data(), grid_info_.width);
+            if (status != DT_OK) break;
+            for (double& value : row) {
+                if (!is_grid_nodata(grid_info_, value)) value += offset;
+            }
+            status = dt_grid_write_window(output, 0, y, grid_info_.width, 1,
+                                          row.data(), grid_info_.width);
+        }
+        if (status == DT_OK) {
+            const std::string crs = grid_crs_wkt(grid_);
+            status = dt_grid_set_crs_wkt(output, crs.c_str());
+        }
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            dt_grid_destroy(output);
+            action_text_ = L"创建偏移设计面失败：" + last_error_text();
+            return;
+        }
+        clear_earthwork_output(true);
+        design_grid_ = output;
+        std::wostringstream text;
+        text << L"已从现状 GRID 创建设计面，高程偏移 "
+             << std::setprecision(8) << offset
+             << L"；正偏移将在分析中计为填方";
+        action_text_ = text.str();
+    }
+
+    void run_earthwork_analysis() {
+        if (!grid_ || !design_grid_) {
+            action_text_ = L"双表面分析失败：需要现状 GRID 和设计面 GRID";
+            return;
+        }
+        std::wstring reason;
+        if (!earthwork_grids_compatible(design_grid_, reason)) {
+            action_text_ = L"双表面分析失败：" + reason;
+            return;
+        }
+        dt_grid_earthwork_options options{};
+        options.struct_size = sizeof(options);
+        options.flags = DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID;
+        options.worker_count = terrain_worker_count_;
+        options.tile_row_count = terrain_tile_rows_;
+        options.existing_z_factor = terrain_z_factor_;
+        options.design_z_factor = terrain_z_factor_;
+        options.output_nodata_value = -9999.0;
+        dt_task_handle task = nullptr;
+        const dt_status start_status = dt_grid_compare_earthwork_async(
+            grid_, design_grid_, &options, &task);
+        if (start_status != DT_OK) {
+            action_text_ = L"双表面分析启动失败：" + last_error_text();
+            return;
+        }
+        terrain_task_ = task;
+        terrain_task_running_ = true;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        int32_t completed = 0;
+        int quit_code = 0;
+        bool saw_quit = false;
+        dt_task_info task_info{};
+        while (!completed) {
+            if (dt_task_wait(task, 25, &completed) != DT_OK) {
+                dt_task_request_cancel(task);
+                break;
+            }
+            if (dt_task_get_info(task, &task_info) == DT_OK) {
+                const int percent = static_cast<int>(std::clamp(
+                    task_info.progress * 100.0, 0.0, 100.0));
+                std::wostringstream status;
+                status << L"正在计算双表面挖填方：" << percent
+                       << L"%（Esc 可取消）";
+                if (task_info.cancellation_requested) status << L"，正在取消…";
+                action_text_ = status.str();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                UpdateWindow(hwnd_);
+            }
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) {
+                    saw_quit = true;
+                    quit_code = static_cast<int>(message.wParam);
+                    dt_task_request_cancel(task);
+                    continue;
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if (!completed) dt_task_wait(task, UINT32_MAX, &completed);
+        dt_task_get_info(task, &task_info);
+        dt_grid_earthwork_result result{};
+        dt_grid_handle difference = nullptr;
+        dt_status result_status = task_info.result_status;
+        if (task_info.state == DT_TASK_SUCCEEDED) {
+            result_status = dt_task_get_earthwork_result(
+                task, &result, &difference);
+        }
+        std::wstring task_error;
+        if (task_info.state == DT_TASK_FAILED) {
+            char buffer[1024]{};
+            if (dt_task_get_error(task, buffer, sizeof(buffer), nullptr) == DT_OK)
+                task_error = utf8_to_wide(buffer);
+        }
+        terrain_task_running_ = false;
+        terrain_task_ = nullptr;
+        dt_task_destroy(task);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (task_info.state == DT_TASK_CANCELLED) {
+            action_text_ = L"双表面挖填方计算已取消";
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
+            return;
+        }
+        if (result_status != DT_OK || !difference) {
+            dt_grid_destroy(difference);
+            action_text_ = L"双表面分析失败：" +
+                           (task_error.empty() ? last_error_text() : task_error);
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
+            return;
+        }
+        dt_grid_destroy(terrain_grid_);
+        terrain_grid_ = difference;
+        earthwork_result_ = result;
+        earthwork_result_valid_ = true;
+        grid_theme_ = GridTheme::Difference;
+        show_grid_ = true;
+        refresh_terrain_cache();
+        update_layer_menu();
+        enter_2d_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << std::fixed << std::setprecision(3)
+             << L"双表面土方完成：挖方 " << result.cut_volume
+             << L"，填方 " << result.fill_volume
+             << L"，净方(挖-填) " << result.net_volume
+             << L"，有效覆盖 " << result.coverage_ratio * 100.0
+             << L"%，耗时 " << std::setprecision(1) << ms << L" ms";
+        action_text_ = text.str();
+        if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+        if (saw_quit) PostQuitMessage(quit_code);
+    }
+
+    void export_earthwork_csv() {
+        if (!earthwork_result_valid_) {
+            action_text_ = L"没有可导出的双表面土方结果";
+            return;
+        }
+        const auto file = choose_file(
+            true, L"earthwork_summary.csv",
+            L"CSV 土方摘要 (*.csv)\0*.csv\0所有文件 (*.*)\0*.*\0", L"csv");
+        if (file.empty()) return;
+        std::ostringstream output;
+        output << std::setprecision(17)
+               << "metric,value\r\n"
+               << "cell_count," << earthwork_result_.cell_count << "\r\n"
+               << "valid_triangle_count," << earthwork_result_.valid_triangle_count << "\r\n"
+               << "skipped_triangle_count," << earthwork_result_.skipped_triangle_count << "\r\n"
+               << "total_plan_area," << earthwork_result_.total_plan_area << "\r\n"
+               << "valid_plan_area," << earthwork_result_.valid_plan_area << "\r\n"
+               << "coverage_ratio," << earthwork_result_.coverage_ratio << "\r\n"
+               << "cut_volume," << earthwork_result_.cut_volume << "\r\n"
+               << "fill_volume," << earthwork_result_.fill_volume << "\r\n"
+               << "net_volume," << earthwork_result_.net_volume << "\r\n"
+               << "minimum_difference," << earthwork_result_.minimum_difference << "\r\n"
+               << "maximum_difference," << earthwork_result_.maximum_difference << "\r\n"
+               << "mean_difference," << earthwork_result_.mean_difference << "\r\n"
+               << "rmse_difference," << earthwork_result_.rmse_difference << "\r\n";
+        const std::string bytes = output.str();
+        FILE* stream = _wfopen(file.c_str(), L"wb");
+        if (!stream) {
+            action_text_ = L"土方摘要导出失败：无法创建文件";
+            return;
+        }
+        const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), stream);
+        const int close_status = std::fclose(stream);
+        action_text_ = written == bytes.size() && close_status == 0
+            ? L"已导出双表面土方摘要：" + file
+            : L"土方摘要导出失败：文件写入不完整";
+    }
+
     void derive_terrain_grid(uint32_t kind) {
         if (!grid_) {
             dt_statistics statistics{};
@@ -4636,6 +5031,15 @@ private:
         case ID_MEASURE_CLEAR:
             clear_measurement();
             action_text_ = L"面积/土方量测已清除";
+            break;
+        case ID_EARTHWORK_LOAD_DESIGN: load_earthwork_design(false); break;
+        case ID_EARTHWORK_LOAD_DESIGN_GDAL: load_earthwork_design(true); break;
+        case ID_EARTHWORK_OFFSET_DESIGN: create_offset_design_grid(); break;
+        case ID_EARTHWORK_RUN: run_earthwork_analysis(); break;
+        case ID_EARTHWORK_EXPORT: export_earthwork_csv(); break;
+        case ID_EARTHWORK_CLEAR:
+            clear_earthwork_output(true);
+            action_text_ = L"设计面与双表面土方结果已清除";
             break;
         case ID_SLOPE_MODE:
             enter_2d_view();

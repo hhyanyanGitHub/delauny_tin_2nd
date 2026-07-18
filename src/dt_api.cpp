@@ -62,6 +62,8 @@ struct dt_task_t {
     std::string error;
     std::shared_ptr<dt::Grid> grid_result;
     std::shared_ptr<dt::ContourSet> contour_result;
+    dt_grid_earthwork_result earthwork_result{};
+    bool earthwork_result_ready = false;
 };
 
 namespace {
@@ -460,6 +462,37 @@ dt_status DT_CALL dt_grid_derive_terrain(
     });
 }
 
+dt_status DT_CALL dt_grid_compare_earthwork(
+    dt_grid_handle existing_grid, dt_grid_handle design_grid,
+    const dt_grid_earthwork_options* options,
+    dt_grid_earthwork_result* output_result,
+    dt_grid_handle* output_difference_grid) {
+    if (output_result) *output_result = {};
+    if (output_difference_grid) *output_difference_grid = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_earthwork_options");
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        if ((options->flags &
+             DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID) != 0 &&
+            !output_difference_grid) {
+            throw dt::Exception(
+                DT_E_INVALID_ARGUMENT,
+                "output_difference_grid is required by earthwork flags");
+        }
+        auto computation = dt::grid_compare_earthwork(
+            require_grid(existing_grid), require_grid(design_grid), *options);
+        *output_result = computation.result;
+        if (computation.difference_grid) {
+            auto result = std::make_unique<dt_grid_t>();
+            result->grid = std::move(computation.difference_grid);
+            *output_difference_grid = result.release();
+        }
+    });
+}
+
 dt_status DT_CALL dt_grid_save_text(dt_grid_handle grid,
                                     const char* utf8_file_name) {
     return guarded([&] { require_grid(grid).save_text(utf8_file_name); });
@@ -698,6 +731,33 @@ dt_status DT_CALL dt_grid_derive_terrain_async(
     });
 }
 
+dt_status DT_CALL dt_grid_compare_earthwork_async(
+    dt_grid_handle existing_grid, dt_grid_handle design_grid,
+    const dt_grid_earthwork_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_earthwork_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto existing = require_grid_shared(existing_grid);
+        const auto design = require_grid_shared(design_grid);
+        const auto copied_options = *options;
+        *output_task = start_task(
+            DT_TASK_RESULT_EARTHWORK,
+            [existing, design, copied_options](dt_task_t& task) {
+                auto computation = dt::grid_compare_earthwork(
+                    *existing, *design, copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+                task.earthwork_result = computation.result;
+                task.earthwork_result_ready = true;
+                task.grid_result = std::move(computation.difference_grid);
+            });
+    });
+}
+
 dt_status DT_CALL dt_tin_from_grid_async(
     dt_grid_handle grid, const dt_grid_to_tin_options* options,
     dt_handle output_tin, dt_task_handle* output_task) {
@@ -885,6 +945,32 @@ dt_status DT_CALL dt_task_get_contour_result(
         auto result = std::make_unique<dt_contour_set_t>();
         result->contours = required.contour_result;
         *output_contours = result.release();
+    });
+}
+
+dt_status DT_CALL dt_task_get_earthwork_result(
+    dt_task_handle task, dt_grid_earthwork_result* output_result,
+    dt_grid_handle* output_difference_grid) {
+    if (output_result) *output_result = {};
+    if (output_difference_grid) *output_difference_grid = nullptr;
+    return guarded([&] {
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        if (required.state != DT_TASK_SUCCEEDED ||
+            !required.earthwork_result_ready) {
+            throw dt::Exception(DT_E_NOT_FOUND,
+                                "task has no completed earthwork result");
+        }
+        *output_result = required.earthwork_result;
+        if (output_difference_grid && required.grid_result) {
+            auto result = std::make_unique<dt_grid_t>();
+            result->grid = required.grid_result;
+            *output_difference_grid = result.release();
+        }
     });
 }
 

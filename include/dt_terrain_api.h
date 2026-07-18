@@ -27,6 +27,15 @@ enum dt_grid_terrain_kind {
     DT_GRID_TERRAIN_HILLSHADE = 3
 };
 
+enum dt_grid_earthwork_flags {
+    /* Creates a node-aligned GRID containing existing-design elevation
+       differences. The caller owns the returned GRID handle. */
+    DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID = 1u << 0,
+    /* By default both triangles of a cell are skipped when any of its four
+       corner pairs is NoData. This flag evaluates each triangle separately. */
+    DT_GRID_EARTHWORK_ALLOW_PARTIAL_CELLS = 1u << 1
+};
+
 typedef struct dt_grid_create_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -89,6 +98,41 @@ typedef struct dt_grid_terrain_options {
     uint32_t tile_row_count;
     uint64_t reserved2[3];
 } dt_grid_terrain_options;
+
+typedef struct dt_grid_earthwork_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Zero selects an implementation-defined automatic count. One forces
+       single-thread execution. Values above 64 are rejected. */
+    uint32_t worker_count;
+    /* Cell rows claimed by one worker at a time. Zero selects 64 rows. */
+    uint32_t tile_row_count;
+    /* Zero selects 1.0. Otherwise both factors must be finite and positive. */
+    double existing_z_factor;
+    double design_z_factor;
+    /* Used only for the optional difference GRID. Zero selects NaN. */
+    double output_nodata_value;
+    uint64_t reserved[3];
+} dt_grid_earthwork_options;
+
+typedef struct dt_grid_earthwork_result {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t cell_count;
+    uint64_t valid_triangle_count;
+    uint64_t skipped_triangle_count;
+    double total_plan_area;
+    double valid_plan_area;
+    double coverage_ratio;
+    /* Positive existing-design material is cut; negative material is fill. */
+    double cut_volume;
+    double fill_volume;
+    double net_volume;
+    double minimum_difference;
+    double maximum_difference;
+    double mean_difference;
+    double rmse_difference;
+} dt_grid_earthwork_result;
 
 typedef struct dt_contours_to_tin_options {
     uint32_t struct_size;
@@ -175,6 +219,17 @@ DT_API dt_status DT_CALL dt_grid_analyze_surface_xy(
 DT_API dt_status DT_CALL dt_grid_derive_terrain(
     dt_grid_handle source_grid, const dt_grid_terrain_options* options,
     dt_grid_handle* output_grid);
+
+/* Integrates the piecewise-linear elevation difference of two node-aligned
+   GRID surfaces. Dimensions, affine transform and CRS must match. Crossing
+   the zero-difference line is clipped analytically, so cut/fill volumes do
+   not depend on a sampling budget. output_difference_grid may be null unless
+   DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID is requested. */
+DT_API dt_status DT_CALL dt_grid_compare_earthwork(
+    dt_grid_handle existing_grid, dt_grid_handle design_grid,
+    const dt_grid_earthwork_options* options,
+    dt_grid_earthwork_result* output_result,
+    dt_grid_handle* output_difference_grid);
 
 /* DGRID 1 is a portable UTF-8 text format intended for tests and exchange. */
 DT_API dt_status DT_CALL dt_grid_save_text(

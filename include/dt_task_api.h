@@ -18,7 +18,8 @@ enum dt_task_state {
 enum dt_task_result_kind {
     DT_TASK_RESULT_NONE = 0,
     DT_TASK_RESULT_GRID = 1,
-    DT_TASK_RESULT_CONTOURS = 2
+    DT_TASK_RESULT_CONTOURS = 2,
+    DT_TASK_RESULT_EARTHWORK = 3
 };
 
 typedef struct dt_task_info {
@@ -39,6 +40,9 @@ DT_API dt_status DT_CALL dt_grid_from_tin_async(
 DT_API dt_status DT_CALL dt_grid_derive_terrain_async(
     dt_grid_handle source_grid, const dt_grid_terrain_options* options,
     dt_task_handle* output_task);
+DT_API dt_status DT_CALL dt_grid_compare_earthwork_async(
+    dt_grid_handle existing_grid, dt_grid_handle design_grid,
+    const dt_grid_earthwork_options* options, dt_task_handle* output_task);
 DT_API dt_status DT_CALL dt_tin_from_grid_async(
     dt_grid_handle grid, const dt_grid_to_tin_options* options,
     dt_handle output_tin, dt_task_handle* output_task);
@@ -61,6 +65,11 @@ DT_API dt_status DT_CALL dt_task_get_grid_result(
     dt_task_handle task, dt_grid_handle* output_grid);
 DT_API dt_status DT_CALL dt_task_get_contour_result(
     dt_task_handle task, dt_contour_handle* output_contours);
+/* output_difference_grid is optional. It is non-null only when requested in
+   the earthwork options and is owned by the caller. */
+DT_API dt_status DT_CALL dt_task_get_earthwork_result(
+    dt_task_handle task, dt_grid_earthwork_result* output_result,
+    dt_grid_handle* output_difference_grid);
 DT_API dt_status DT_CALL dt_task_get_error(
     dt_task_handle task, char* buffer, size_t buffer_size,
     size_t* required_size);

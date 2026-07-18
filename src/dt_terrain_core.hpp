@@ -14,6 +14,7 @@
 namespace dt {
 
 class CdtContext;
+struct GridEarthworkComputation;
 
 using ProgressCallback = std::function<void(double)>;
 using CancelCallback = std::function<bool()>;
@@ -46,6 +47,10 @@ private:
     friend std::unique_ptr<Grid> grid_derive_terrain(
         const Grid& source, const dt_grid_terrain_options& options,
         const ProgressCallback& progress, const CancelCallback& cancelled);
+    friend GridEarthworkComputation grid_compare_earthwork(
+        const Grid& existing, const Grid& design,
+        const dt_grid_earthwork_options& options,
+        const ProgressCallback& progress, const CancelCallback& cancelled);
 
     dt_grid_create_options options_{};
     std::vector<double> values_;
@@ -55,6 +60,11 @@ private:
     size_t offset(uint64_t column, uint64_t row) const;
     void validate_window(uint64_t column, uint64_t row, uint64_t width,
                          uint64_t height, uint64_t stride) const;
+};
+
+struct GridEarthworkComputation {
+    dt_grid_earthwork_result result{};
+    std::unique_ptr<Grid> difference_grid;
 };
 
 struct ContourLine {
@@ -83,6 +93,11 @@ std::unique_ptr<Grid> grid_from_cdt(CdtContext& cdt,
                                     const CancelCallback& cancelled = {});
 std::unique_ptr<Grid> grid_derive_terrain(
     const Grid& source, const dt_grid_terrain_options& options,
+    const ProgressCallback& progress = {},
+    const CancelCallback& cancelled = {});
+GridEarthworkComputation grid_compare_earthwork(
+    const Grid& existing, const Grid& design,
+    const dt_grid_earthwork_options& options,
     const ProgressCallback& progress = {},
     const CancelCallback& cancelled = {});
 std::vector<dt_point3> points_from_grid(

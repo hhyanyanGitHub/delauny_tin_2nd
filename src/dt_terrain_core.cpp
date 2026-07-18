@@ -707,6 +707,379 @@ std::unique_ptr<Grid> grid_derive_terrain(
     return output;
 }
 
+GridEarthworkComputation grid_compare_earthwork(
+    const Grid& existing, const Grid& design,
+    const dt_grid_earthwork_options& options,
+    const ProgressCallback& progress, const CancelCallback& cancelled) {
+    if (existing.width() < 2 || existing.height() < 2) {
+        throw Exception(DT_E_EMPTY,
+                        "earthwork analysis needs at least two rows and columns");
+    }
+    if (existing.width() != design.width() ||
+        existing.height() != design.height()) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "earthwork GRID dimensions do not match");
+    }
+    const auto nearly_equal = [](double a, double b) {
+        return std::abs(a - b) <=
+               1e-12 * std::max({1.0, std::abs(a), std::abs(b)});
+    };
+    for (int i = 0; i < 6; ++i) {
+        if (!nearly_equal(existing.transform()[i], design.transform()[i])) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "earthwork GRID affine transforms do not match");
+        }
+    }
+    if (existing.crs_wkt() != design.crs_wkt()) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "earthwork GRID coordinate systems do not match");
+    }
+    constexpr uint32_t kKnownFlags =
+        DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID |
+        DT_GRID_EARTHWORK_ALLOW_PARTIAL_CELLS;
+    if ((options.flags & ~kKnownFlags) != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown earthwork analysis flags");
+    }
+    if (options.worker_count > 64) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "earthwork worker_count exceeds 64");
+    }
+    constexpr uint32_t kDefaultTileRows = 64;
+    constexpr uint32_t kMaximumTileRows = 1024U * 1024U;
+    const uint32_t tile_rows = options.tile_row_count == 0
+                                   ? kDefaultTileRows
+                                   : options.tile_row_count;
+    if (tile_rows > kMaximumTileRows) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "earthwork tile_row_count is too large");
+    }
+    const double existing_factor = options.existing_z_factor == 0.0
+                                       ? 1.0
+                                       : options.existing_z_factor;
+    const double design_factor = options.design_z_factor == 0.0
+                                     ? 1.0
+                                     : options.design_z_factor;
+    if (!finite(existing_factor) || existing_factor <= 0.0 ||
+        !finite(design_factor) || design_factor <= 0.0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "earthwork z factors must be positive");
+    }
+    const double output_nodata = options.output_nodata_value == 0.0
+                                     ? std::numeric_limits<double>::quiet_NaN()
+                                     : options.output_nodata_value;
+    if (!(finite(output_nodata) || std::isnan(output_nodata))) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "earthwork output NoData must be finite or NaN");
+    }
+
+    GridEarthworkComputation output{};
+    output.result.struct_size = sizeof(output.result);
+    output.result.flags = options.flags;
+    const uint64_t width = existing.width();
+    const uint64_t height = existing.height();
+    const uint64_t cell_rows = height - 1;
+    const uint64_t cell_columns = width - 1;
+    output.result.cell_count = cell_rows * cell_columns;
+    const double* gt = existing.transform();
+    const double cell_area =
+        std::abs(gt[1] * gt[5] - gt[2] * gt[4]);
+    const double triangle_area = cell_area * 0.5;
+    output.result.total_plan_area =
+        cell_area * static_cast<double>(output.result.cell_count);
+
+    if ((options.flags & DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID) != 0) {
+        dt_grid_create_options create{};
+        create.struct_size = sizeof(create);
+        create.flags = DT_GRID_HAS_NODATA;
+        create.width = width;
+        create.height = height;
+        std::copy(existing.transform(), existing.transform() + 6,
+                  create.geo_transform);
+        create.nodata_value = output_nodata;
+        output.difference_grid = std::make_unique<Grid>(create);
+        output.difference_grid->set_crs_wkt(existing.crs_wkt());
+    }
+
+    struct TileStatistics {
+        uint64_t valid = 0;
+        uint64_t skipped = 0;
+        double cut = 0.0;
+        double fill = 0.0;
+        double net = 0.0;
+        double squared = 0.0;
+        double minimum = std::numeric_limits<double>::infinity();
+        double maximum = -std::numeric_limits<double>::infinity();
+    };
+    const uint64_t tile_count =
+        (cell_rows + static_cast<uint64_t>(tile_rows) - 1U) / tile_rows;
+    std::vector<TileStatistics> tile_statistics(
+        static_cast<size_t>(tile_count));
+    const auto& existing_values = existing.values();
+    const auto& design_values = design.values();
+    const auto node_difference = [&](uint64_t index, double& difference) {
+        const double a = existing_values[static_cast<size_t>(index)];
+        const double b = design_values[static_cast<size_t>(index)];
+        if (!finite(a) || !finite(b) || existing.is_nodata(a) ||
+            design.is_nodata(b)) {
+            return false;
+        }
+        difference = existing_factor * a - design_factor * b;
+        return finite(difference);
+    };
+    const auto accumulate_triangle = [&](const std::array<double, 3>& d,
+                                         TileStatistics& statistics) {
+        ++statistics.valid;
+        statistics.minimum =
+            std::min({statistics.minimum, d[0], d[1], d[2]});
+        statistics.maximum =
+            std::max({statistics.maximum, d[0], d[1], d[2]});
+        const double net = triangle_area * (d[0] + d[1] + d[2]) / 3.0;
+        const double squared = triangle_area / 6.0 *
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] +
+             d[0] * d[1] + d[1] * d[2] + d[2] * d[0]);
+        statistics.net += net;
+        statistics.squared += std::max(0.0, squared);
+        int positive_count = 0;
+        int negative_count = 0;
+        for (double value : d) {
+            if (value > 0.0) ++positive_count;
+            else if (value < 0.0) ++negative_count;
+        }
+        double cut = 0.0;
+        double fill = 0.0;
+        if (negative_count == 0) {
+            cut = std::max(0.0, net);
+        } else if (positive_count == 0) {
+            fill = std::max(0.0, -net);
+        } else if (positive_count == 1) {
+            double positive = 0.0;
+            std::array<double, 2> other{};
+            size_t next = 0;
+            for (double value : d) {
+                if (value > 0.0) positive = value;
+                else other[next++] = value;
+            }
+            const double first = positive / (positive - other[0]);
+            const double second = positive / (positive - other[1]);
+            cut = triangle_area * first * second * positive / 3.0;
+            fill = std::max(0.0, cut - net);
+        } else {
+            double negative = 0.0;
+            std::array<double, 2> other{};
+            size_t next = 0;
+            for (double value : d) {
+                if (value < 0.0) negative = value;
+                else other[next++] = value;
+            }
+            const double first = -negative / (other[0] - negative);
+            const double second = -negative / (other[1] - negative);
+            fill = triangle_area * first * second * (-negative) / 3.0;
+            cut = std::max(0.0, net + fill);
+        }
+        statistics.cut += cut;
+        statistics.fill += fill;
+    };
+
+    std::atomic<uint64_t> completed_rows{0};
+    const bool partial_cells =
+        (options.flags & DT_GRID_EARTHWORK_ALLOW_PARTIAL_CELLS) != 0;
+    const auto process_tile = [&](uint64_t tile_index,
+                                  const std::atomic<bool>* stop_requested) {
+        TileStatistics local{};
+        const uint64_t begin = tile_index * tile_rows;
+        const uint64_t end = std::min<uint64_t>(
+            cell_rows, begin + static_cast<uint64_t>(tile_rows));
+        for (uint64_t row = begin; row < end; ++row) {
+            if (stop_requested) {
+                if (stop_requested->load()) return false;
+            } else {
+                check_cancelled(cancelled);
+            }
+            double* difference_row = output.difference_grid
+                ? output.difference_grid->values_.data() +
+                      static_cast<size_t>(row * width)
+                : nullptr;
+            for (uint64_t column = 0; column < width; ++column) {
+                if (stop_requested && (column & 4095U) == 0U &&
+                    stop_requested->load()) {
+                    return false;
+                }
+                if (difference_row) {
+                    double difference = 0.0;
+                    difference_row[static_cast<size_t>(column)] =
+                        node_difference(row * width + column, difference)
+                            ? difference
+                            : output_nodata;
+                }
+                if (column == cell_columns) continue;
+                const uint64_t top_left = row * width + column;
+                std::array<double, 4> d{};
+                std::array<bool, 4> valid_node{
+                    node_difference(top_left, d[0]),
+                    node_difference(top_left + 1, d[1]),
+                    node_difference(top_left + width, d[2]),
+                    node_difference(top_left + width + 1, d[3])};
+                if (!partial_cells &&
+                    (!valid_node[0] || !valid_node[1] ||
+                     !valid_node[2] || !valid_node[3])) {
+                    local.skipped += 2;
+                    continue;
+                }
+                if (valid_node[0] && valid_node[1] && valid_node[3])
+                    accumulate_triangle({d[0], d[1], d[3]}, local);
+                else
+                    ++local.skipped;
+                if (valid_node[0] && valid_node[3] && valid_node[2])
+                    accumulate_triangle({d[0], d[3], d[2]}, local);
+                else
+                    ++local.skipped;
+            }
+            completed_rows.fetch_add(1);
+        }
+        tile_statistics[static_cast<size_t>(tile_index)] = local;
+        return true;
+    };
+
+    uint32_t worker_count = options.worker_count;
+    if (worker_count == 0) {
+        worker_count = std::thread::hardware_concurrency();
+        if (worker_count == 0) worker_count = 4;
+        worker_count = std::min(worker_count, 32U);
+    }
+    worker_count = static_cast<uint32_t>(std::min<uint64_t>(
+        worker_count, std::max<uint64_t>(1, tile_count)));
+    report_progress(progress, 0.0);
+    if (worker_count == 1) {
+        for (uint64_t tile = 0; tile < tile_count; ++tile) {
+            process_tile(tile, nullptr);
+            report_progress(progress,
+                            static_cast<double>(completed_rows.load()) /
+                                static_cast<double>(cell_rows));
+        }
+    } else {
+        std::atomic<uint64_t> next_tile{0};
+        std::atomic<uint32_t> active_workers{worker_count};
+        std::atomic<bool> stop_requested{false};
+        std::mutex event_mutex;
+        std::condition_variable event;
+        std::mutex error_mutex;
+        std::exception_ptr worker_error;
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        const auto worker = [&] {
+            try {
+                while (!stop_requested.load()) {
+                    const uint64_t tile = next_tile.fetch_add(1);
+                    if (tile >= tile_count) break;
+                    if (!process_tile(tile, &stop_requested)) break;
+                    event.notify_one();
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!worker_error) worker_error = std::current_exception();
+                }
+                stop_requested.store(true);
+            }
+            active_workers.fetch_sub(1);
+            event.notify_one();
+        };
+        try {
+            for (uint32_t i = 0; i < worker_count; ++i)
+                workers.emplace_back(worker);
+        } catch (...) {
+            stop_requested.store(true);
+            for (auto& thread : workers)
+                if (thread.joinable()) thread.join();
+            throw;
+        }
+        bool cancellation_seen = false;
+        std::exception_ptr coordinator_error;
+        try {
+            while (active_workers.load() != 0) {
+                if (cancelled && cancelled()) {
+                    cancellation_seen = true;
+                    stop_requested.store(true);
+                }
+                report_progress(
+                    progress,
+                    static_cast<double>(completed_rows.load()) /
+                        static_cast<double>(cell_rows));
+                std::unique_lock<std::mutex> lock(event_mutex);
+                event.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                    return active_workers.load() == 0;
+                });
+            }
+        } catch (...) {
+            coordinator_error = std::current_exception();
+            stop_requested.store(true);
+        }
+        for (auto& thread : workers)
+            if (thread.joinable()) thread.join();
+        if (coordinator_error) std::rethrow_exception(coordinator_error);
+        if (worker_error) std::rethrow_exception(worker_error);
+        if (cancellation_seen || (cancelled && cancelled())) {
+            throw Exception(DT_E_CANCELLED,
+                            "earthwork operation was cancelled");
+        }
+    }
+
+    if (output.difference_grid) {
+        check_cancelled(cancelled);
+        double* last_row = output.difference_grid->values_.data() +
+                           static_cast<size_t>((height - 1) * width);
+        for (uint64_t column = 0; column < width; ++column) {
+            if ((column & 4095U) == 0U) check_cancelled(cancelled);
+            double difference = 0.0;
+            last_row[static_cast<size_t>(column)] =
+                node_difference((height - 1) * width + column, difference)
+                    ? difference
+                    : output_nodata;
+        }
+        ++output.difference_grid->generation_;
+    }
+    double minimum_difference = std::numeric_limits<double>::infinity();
+    double maximum_difference = -std::numeric_limits<double>::infinity();
+    double squared_difference_integral = 0.0;
+    for (const auto& statistics : tile_statistics) {
+        output.result.valid_triangle_count += statistics.valid;
+        output.result.skipped_triangle_count += statistics.skipped;
+        output.result.cut_volume += statistics.cut;
+        output.result.fill_volume += statistics.fill;
+        output.result.net_volume += statistics.net;
+        squared_difference_integral += statistics.squared;
+        minimum_difference =
+            std::min(minimum_difference, statistics.minimum);
+        maximum_difference =
+            std::max(maximum_difference, statistics.maximum);
+    }
+    output.result.valid_plan_area =
+        triangle_area * static_cast<double>(output.result.valid_triangle_count);
+    output.result.coverage_ratio = output.result.total_plan_area > 0.0
+        ? output.result.valid_plan_area / output.result.total_plan_area
+        : 0.0;
+    if (output.result.valid_plan_area > 0.0) {
+        output.result.minimum_difference = minimum_difference;
+        output.result.maximum_difference = maximum_difference;
+        output.result.mean_difference =
+            output.result.net_volume / output.result.valid_plan_area;
+        output.result.rmse_difference = std::sqrt(
+            squared_difference_integral / output.result.valid_plan_area);
+    } else {
+        output.result.minimum_difference =
+            std::numeric_limits<double>::quiet_NaN();
+        output.result.maximum_difference =
+            std::numeric_limits<double>::quiet_NaN();
+        output.result.mean_difference =
+            std::numeric_limits<double>::quiet_NaN();
+        output.result.rmse_difference =
+            std::numeric_limits<double>::quiet_NaN();
+    }
+    report_progress(progress, 1.0);
+    return output;
+}
+
 void Grid::read_window(uint64_t column, uint64_t row, uint64_t width,
                        uint64_t height, double* output, uint64_t stride) const {
     if (!output) throw Exception(DT_E_INVALID_ARGUMENT, "output_values is null");

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -29,6 +31,65 @@ constexpr uint64_t kMaximumContourLevels = 1000000ULL;
 constexpr uint64_t kMaximumContourLines = 100000000ULL;
 constexpr uint64_t kMaximumContourVertices = 1000000000ULL;
 constexpr uint64_t kMaximumClipVertices = 10000000ULL;
+constexpr size_t kBinaryGridHeaderSize = 65536;
+constexpr size_t kBinaryGridCrsOffset = 256;
+constexpr size_t kBinaryGridChecksumOffset = 192;
+constexpr uint32_t kBinaryGridVersion = 1;
+constexpr uint32_t kBinaryGridEndianMarker = 0x01020304U;
+constexpr char kBinaryGridMagic[8] = {'D', 'G', 'R', 'I', 'D', 'B', '1', '\0'};
+
+template <typename T>
+void header_store(std::array<unsigned char, kBinaryGridHeaderSize>& header,
+                  size_t offset, const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (offset > header.size() || sizeof(T) > header.size() - offset) {
+        throw Exception(DT_E_INTERNAL, "binary GRID header write overflow");
+    }
+    std::memcpy(header.data() + offset, &value, sizeof(T));
+}
+
+template <typename T>
+T header_load(const std::array<unsigned char, kBinaryGridHeaderSize>& header,
+              size_t offset) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (offset > header.size() || sizeof(T) > header.size() - offset) {
+        throw Exception(DT_E_CORRUPTED_DATA, "binary GRID header is invalid");
+    }
+    T value{};
+    std::memcpy(&value, header.data() + offset, sizeof(T));
+    return value;
+}
+
+uint64_t binary_header_hash(
+    const std::array<unsigned char, kBinaryGridHeaderSize>& header) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char byte : header) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+uint64_t align_binary_offset(uint64_t value) {
+    constexpr uint64_t alignment = kBinaryGridHeaderSize;
+    if (value > std::numeric_limits<uint64_t>::max() - (alignment - 1)) {
+        throw Exception(DT_E_LIMIT_EXCEEDED, "binary GRID file is too large");
+    }
+    return (value + alignment - 1) / alignment * alignment;
+}
+
+void write_binary_bytes(std::ofstream& stream, const void* data,
+                        uint64_t byte_count) {
+    constexpr uint64_t chunk_size = 64ULL * 1024ULL * 1024ULL;
+    const auto* source = static_cast<const char*>(data);
+    while (byte_count != 0) {
+        const uint64_t chunk = std::min(byte_count, chunk_size);
+        stream.write(source, static_cast<std::streamsize>(chunk));
+        if (!stream) throw Exception(DT_E_IO, "failed to write binary GRID");
+        source += static_cast<size_t>(chunk);
+        byte_count -= chunk;
+    }
+}
 
 void check_cancelled(const CancelCallback& cancelled) {
     if (cancelled && cancelled()) {
@@ -324,7 +385,11 @@ void stitch_level(double level, const std::vector<Segment>& segments,
 
 } // namespace
 
-Grid::Grid(const dt_grid_create_options& options) : options_(options) {
+Grid::Grid(const dt_grid_create_options& options, bool initialize_storage)
+    : options_(options) {
+    if ((options_.flags & ~static_cast<uint32_t>(DT_GRID_HAS_NODATA)) != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "unknown grid creation flags");
+    }
     if (options_.width == 0 || options_.height == 0) {
         throw Exception(DT_E_INVALID_ARGUMENT,
                         "grid width and height must be positive");
@@ -346,7 +411,8 @@ Grid::Grid(const dt_grid_create_options& options) : options_(options) {
     const double initial = (options_.flags & DT_GRID_HAS_NODATA) != 0
                                ? options_.nodata_value
                                : 0.0;
-    values_.assign(static_cast<size_t>(count), initial);
+    if (initialize_storage)
+        values_.assign(static_cast<size_t>(count), initial);
 }
 
 size_t Grid::offset(uint64_t column, uint64_t row) const {
@@ -447,6 +513,9 @@ dt_grid_info Grid::info() const {
     dt_grid_info result{};
     result.struct_size = sizeof(result);
     result.flags = options_.flags;
+    if (values_.is_mapped()) result.flags |= DT_GRID_STORAGE_MEMORY_MAPPED;
+    if (!persistent_overview_.empty())
+        result.flags |= DT_GRID_HAS_PERSISTENT_OVERVIEW;
     result.width = options_.width;
     result.height = options_.height;
     std::copy(std::begin(options_.geo_transform),
@@ -463,9 +532,11 @@ dt_grid_info Grid::info() const {
         result.bounds.xmax = std::max(result.bounds.xmax, corner.x);
         result.bounds.ymax = std::max(result.bounds.ymax, corner.y);
     }
-    result.valid_value_count = static_cast<uint64_t>(
-        std::count_if(values_.begin(), values_.end(),
-                      [&](double value) { return !is_nodata(value); }));
+    result.valid_value_count = binary_valid_count_available_
+        ? binary_valid_count_
+        : static_cast<uint64_t>(std::count_if(
+              values_.begin(), values_.end(),
+              [&](double value) { return !is_nodata(value); }));
     result.generation = generation_;
     return result;
 }
@@ -1928,6 +1999,23 @@ dt_grid_overview_result Grid::read_overview(
                         "GRID overview output stride is too large");
     }
 
+    const bool full_source = options.source_column == 0 &&
+        options.source_row == 0 && source_width == width() &&
+        source_height == height();
+    if (method == DT_GRID_OVERVIEW_AVERAGE && options.flags == 0 &&
+        full_source && output_width == persistent_overview_width_ &&
+        output_height == persistent_overview_height_ &&
+        persistent_overview_.size() ==
+            static_cast<size_t>(output_width * output_height)) {
+        for (uint64_t row = 0; row < output_height; ++row) {
+            std::copy_n(persistent_overview_.data() +
+                            static_cast<size_t>(row * output_width),
+                        static_cast<size_t>(output_width),
+                        output + static_cast<size_t>(row * stride));
+        }
+        return persistent_overview_result_;
+    }
+
     struct Statistics {
         uint64_t valid = 0;
         uint64_t nodata = 0;
@@ -2114,10 +2202,11 @@ dt_grid_overview_result Grid::read_overview(
 }
 
 void Grid::write_window(uint64_t column, uint64_t row, uint64_t width,
-                        uint64_t height, const double* input, uint64_t stride) {
+                         uint64_t height, const double* input, uint64_t stride) {
     if (!input) throw Exception(DT_E_INVALID_ARGUMENT, "values is null");
     if (stride == 0) stride = width;
     validate_window(column, row, width, height, stride);
+    int64_t valid_delta = 0;
     for (uint64_t y = 0; y < height; ++y) {
         for (uint64_t x = 0; x < width; ++x) {
             const double value = input[y * stride + x];
@@ -2125,7 +2214,14 @@ void Grid::write_window(uint64_t column, uint64_t row, uint64_t width,
                   ((options_.flags & DT_GRID_HAS_NODATA) != 0 &&
                    std::isnan(options_.nodata_value) && std::isnan(value)))) {
                 throw Exception(DT_E_INVALID_ARGUMENT,
-                                "grid values must be finite or NoData NaN");
+                                 "grid values must be finite or NoData NaN");
+            }
+            if (binary_valid_count_available_) {
+                const bool old_valid =
+                    !is_nodata(values_[offset(column + x, row + y)]);
+                const bool new_valid = !is_nodata(value);
+                valid_delta += static_cast<int64_t>(new_valid) -
+                               static_cast<int64_t>(old_valid);
             }
         }
         std::copy_n(input + y * stride, static_cast<size_t>(width),
@@ -2133,6 +2229,16 @@ void Grid::write_window(uint64_t column, uint64_t row, uint64_t width,
                                           offset(column, row + y)));
     }
     ++generation_;
+    persistent_overview_.clear();
+    persistent_overview_width_ = persistent_overview_height_ = 0;
+    persistent_overview_result_ = {};
+    if (binary_valid_count_available_) {
+        if (valid_delta < 0) {
+            binary_valid_count_ -= static_cast<uint64_t>(-valid_delta);
+        } else {
+            binary_valid_count_ += static_cast<uint64_t>(valid_delta);
+        }
+    }
 }
 
 void Grid::save_text(const char* file_name) const {
@@ -2207,6 +2313,215 @@ std::unique_ptr<Grid> Grid::load_text(const char* file_name) {
     if (!(stream >> token) || token != "END") {
         throw Exception(DT_E_CORRUPTED_DATA, "missing DGRID END marker");
     }
+    return grid;
+}
+
+void Grid::save_binary(const char* file_name) {
+    require_file_name(file_name);
+    const uint16_t endian_probe = 1;
+    if (*reinterpret_cast<const unsigned char*>(&endian_probe) != 1 ||
+        sizeof(double) != 8) {
+        throw Exception(DT_E_UNSUPPORTED,
+                        "DGRIDB requires little-endian IEEE-754 doubles");
+    }
+    if (crs_wkt_.size() > kBinaryGridHeaderSize - kBinaryGridCrsOffset) {
+        throw Exception(DT_E_LIMIT_EXCEEDED,
+                        "GRID CRS is too large for DGRIDB header");
+    }
+
+    const uint64_t overview_width = std::min<uint64_t>(512, width());
+    const uint64_t overview_height = std::min<uint64_t>(512, height());
+    if (overview_width > std::numeric_limits<size_t>::max() / overview_height) {
+        throw Exception(DT_E_LIMIT_EXCEEDED, "binary GRID overview is too large");
+    }
+    std::vector<double> overview(static_cast<size_t>(overview_width *
+                                                     overview_height));
+    dt_grid_overview_options overview_options{};
+    overview_options.struct_size = sizeof(overview_options);
+    overview_options.method = DT_GRID_OVERVIEW_AVERAGE;
+    dt_grid_overview_result overview_result = read_overview(
+        overview_options, overview_width, overview_height, overview.data(), 0);
+
+    const uint64_t overview_offset = kBinaryGridHeaderSize;
+    const uint64_t overview_bytes = overview.size() * sizeof(double);
+    const uint64_t data_offset = align_binary_offset(
+        overview_offset + overview_bytes);
+    const uint64_t value_count = width() * height();
+    if (value_count > (std::numeric_limits<uint64_t>::max() - data_offset) /
+                          sizeof(double)) {
+        throw Exception(DT_E_LIMIT_EXCEEDED, "binary GRID file is too large");
+    }
+    const uint64_t file_size = data_offset + value_count * sizeof(double);
+
+    std::array<unsigned char, kBinaryGridHeaderSize> header{};
+    std::memcpy(header.data(), kBinaryGridMagic, sizeof(kBinaryGridMagic));
+    header_store(header, 8, kBinaryGridVersion);
+    header_store(header, 12, static_cast<uint32_t>(kBinaryGridHeaderSize));
+    header_store(header, 16, kBinaryGridEndianMarker);
+    header_store(header, 20, options_.flags);
+    header_store(header, 24, width());
+    header_store(header, 32, height());
+    for (size_t index = 0; index < 6; ++index)
+        header_store(header, 40 + index * sizeof(double),
+                     options_.geo_transform[index]);
+    header_store(header, 88, options_.nodata_value);
+    header_store(header, 96, static_cast<uint64_t>(crs_wkt_.size()));
+    header_store(header, 104, overview_width);
+    header_store(header, 112, overview_height);
+    header_store(header, 120, overview_offset);
+    header_store(header, 128, data_offset);
+    header_store(header, 136, value_count);
+    header_store(header, 144, overview_result.valid_value_count);
+    header_store(header, 152, overview_result.nodata_value_count);
+    header_store(header, 160, overview_result.minimum_value);
+    header_store(header, 168, overview_result.maximum_value);
+    header_store(header, 176, overview_result.mean_value);
+    header_store(header, 184, file_size);
+    if (!crs_wkt_.empty()) {
+        std::memcpy(header.data() + kBinaryGridCrsOffset, crs_wkt_.data(),
+                    crs_wkt_.size());
+    }
+    header_store(header, kBinaryGridChecksumOffset, uint64_t{0});
+    header_store(header, kBinaryGridChecksumOffset, binary_header_hash(header));
+
+    const auto destination = std::filesystem::u8path(file_name);
+    auto temporary = destination;
+    temporary += "." + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + ".tmp";
+    try {
+        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+        if (!stream) {
+            throw Exception(DT_E_IO,
+                            "cannot open temporary binary GRID for writing");
+        }
+        write_binary_bytes(stream, header.data(), header.size());
+        write_binary_bytes(stream, overview.data(), overview_bytes);
+        const uint64_t padding = data_offset - overview_offset - overview_bytes;
+        std::vector<unsigned char> zeros(static_cast<size_t>(padding), 0);
+        if (!zeros.empty()) write_binary_bytes(stream, zeros.data(), zeros.size());
+        write_binary_bytes(stream, values_.data(), value_count * sizeof(double));
+        stream.flush();
+        if (!stream) throw Exception(DT_E_IO, "failed to flush binary GRID");
+        stream.close();
+        if (values_.maps_file(destination)) values_.materialize();
+        replace_file_atomically(temporary, destination);
+        persistent_overview_ = std::move(overview);
+        persistent_overview_width_ = overview_width;
+        persistent_overview_height_ = overview_height;
+        persistent_overview_result_ = overview_result;
+        binary_valid_count_available_ = true;
+        binary_valid_count_ = overview_result.valid_value_count;
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
+    }
+}
+
+std::unique_ptr<Grid> Grid::load_binary(const char* file_name) {
+    require_file_name(file_name);
+    const uint16_t endian_probe = 1;
+    if (*reinterpret_cast<const unsigned char*>(&endian_probe) != 1 ||
+        sizeof(double) != 8) {
+        throw Exception(DT_E_UNSUPPORTED,
+                        "DGRIDB requires little-endian IEEE-754 doubles");
+    }
+    const auto file = std::filesystem::u8path(file_name);
+    std::ifstream stream(file, std::ios::binary);
+    if (!stream) throw Exception(DT_E_IO, "cannot open binary GRID");
+    std::array<unsigned char, kBinaryGridHeaderSize> header{};
+    stream.read(reinterpret_cast<char*>(header.data()),
+                static_cast<std::streamsize>(header.size()));
+    if (!stream) throw Exception(DT_E_CORRUPTED_DATA, "truncated DGRIDB header");
+    if (std::memcmp(header.data(), kBinaryGridMagic,
+                    sizeof(kBinaryGridMagic)) != 0 ||
+        header_load<uint32_t>(header, 8) != kBinaryGridVersion ||
+        header_load<uint32_t>(header, 12) != kBinaryGridHeaderSize ||
+        header_load<uint32_t>(header, 16) != kBinaryGridEndianMarker) {
+        throw Exception(DT_E_CORRUPTED_DATA, "invalid DGRIDB header");
+    }
+    const uint64_t stored_hash =
+        header_load<uint64_t>(header, kBinaryGridChecksumOffset);
+    header_store(header, kBinaryGridChecksumOffset, uint64_t{0});
+    if (stored_hash != binary_header_hash(header)) {
+        throw Exception(DT_E_CORRUPTED_DATA, "DGRIDB header checksum mismatch");
+    }
+
+    dt_grid_create_options options{};
+    options.struct_size = sizeof(options);
+    options.flags = header_load<uint32_t>(header, 20);
+    options.width = header_load<uint64_t>(header, 24);
+    options.height = header_load<uint64_t>(header, 32);
+    for (size_t index = 0; index < 6; ++index)
+        options.geo_transform[index] =
+            header_load<double>(header, 40 + index * sizeof(double));
+    options.nodata_value = header_load<double>(header, 88);
+    const uint64_t crs_size = header_load<uint64_t>(header, 96);
+    const uint64_t overview_width = header_load<uint64_t>(header, 104);
+    const uint64_t overview_height = header_load<uint64_t>(header, 112);
+    const uint64_t overview_offset = header_load<uint64_t>(header, 120);
+    const uint64_t data_offset = header_load<uint64_t>(header, 128);
+    const uint64_t value_count = header_load<uint64_t>(header, 136);
+    const uint64_t valid_count = header_load<uint64_t>(header, 144);
+    const uint64_t nodata_count = header_load<uint64_t>(header, 152);
+    const double minimum = header_load<double>(header, 160);
+    const double maximum = header_load<double>(header, 168);
+    const double mean = header_load<double>(header, 176);
+    const uint64_t declared_file_size = header_load<uint64_t>(header, 184);
+    if ((options.flags & ~static_cast<uint32_t>(DT_GRID_HAS_NODATA)) != 0 ||
+        crs_size > kBinaryGridHeaderSize - kBinaryGridCrsOffset ||
+        overview_width != std::min<uint64_t>(512, options.width) ||
+        overview_height != std::min<uint64_t>(512, options.height) ||
+        overview_offset != kBinaryGridHeaderSize ||
+        data_offset % kBinaryGridHeaderSize != 0 ||
+        data_offset < overview_offset +
+            overview_width * overview_height * sizeof(double) ||
+        options.height == 0 || options.width == 0 ||
+        options.width > kMaximumGridValues / options.height ||
+        value_count != options.width * options.height ||
+        valid_count > value_count || nodata_count != value_count - valid_count ||
+        value_count > (std::numeric_limits<uint64_t>::max() - data_offset) /
+                          sizeof(double) ||
+        declared_file_size != data_offset + value_count * sizeof(double)) {
+        throw Exception(DT_E_CORRUPTED_DATA, "invalid DGRIDB metadata");
+    }
+    std::error_code size_error;
+    const uint64_t actual_file_size =
+        std::filesystem::file_size(file, size_error);
+    if (size_error || actual_file_size != declared_file_size) {
+        throw Exception(DT_E_CORRUPTED_DATA, "DGRIDB file size mismatch");
+    }
+
+    auto grid = std::make_unique<Grid>(options, false);
+    grid->crs_wkt_.assign(
+        reinterpret_cast<const char*>(header.data() + kBinaryGridCrsOffset),
+        static_cast<size_t>(crs_size));
+    grid->persistent_overview_width_ = overview_width;
+    grid->persistent_overview_height_ = overview_height;
+    grid->persistent_overview_.resize(
+        static_cast<size_t>(overview_width * overview_height));
+    stream.seekg(static_cast<std::streamoff>(overview_offset));
+    stream.read(reinterpret_cast<char*>(grid->persistent_overview_.data()),
+                static_cast<std::streamsize>(
+                    grid->persistent_overview_.size() * sizeof(double)));
+    if (!stream) {
+        throw Exception(DT_E_CORRUPTED_DATA,
+                        "truncated DGRIDB persistent overview");
+    }
+    grid->persistent_overview_result_ = {};
+    grid->persistent_overview_result_.struct_size =
+        sizeof(dt_grid_overview_result);
+    grid->persistent_overview_result_.flags =
+        DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS;
+    grid->persistent_overview_result_.valid_value_count = valid_count;
+    grid->persistent_overview_result_.nodata_value_count = nodata_count;
+    grid->persistent_overview_result_.minimum_value = minimum;
+    grid->persistent_overview_result_.maximum_value = maximum;
+    grid->persistent_overview_result_.mean_value = mean;
+    grid->binary_valid_count_available_ = true;
+    grid->binary_valid_count_ = valid_count;
+    grid->values_.map_copy_on_write(file, static_cast<size_t>(data_offset),
+                                    static_cast<size_t>(value_count));
     return grid;
 }
 
@@ -2308,13 +2623,17 @@ std::unique_ptr<Grid> grid_from_tin(Context& tin,
                                     const dt_tin_to_grid_options& options,
                                     const ProgressCallback& progress,
                                     const CancelCallback& cancelled) {
+    if (options.flags != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown TIN-to-GRID flags");
+    }
     const auto statistics = tin.statistics();
     if (statistics.dimension != 2) {
         throw Exception(DT_E_EMPTY, "TIN has no two-dimensional surface");
     }
     dt_grid_create_options create{};
     create.struct_size = sizeof(create);
-    create.flags = options.flags | DT_GRID_HAS_NODATA;
+    create.flags = DT_GRID_HAS_NODATA;
     create.width = options.width;
     create.height = options.height;
     std::copy(std::begin(options.geo_transform), std::end(options.geo_transform),
@@ -2361,13 +2680,17 @@ std::unique_ptr<Grid> grid_from_cdt(CdtContext& cdt,
                                     const dt_tin_to_grid_options& options,
                                     const ProgressCallback& progress,
                                     const CancelCallback& cancelled) {
+    if (options.flags != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown TIN-to-GRID flags");
+    }
     const auto statistics = cdt.statistics();
     if (statistics.domain_triangle_count == 0) {
         throw Exception(DT_E_EMPTY, "CDT has no active domain surface");
     }
     dt_grid_create_options create{};
     create.struct_size = sizeof(create);
-    create.flags = options.flags | DT_GRID_HAS_NODATA;
+    create.flags = DT_GRID_HAS_NODATA;
     create.width = options.width;
     create.height = options.height;
     std::copy(std::begin(options.geo_transform), std::end(options.geo_transform),

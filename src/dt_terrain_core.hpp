@@ -2,6 +2,7 @@
 #define DT_TERRAIN_CORE_HPP
 
 #include "dt_core.hpp"
+#include "dt_grid_storage.hpp"
 #include "dt_terrain_api.h"
 
 #include <cstdint>
@@ -21,7 +22,8 @@ using CancelCallback = std::function<bool()>;
 
 class Grid final {
 public:
-    explicit Grid(const dt_grid_create_options& options);
+    explicit Grid(const dt_grid_create_options& options,
+                  bool initialize_storage = true);
 
     dt_grid_info info() const;
     void read_window(uint64_t column, uint64_t row, uint64_t width,
@@ -34,13 +36,15 @@ public:
                       uint64_t height, const double* input, uint64_t stride);
     void save_text(const char* file_name) const;
     static std::unique_ptr<Grid> load_text(const char* file_name);
+    void save_binary(const char* file_name);
+    static std::unique_ptr<Grid> load_binary(const char* file_name);
 
     uint64_t width() const noexcept { return options_.width; }
     uint64_t height() const noexcept { return options_.height; }
     uint32_t flags() const noexcept { return options_.flags; }
     double nodata() const noexcept { return options_.nodata_value; }
     const double* transform() const noexcept { return options_.geo_transform; }
-    const std::vector<double>& values() const noexcept { return values_; }
+    const GridStorage& values() const noexcept { return values_; }
     const std::string& crs_wkt() const noexcept { return crs_wkt_; }
     void set_crs_wkt(std::string crs_wkt) { crs_wkt_ = std::move(crs_wkt); }
     bool is_nodata(double value) const noexcept;
@@ -65,9 +69,15 @@ private:
         const ProgressCallback& progress, const CancelCallback& cancelled);
 
     dt_grid_create_options options_{};
-    std::vector<double> values_;
+    GridStorage values_;
     std::string crs_wkt_;
     uint64_t generation_ = 1;
+    std::vector<double> persistent_overview_;
+    uint64_t persistent_overview_width_ = 0;
+    uint64_t persistent_overview_height_ = 0;
+    dt_grid_overview_result persistent_overview_result_{};
+    bool binary_valid_count_available_ = false;
+    uint64_t binary_valid_count_ = 0;
 
     size_t offset(uint64_t column, uint64_t row) const;
     void validate_window(uint64_t column, uint64_t row, uint64_t width,

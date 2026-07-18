@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.27 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.28 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -22,6 +22,35 @@ TIN、GRID 和等高线句柄都可保存可选 CRS WKT。使用 `dt_set_crs_wkt
 
 `dt_grid_read_window()`、`dt_grid_write_window()` 支持局部窗口；`row_stride`
 以 `double` 个数计，零表示紧密排列。GRID 句柄由 `dt_grid_destroy()` 释放。
+
+## DGRIDB 二进制映射 GRID
+
+```cpp
+dt_status saved = dt_grid_save_binary(grid, "terrain.dgridb");
+
+dt_grid_handle mapped = nullptr;
+dt_status opened = dt_grid_load_binary("terrain.dgridb", &mapped);
+if (opened == DT_OK) {
+    dt_grid_info info{};
+    info.struct_size = sizeof(info);
+    dt_grid_get_info(mapped, &info);
+    const bool mapped_values =
+        (info.flags & DT_GRID_STORAGE_MEMORY_MAPPED) != 0;
+    dt_grid_destroy(mapped);
+}
+```
+
+`DGRIDB 1` 保存完整六参数仿射、NoData、UTF-8 CRS、源统计、最多 512×512 的全幅平均
+概览和按行优先排列的 double 节点。Windows 加载使用私有写时复制映射，句柄仍可传给
+全部现有 GRID API；窗口写入不会修改源文件。保存采用同目录临时文件加成功后原子替换。
+保存回当前映射源时，为解除 Windows 映射锁定会在替换前实体化当前视图；另存为其他
+路径不需要完整副本。格式字段见 [DGRIDB_FORMAT.md](DGRIDB_FORMAT.md)。
+
+`DT_GRID_STORAGE_MEMORY_MAPPED` 和 `DT_GRID_HAS_PERSISTENT_OVERVIEW` 是
+`dt_grid_info.flags` 的输出能力位，不允许作为 `dt_grid_create_options.flags` 输入。
+对完整源范围、默认 NoData 策略、平均方法和文件内记录尺寸的概览请求会直接复制持久
+概览；写入任意节点后旧概览自动失效，下一次二进制保存重建。DGRIDB 是本机高性能
+格式；文本交换仍用 DGRID，GIS 互操作使用 GeoTIFF/COG。
 
 ## GRID 窗口概览与 LOD 读取
 

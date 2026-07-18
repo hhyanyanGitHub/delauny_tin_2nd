@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.27.0
+    VERSION 0.28.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -34,6 +34,7 @@ add_library(dterrain SHARED
     src/dt_api.cpp
     src/dt_cdt_core.cpp
     src/dt_core.cpp
+    src/dt_grid_storage.cpp
     src/dt_terrain_core.cpp
     src/dt_legacy.cpp)
 
@@ -216,6 +217,16 @@ if(DT_BUILD_TESTS)
     else()
         target_compile_options(dterrain_view_lod_tests PRIVATE -UNDEBUG)
     endif()
+
+    add_executable(dterrain_grid_binary_tests tests/test_grid_binary.cpp)
+    target_compile_features(dterrain_grid_binary_tests PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_grid_binary_tests PRIVATE dterrain)
+    add_test(NAME dterrain_grid_binary_tests COMMAND dterrain_grid_binary_tests)
+    if(MSVC)
+        target_compile_options(dterrain_grid_binary_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(dterrain_grid_binary_tests PRIVATE -UNDEBUG)
+    endif()
 endif()
 
 if(DT_BUILD_EXAMPLES)
@@ -262,6 +273,10 @@ if(DT_BUILD_BENCHMARKS)
         benchmarks/view_lod_benchmark.cpp)
     target_compile_features(dterrain_view_lod_benchmark PRIVATE cxx_std_17)
     target_link_libraries(dterrain_view_lod_benchmark PRIVATE dterrain)
+    add_executable(dterrain_grid_binary_benchmark
+        benchmarks/grid_binary_benchmark.cpp)
+    target_compile_features(dterrain_grid_binary_benchmark PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_grid_binary_benchmark PRIVATE dterrain)
 endif()
 
 if(DT_BUILD_GUI AND WIN32)

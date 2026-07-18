@@ -593,6 +593,24 @@ dt_status DT_CALL dt_grid_load_text(const char* utf8_file_name,
     });
 }
 
+dt_status DT_CALL dt_grid_save_binary(dt_grid_handle grid,
+                                      const char* utf8_file_name) {
+    return guarded([&] { require_grid(grid).save_binary(utf8_file_name); });
+}
+
+dt_status DT_CALL dt_grid_load_binary(const char* utf8_file_name,
+                                      dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_grid is null");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::Grid::load_binary(utf8_file_name);
+        *output_grid = result.release();
+    });
+}
+
 dt_status DT_CALL dt_grid_from_tin(dt_handle tin,
                                    const dt_tin_to_grid_options* options,
                                    dt_grid_handle* output_grid) {

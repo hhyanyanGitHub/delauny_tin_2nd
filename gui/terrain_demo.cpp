@@ -672,9 +672,9 @@ private:
 
         HMENU exchange_menu = CreatePopupMenu();
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_GRID,
-                    L"导入 GRID 文本…");
+                    L"导入 GRID（DGRIDB / 文本）…");
         AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_GRID,
-                    L"导出 GRID 文本…");
+                    L"导出 GRID（DGRIDB / 文本）…");
         AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CONTOURS,
                     L"导入等高线文本…");
@@ -4577,7 +4577,7 @@ private:
         }
         dt_grid_create_options create{};
         create.struct_size = sizeof(create);
-        create.flags = grid_info_.flags;
+        create.flags = grid_info_.flags & DT_GRID_HAS_NODATA;
         create.width = grid_info_.width;
         create.height = grid_info_.height;
         std::copy(std::begin(grid_info_.geo_transform),
@@ -4989,14 +4989,19 @@ private:
     }
 
     void import_grid_file() {
-        const auto file = choose_file(false, L"terrain.dgrid",
-            L"DGRID 规则网格 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
-            L"dgrid");
+        const auto file = choose_file(false, L"terrain.dgridb",
+            L"DGRIDB 映射网格 (*.dgridb)\0*.dgridb\0DGRID 文本 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有 GRID (*.dgridb;*.dgrid;*.txt)\0*.dgridb;*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dgridb");
         if (file.empty()) return;
         dt_grid_handle output = nullptr;
+        const bool binary = lower_extension(file) == L".dgridb";
         set_wait_cursor(true);
-        const dt_status status = dt_grid_load_text(
-            wide_to_utf8(file.c_str()).c_str(), &output);
+        const auto begin = std::chrono::steady_clock::now();
+        const auto utf8 = wide_to_utf8(file.c_str());
+        const dt_status status = binary
+            ? dt_grid_load_binary(utf8.c_str(), &output)
+            : dt_grid_load_text(utf8.c_str(), &output);
+        const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
         if (status != DT_OK) {
             action_text_ = L"GRID 导入失败：" + last_error_text();
@@ -5013,7 +5018,14 @@ private:
         std::wostringstream text;
         text << L"已导入 GRID：" << grid_info_.width << L"×"
              << grid_info_.height << L"，有效节点 "
-             << grid_info_.valid_value_count;
+             << grid_info_.valid_value_count << L"，耗时 " << std::fixed
+             << std::setprecision(1)
+             << std::chrono::duration<double, std::milli>(end - begin).count()
+             << L" ms";
+        if ((grid_info_.flags & DT_GRID_STORAGE_MEMORY_MAPPED) != 0)
+            text << L"；写时复制映射";
+        if ((grid_info_.flags & DT_GRID_HAS_PERSISTENT_OVERVIEW) != 0)
+            text << L"；内置概览";
         if (grid_info_.width > grid_preview_width_ ||
             grid_info_.height > grid_preview_height_)
             text << L"；LOD 预览 " << grid_preview_width_ << L"×"
@@ -5026,14 +5038,29 @@ private:
             action_text_ = L"没有可导出的 GRID";
             return;
         }
-        const auto file = choose_file(true, L"terrain.dgrid",
-            L"DGRID 规则网格 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
-            L"dgrid");
+        const auto file = choose_file(true, L"terrain.dgridb",
+            L"DGRIDB 映射网格 (*.dgridb)\0*.dgridb\0DGRID 文本 (*.dgrid;*.txt)\0*.dgrid;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dgridb");
         if (file.empty()) return;
-        const dt_status status = dt_grid_save_text(
-            grid_, wide_to_utf8(file.c_str()).c_str());
-        action_text_ = status == DT_OK ? L"已导出 GRID：" + file
-                                       : L"GRID 导出失败：" + last_error_text();
+        const bool binary = lower_extension(file) == L".dgridb";
+        const auto utf8 = wide_to_utf8(file.c_str());
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = binary
+            ? dt_grid_save_binary(grid_, utf8.c_str())
+            : dt_grid_save_text(grid_, utf8.c_str());
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status == DT_OK) {
+            std::wostringstream text;
+            text << L"已导出 " << (binary ? L"DGRIDB：" : L"DGRID：")
+                 << file << L"，耗时 " << std::fixed << std::setprecision(1)
+                 << std::chrono::duration<double, std::milli>(end - begin).count()
+                 << L" ms";
+            action_text_ = text.str();
+        } else {
+            action_text_ = L"GRID 导出失败：" + last_error_text();
+        }
     }
 
     void import_contour_file() {

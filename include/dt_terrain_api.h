@@ -8,7 +8,11 @@ extern "C" {
 #endif
 
 enum dt_grid_flags {
-    DT_GRID_HAS_NODATA = 1u << 0
+    DT_GRID_HAS_NODATA = 1u << 0,
+    /* Output-only dt_grid_info flags. Binary GRID loading uses a private,
+       copy-on-write view, so edits do not modify the source file. */
+    DT_GRID_STORAGE_MEMORY_MAPPED = 1u << 1,
+    DT_GRID_HAS_PERSISTENT_OVERVIEW = 1u << 2
 };
 
 enum dt_grid_to_tin_flags {
@@ -401,6 +405,15 @@ DT_API dt_status DT_CALL dt_grid_clip_polygon(
 DT_API dt_status DT_CALL dt_grid_save_text(
     dt_grid_handle grid, const char* utf8_file_name);
 DT_API dt_status DT_CALL dt_grid_load_text(
+    const char* utf8_file_name, dt_grid_handle* output_grid);
+
+/* DGRIDB 1 is a little-endian binary format for large local GRID data. It
+   stores doubles row-major plus a persistent average overview and CRS. On
+   Windows, loading maps the value array copy-on-write instead of allocating a
+   second full array. Saving replaces the destination only after completion. */
+DT_API dt_status DT_CALL dt_grid_save_binary(
+    dt_grid_handle grid, const char* utf8_file_name);
+DT_API dt_status DT_CALL dt_grid_load_binary(
     const char* utf8_file_name, dt_grid_handle* output_grid);
 
 /* Samples the piecewise-linear TIN surface at each output grid node. */

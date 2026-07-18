@@ -79,6 +79,12 @@ enum dt_grid_overview_result_flags {
     DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS = 1u << 0
 };
 
+enum dt_grid_view_window_flags {
+    /* The requested world rectangle extended outside the GRID footprint and
+       the returned source window was clipped to available nodes. */
+    DT_GRID_VIEW_WINDOW_CLIPPED = 1u << 0
+};
+
 typedef struct dt_grid_create_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -239,6 +245,28 @@ typedef struct dt_grid_overview_result {
     uint64_t reserved[2];
 } dt_grid_overview_result;
 
+typedef struct dt_grid_view_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Axis-aligned world XY rectangle. It is transformed through the complete
+       inverse six-parameter GRID affine before clipping. */
+    dt_bounds2 world_bounds;
+    /* Expands the selected source-node window after geometric clipping. */
+    uint32_t padding_nodes;
+    uint32_t reserved0;
+    uint64_t reserved[2];
+} dt_grid_view_options;
+
+typedef struct dt_grid_window {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t column;
+    uint64_t row;
+    uint64_t width;
+    uint64_t height;
+    uint64_t reserved[3];
+} dt_grid_window;
+
 typedef struct dt_contours_to_tin_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -315,6 +343,14 @@ DT_API dt_status DT_CALL dt_grid_read_overview(
     dt_grid_handle grid, const dt_grid_overview_options* options,
     uint64_t output_width, uint64_t output_height, double* output_values,
     uint64_t row_stride, dt_grid_overview_result* output_result);
+
+/* Maps an axis-aligned world viewport to the smallest source-node window that
+   covers its intersection with the GRID footprint. Returns DT_E_NOT_FOUND
+   when the viewport and GRID do not overlap. The result can be copied into
+   dt_grid_overview_options.source_* for view-dependent LOD reads. */
+DT_API dt_status DT_CALL dt_grid_get_view_window(
+    dt_grid_handle grid, const dt_grid_view_options* options,
+    dt_grid_window* output_window);
 DT_API dt_status DT_CALL dt_grid_write_window(
     dt_grid_handle grid, uint64_t column, uint64_t row,
     uint64_t width, uint64_t height, const double* values,

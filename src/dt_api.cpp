@@ -454,6 +454,20 @@ dt_status DT_CALL dt_grid_read_overview(
     });
 }
 
+dt_status DT_CALL dt_grid_get_view_window(
+    dt_grid_handle grid, const dt_grid_view_options* options,
+    dt_grid_window* output_window) {
+    if (output_window) *output_window = {};
+    return guarded([&] {
+        validate_options(options, "dt_grid_view_options");
+        if (!output_window) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_window is null");
+        }
+        *output_window = require_grid(grid).view_window(*options);
+    });
+}
+
 dt_status DT_CALL dt_grid_write_window(dt_grid_handle grid, uint64_t column,
                                        uint64_t row, uint64_t width,
                                        uint64_t height, const double* values,

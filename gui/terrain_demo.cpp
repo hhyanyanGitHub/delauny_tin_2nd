@@ -414,7 +414,7 @@ public:
         case WM_RBUTTONUP:
         case WM_MBUTTONUP:
             if (drag3d_ != Drag3D::None) end_drag3d();
-            panning_ = false;
+            else end_pan();
             if (GetCapture() == hwnd_) ReleaseCapture();
             return 0;
         case WM_MOUSEWHEEL: {
@@ -561,6 +561,12 @@ private:
     std::vector<uint32_t> grid_preview_;
     uint32_t grid_preview_width_ = 0;
     uint32_t grid_preview_height_ = 0;
+    uint64_t grid_preview_column_ = 0;
+    uint64_t grid_preview_row_ = 0;
+    uint64_t grid_preview_source_width_ = 0;
+    uint64_t grid_preview_source_height_ = 0;
+    dt_grid_handle grid_preview_source_ = nullptr;
+    bool grid_preview_view_valid_ = false;
     double grid_zmin_ = 0.0;
     double grid_zmax_ = 1.0;
     GridTheme grid_theme_ = GridTheme::Elevation;
@@ -911,6 +917,10 @@ private:
         grid_info_ = {};
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
+        grid_preview_column_ = grid_preview_row_ = 0;
+        grid_preview_source_width_ = grid_preview_source_height_ = 0;
+        grid_preview_source_ = nullptr;
+        grid_preview_view_valid_ = false;
     }
 
     void destroy_contour_layer() {
@@ -1002,6 +1012,7 @@ private:
                  center_x + width * 0.5, center_y + height * 0.5};
         view_valid_ = true;
         cache_valid_ = false;
+        grid_preview_view_valid_ = false;
     }
 
     void reset_view() {
@@ -1048,6 +1059,10 @@ private:
     void invalidate_mesh_cache() {
         cache_valid_ = false;
         InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void invalidate_grid_view_cache() {
+        grid_preview_view_valid_ = false;
     }
 
     void clear_overlays() {
@@ -2114,6 +2129,13 @@ private:
         invalidate_mesh_cache();
     }
 
+    void end_pan() {
+        if (!panning_) return;
+        panning_ = false;
+        invalidate_grid_view_cache();
+        invalidate_mesh_cache();
+    }
+
     void zoom(int x, int y, int delta) {
         if (!view_valid_ || y < kToolbarHeight) return;
         const auto anchor = screen_to_world(x, y);
@@ -2122,6 +2144,7 @@ private:
         view_.xmax = anchor.x + (view_.xmax - anchor.x) * factor;
         view_.ymin = anchor.y + (view_.ymin - anchor.y) * factor;
         view_.ymax = anchor.y + (view_.ymax - anchor.y) * factor;
+        invalidate_grid_view_cache();
         invalidate_mesh_cache();
     }
 
@@ -2499,6 +2522,11 @@ private:
             grid_preview_width_ = grid_preview_height_ = 0;
             return false;
         }
+        grid_preview_column_ = grid_preview_row_ = 0;
+        grid_preview_source_width_ = grid_info_.width;
+        grid_preview_source_height_ = grid_info_.height;
+        grid_preview_source_ = grid_;
+        grid_preview_view_valid_ = false;
         if (result.valid_value_count == 0) {
             grid_zmin_ = 0.0;
             grid_zmax_ = 1.0;
@@ -2550,6 +2578,11 @@ private:
             grid_preview_width_ = grid_preview_height_ = 0;
             return false;
         }
+        grid_preview_column_ = grid_preview_row_ = 0;
+        grid_preview_source_width_ = info.width;
+        grid_preview_source_height_ = info.height;
+        grid_preview_source_ = terrain_grid_;
+        grid_preview_view_valid_ = false;
         grid_preview_.resize(static_cast<size_t>(grid_preview_width_) *
                              grid_preview_height_);
         for (uint32_t row = 0; row < grid_preview_height_; ++row) {
@@ -2562,6 +2595,85 @@ private:
                                             : terrain_pixel(value);
             }
         }
+        return true;
+    }
+
+    bool refresh_grid_view_cache() {
+        if (!view_valid_ || !grid_ || !show_grid_) return true;
+        dt_grid_handle source_grid = terrain_grid_ ? terrain_grid_ : grid_;
+        dt_grid_info source_info{};
+        source_info.struct_size = sizeof(source_info);
+        if (dt_grid_get_info(source_grid, &source_info) != DT_OK) return false;
+
+        dt_grid_view_options view_options{};
+        view_options.struct_size = sizeof(view_options);
+        view_options.world_bounds = view_;
+        view_options.padding_nodes = 2;
+        dt_grid_window window{};
+        const dt_status window_status = dt_grid_get_view_window(
+            source_grid, &view_options, &window);
+        if (window_status == DT_E_NOT_FOUND) {
+            grid_preview_.clear();
+            grid_preview_width_ = grid_preview_height_ = 0;
+            grid_preview_source_width_ = grid_preview_source_height_ = 0;
+            grid_preview_source_ = source_grid;
+            grid_preview_view_valid_ = true;
+            return true;
+        }
+        if (window_status != DT_OK) return false;
+        if (grid_preview_view_valid_ && grid_preview_source_ == source_grid &&
+            grid_preview_column_ == window.column &&
+            grid_preview_row_ == window.row &&
+            grid_preview_source_width_ == window.width &&
+            grid_preview_source_height_ == window.height) {
+            return true;
+        }
+
+        const RECT canvas = canvas_rect();
+        const uint64_t pixel_width = static_cast<uint64_t>(
+            std::clamp<LONG>(canvas.right - canvas.left, 64, 512));
+        const uint64_t pixel_height = static_cast<uint64_t>(
+            std::clamp<LONG>(canvas.bottom - canvas.top, 64, 512));
+        const uint64_t output_width = std::min(window.width, pixel_width);
+        const uint64_t output_height = std::min(window.height, pixel_height);
+        std::vector<double> values(static_cast<size_t>(output_width *
+                                                       output_height));
+        dt_grid_overview_options overview{};
+        overview.struct_size = sizeof(overview);
+        overview.method = grid_theme_ == GridTheme::Aspect
+            ? DT_GRID_OVERVIEW_NEAREST
+            : DT_GRID_OVERVIEW_AVERAGE;
+        overview.worker_count = terrain_worker_count_;
+        overview.tile_row_count = terrain_tile_rows_;
+        overview.source_column = window.column;
+        overview.source_row = window.row;
+        overview.source_width = window.width;
+        overview.source_height = window.height;
+        if (dt_grid_read_overview(source_grid, &overview, output_width,
+                                  output_height, values.data(), 0,
+                                  nullptr) != DT_OK) {
+            return false;
+        }
+
+        grid_preview_.resize(static_cast<size_t>(output_width * output_height));
+        grid_preview_width_ = static_cast<uint32_t>(output_width);
+        grid_preview_height_ = static_cast<uint32_t>(output_height);
+        for (uint32_t row = 0; row < grid_preview_height_; ++row) {
+            for (uint32_t column = 0; column < grid_preview_width_; ++column) {
+                const double value = values[static_cast<size_t>(row) *
+                                            grid_preview_width_ + column];
+                grid_preview_[static_cast<size_t>(row) * grid_preview_width_ +
+                              column] = is_grid_nodata(source_info, value)
+                    ? 0x00191f24U
+                    : terrain_pixel(value);
+            }
+        }
+        grid_preview_column_ = window.column;
+        grid_preview_row_ = window.row;
+        grid_preview_source_width_ = window.width;
+        grid_preview_source_height_ = window.height;
+        grid_preview_source_ = source_grid;
+        grid_preview_view_valid_ = true;
         return true;
     }
 
@@ -2632,7 +2744,18 @@ private:
             world_to_screen(grid_world(grid_info_.width - 1,
                                        grid_info_.height - 1)),
             world_to_screen(grid_world(0, grid_info_.height - 1))};
-        if (!grid_preview_.empty()) {
+        if (!grid_preview_.empty() && grid_preview_source_width_ != 0 &&
+            grid_preview_source_height_ != 0) {
+            const uint64_t last_column = grid_preview_column_ +
+                                         grid_preview_source_width_ - 1;
+            const uint64_t last_row = grid_preview_row_ +
+                                      grid_preview_source_height_ - 1;
+            const POINT preview_corners[4]{
+                world_to_screen(grid_world(grid_preview_column_,
+                                           grid_preview_row_)),
+                world_to_screen(grid_world(last_column, grid_preview_row_)),
+                world_to_screen(grid_world(last_column, last_row)),
+                world_to_screen(grid_world(grid_preview_column_, last_row))};
             BITMAPINFO info{};
             info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
             info.bmiHeader.biWidth = static_cast<LONG>(grid_preview_width_);
@@ -2648,7 +2771,8 @@ private:
                             grid_preview_.size() * sizeof(uint32_t));
                 HDC source = CreateCompatibleDC(dc);
                 const auto old_bitmap = SelectObject(source, bitmap);
-                POINT destination[3]{corners[0], corners[1], corners[3]};
+                POINT destination[3]{preview_corners[0], preview_corners[1],
+                                     preview_corners[3]};
                 SetStretchBltMode(dc, HALFTONE);
                 PlgBlt(dc, destination, source, 0, 0,
                        static_cast<int>(grid_preview_width_),
@@ -3372,6 +3496,7 @@ private:
                       L"3D：左键环视｜右/中键平移｜滚轮缩放｜WASD/方向键漫游｜Q/E升降｜+/-垂直夸张｜Home复位",
                       -1, &help, DT_LEFT | DT_TOP | DT_SINGLELINE);
         } else {
+            if (!panning_) refresh_grid_view_cache();
             draw_grid(dc);
             if (show_tin_) draw_mesh(dc);
             draw_cdt(dc);
@@ -3426,8 +3551,17 @@ private:
              << (show_grid_ && grid_ ? L"G" : L"-")
              << (show_contours_ && contours_ ? L"C" : L"-")
              << (show_cdt_ && cdt_info_.vertex_count != 0 ? L"D" : L"-")
-             << L" | "
-             << action_text_;
+             << L" | ";
+        if (view_mode_ == ViewMode::Map2D && show_grid_ &&
+            grid_preview_source_width_ != 0 &&
+            (grid_preview_source_width_ < grid_info_.width ||
+             grid_preview_source_height_ < grid_info_.height)) {
+            text << L"局部LOD " << grid_preview_source_width_ << L"×"
+                 << grid_preview_source_height_ << L"→"
+                 << grid_preview_width_ << L"×" << grid_preview_height_
+                 << L" | ";
+        }
+        text << action_text_;
         DrawTextW(dc, text.str().c_str(), -1, &status,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         EndPaint(hwnd_, &ps);

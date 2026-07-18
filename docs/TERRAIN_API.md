@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.26 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.27 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -66,6 +66,39 @@ double 计，0 表示输出宽度；输出维度上限为每轴 1,048,576 且总
 工作线程按输出行块写互不重叠的调用方区域，自动线程数最多 32，显式最多 64；所有
 统计按输出行顺序归并，所以串并行输出和均值确定一致。接口是同步调用：返回前调用方
 不得释放输出缓冲区，也不得并发修改源 GRID。
+
+## 世界视口到 GRID 行列窗口
+
+`dt_grid_get_view_window()` 为视口自适应 LOD 提供稳定的仿射几何入口：
+
+```cpp
+dt_grid_view_options view{};
+view.struct_size = sizeof(view);
+view.world_bounds = {xmin, ymin, xmax, ymax};
+view.padding_nodes = 2;
+
+dt_grid_window window{};
+dt_status status = dt_grid_get_view_window(grid, &view, &window);
+if (status == DT_OK) {
+    dt_grid_overview_options overview{};
+    overview.struct_size = sizeof(overview);
+    overview.source_column = window.column;
+    overview.source_row = window.row;
+    overview.source_width = window.width;
+    overview.source_height = window.height;
+    // 输出尺寸应不大于 window.width × window.height
+}
+```
+
+实现把世界矩形四角通过完整六参数逆仿射变成源行列四边形，再用 Sutherland–Hodgman
+裁剪到节点覆盖域 `[-0.5,width-0.5] × [-0.5,height-0.5]`。随后以 `floor/ceil` 取得覆盖
+所有相交节点的最小整数窗口，并在裁剪后应用 `padding_nodes`。所以旋转、剪切、负像元
+高和单行/单列 GRID 使用相同规则。
+
+两种结构均为 64 字节，`flags` 当前必须为 0，节点缓冲最大 1,048,576。完全无交集返回
+`DT_E_NOT_FOUND`；视口部分超出 GRID 时成功并在结果设置
+`DT_GRID_VIEW_WINDOW_CLIPPED`。接口只做几何计算，不读取高程、分配结果数组或修改 GRID，
+因此适合在交互缩放路径中频繁调用。
 
 ## GRID 显式重采样与节点对齐
 

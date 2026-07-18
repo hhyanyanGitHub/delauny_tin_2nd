@@ -1711,6 +1711,141 @@ void Grid::read_window(uint64_t column, uint64_t row, uint64_t width,
     }
 }
 
+dt_grid_window Grid::view_window(const dt_grid_view_options& options) const {
+    if (options.flags != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "unknown GRID view flags");
+    }
+    const auto& bounds = options.world_bounds;
+    if (!finite(bounds.xmin) || !finite(bounds.ymin) ||
+        !finite(bounds.xmax) || !finite(bounds.ymax) ||
+        !(bounds.xmin < bounds.xmax) || !(bounds.ymin < bounds.ymax)) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID view bounds must be finite and ordered");
+    }
+    constexpr uint32_t kMaximumPadding = 1024U * 1024U;
+    if (options.padding_nodes > kMaximumPadding) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID view padding_nodes is too large");
+    }
+
+    const double* gt = transform();
+    const double determinant = gt[1] * gt[5] - gt[2] * gt[4];
+    const auto source_point = [&](double x, double y) {
+        const double dx = x - gt[0];
+        const double dy = y - gt[3];
+        return std::array<double, 2>{
+            (dx * gt[5] - dy * gt[2]) / determinant,
+            (dy * gt[1] - dx * gt[4]) / determinant};
+    };
+    using Point2 = std::array<double, 2>;
+    std::vector<Point2> polygon{
+        source_point(bounds.xmin, bounds.ymin),
+        source_point(bounds.xmax, bounds.ymin),
+        source_point(bounds.xmax, bounds.ymax),
+        source_point(bounds.xmin, bounds.ymax)};
+    for (const auto& point : polygon) {
+        if (!finite(point[0]) || !finite(point[1])) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "GRID view inverse transform overflowed");
+        }
+    }
+
+    const double minimum_column = -0.5;
+    const double maximum_column = static_cast<double>(width()) - 0.5;
+    const double minimum_row = -0.5;
+    const double maximum_row = static_cast<double>(height()) - 0.5;
+    bool clipped = false;
+    for (const auto& point : polygon) {
+        if (point[0] < minimum_column || point[0] > maximum_column ||
+            point[1] < minimum_row || point[1] > maximum_row) {
+            clipped = true;
+            break;
+        }
+    }
+    const auto clip_axis = [&](size_t axis, double boundary,
+                               bool keep_greater) {
+        if (polygon.empty()) return;
+        std::vector<Point2> output;
+        output.reserve(polygon.size() + 2);
+        const auto inside = [&](const Point2& point) {
+            return keep_greater ? point[axis] >= boundary
+                                : point[axis] <= boundary;
+        };
+        const auto intersection = [&](const Point2& start,
+                                      const Point2& end) {
+            const double denominator = end[axis] - start[axis];
+            double t = denominator == 0.0
+                ? 0.0
+                : (boundary - start[axis]) / denominator;
+            t = std::clamp(t, 0.0, 1.0);
+            Point2 point{start[0] + t * (end[0] - start[0]),
+                         start[1] + t * (end[1] - start[1])};
+            point[axis] = boundary;
+            return point;
+        };
+        Point2 previous = polygon.back();
+        bool previous_inside = inside(previous);
+        for (const Point2& current : polygon) {
+            const bool current_inside = inside(current);
+            if (current_inside != previous_inside)
+                output.push_back(intersection(previous, current));
+            if (current_inside) output.push_back(current);
+            previous = current;
+            previous_inside = current_inside;
+        }
+        polygon = std::move(output);
+    };
+    clip_axis(0, minimum_column, true);
+    clip_axis(0, maximum_column, false);
+    clip_axis(1, minimum_row, true);
+    clip_axis(1, maximum_row, false);
+    if (polygon.empty()) {
+        throw Exception(DT_E_NOT_FOUND,
+                        "GRID view does not overlap the GRID footprint");
+    }
+
+    double cmin = polygon.front()[0], cmax = polygon.front()[0];
+    double rmin = polygon.front()[1], rmax = polygon.front()[1];
+    for (const auto& point : polygon) {
+        cmin = std::min(cmin, point[0]);
+        cmax = std::max(cmax, point[0]);
+        rmin = std::min(rmin, point[1]);
+        rmax = std::max(rmax, point[1]);
+    }
+    const auto lower_node = [](double value, uint64_t extent) {
+        const double node = std::floor(value);
+        if (node <= 0.0) return uint64_t{0};
+        return static_cast<uint64_t>(std::min(
+            node, static_cast<double>(extent - 1)));
+    };
+    const auto upper_node = [](double value, uint64_t extent) {
+        const double node = std::ceil(value);
+        if (node <= 0.0) return uint64_t{0};
+        return static_cast<uint64_t>(std::min(
+            node, static_cast<double>(extent - 1)));
+    };
+    uint64_t first_column = lower_node(cmin, width());
+    uint64_t last_column = upper_node(cmax, width());
+    uint64_t first_row = lower_node(rmin, height());
+    uint64_t last_row = upper_node(rmax, height());
+    const uint64_t padding = options.padding_nodes;
+    first_column = padding > first_column ? 0 : first_column - padding;
+    first_row = padding > first_row ? 0 : first_row - padding;
+    last_column = std::min(width() - 1, last_column + std::min(
+        padding, width() - 1 - last_column));
+    last_row = std::min(height() - 1, last_row + std::min(
+        padding, height() - 1 - last_row));
+
+    dt_grid_window result{};
+    result.struct_size = sizeof(result);
+    if (clipped) result.flags |= DT_GRID_VIEW_WINDOW_CLIPPED;
+    result.column = first_column;
+    result.row = first_row;
+    result.width = last_column - first_column + 1;
+    result.height = last_row - first_row + 1;
+    return result;
+}
+
 dt_grid_overview_result Grid::read_overview(
     const dt_grid_overview_options& options, uint64_t output_width,
     uint64_t output_height, double* output, uint64_t stride) const {

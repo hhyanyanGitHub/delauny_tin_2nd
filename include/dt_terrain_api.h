@@ -56,6 +56,29 @@ enum dt_grid_clip_flags {
     DT_GRID_CLIP_INVERT = 1u << 1
 };
 
+enum dt_grid_overview_method {
+    /* Zero also selects arithmetic mean. Aggregate methods require output
+       dimensions no larger than the selected source window. */
+    DT_GRID_OVERVIEW_AVERAGE = 1,
+    DT_GRID_OVERVIEW_NEAREST = 2,
+    DT_GRID_OVERVIEW_MINIMUM = 3,
+    DT_GRID_OVERVIEW_MAXIMUM = 4
+};
+
+enum dt_grid_overview_flags {
+    /* Aggregate cells become NoData when any contributing source node is
+       NoData. Without this flag invalid nodes are ignored and remaining
+       weights are renormalized. Nearest-neighbor output is unchanged. */
+    DT_GRID_OVERVIEW_STRICT_NODATA = 1u << 0
+};
+
+enum dt_grid_overview_result_flags {
+    /* Statistics cover every node in the selected source window. Aggregate
+       methods set this flag; nearest-neighbor statistics cover output samples
+       only and leave it clear. */
+    DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS = 1u << 0
+};
+
 typedef struct dt_grid_create_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -184,6 +207,38 @@ typedef struct dt_grid_clip_options {
     uint64_t reserved[5];
 } dt_grid_clip_options;
 
+typedef struct dt_grid_overview_options {
+    uint32_t struct_size;
+    /* Zero selects DT_GRID_OVERVIEW_AVERAGE. */
+    uint32_t method;
+    uint32_t flags;
+    /* Zero selects an implementation-defined automatic count. One forces
+       single-thread execution. Values above 64 are rejected. */
+    uint32_t worker_count;
+    uint64_t source_column;
+    uint64_t source_row;
+    /* Zero selects the remaining width/height from source_column/source_row. */
+    uint64_t source_width;
+    uint64_t source_height;
+    /* Output rows claimed by one worker at a time. Zero selects 16 rows. */
+    uint32_t tile_row_count;
+    uint32_t reserved0;
+    uint64_t reserved[1];
+} dt_grid_overview_options;
+
+typedef struct dt_grid_overview_result {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Aggregate methods report exact source-window counts. Nearest reports
+       counts for the output samples, as indicated by flags. */
+    uint64_t valid_value_count;
+    uint64_t nodata_value_count;
+    double minimum_value;
+    double maximum_value;
+    double mean_value;
+    uint64_t reserved[2];
+} dt_grid_overview_result;
+
 typedef struct dt_contours_to_tin_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -251,6 +306,15 @@ DT_API dt_status DT_CALL dt_grid_read_window(
     dt_grid_handle grid, uint64_t column, uint64_t row,
     uint64_t width, uint64_t height, double* output_values,
     uint64_t row_stride);
+
+/* Reads an in-memory, caller-owned overview of a source GRID window without
+   constructing another GRID handle. row_stride is measured in doubles and
+   zero means output_width. output_result may be NULL. Aggregate bins use an
+   exact integer partition, so every selected source node contributes once. */
+DT_API dt_status DT_CALL dt_grid_read_overview(
+    dt_grid_handle grid, const dt_grid_overview_options* options,
+    uint64_t output_width, uint64_t output_height, double* output_values,
+    uint64_t row_stride, dt_grid_overview_result* output_result);
 DT_API dt_status DT_CALL dt_grid_write_window(
     dt_grid_handle grid, uint64_t column, uint64_t row,
     uint64_t width, uint64_t height, const double* values,

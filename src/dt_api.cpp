@@ -432,12 +432,25 @@ dt_status DT_CALL dt_grid_get_crs_wkt(dt_grid_handle grid, char* buffer,
 }
 
 dt_status DT_CALL dt_grid_read_window(dt_grid_handle grid, uint64_t column,
-                                      uint64_t row, uint64_t width,
-                                      uint64_t height, double* output_values,
-                                      uint64_t row_stride) {
+                                       uint64_t row, uint64_t width,
+                                       uint64_t height, double* output_values,
+                                       uint64_t row_stride) {
     return guarded([&] {
         require_grid(grid).read_window(column, row, width, height, output_values,
                                        row_stride);
+    });
+}
+
+dt_status DT_CALL dt_grid_read_overview(
+    dt_grid_handle grid, const dt_grid_overview_options* options,
+    uint64_t output_width, uint64_t output_height, double* output_values,
+    uint64_t row_stride, dt_grid_overview_result* output_result) {
+    if (output_result) *output_result = {};
+    return guarded([&] {
+        validate_options(options, "dt_grid_overview_options");
+        const auto result = require_grid(grid).read_overview(
+            *options, output_width, output_height, output_values, row_stride);
+        if (output_result) *output_result = result;
     });
 }
 

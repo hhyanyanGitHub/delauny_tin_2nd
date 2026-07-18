@@ -33,7 +33,6 @@ constexpr int kToolbarHeight = 48;
 constexpr int kStatusHeight = 28;
 constexpr size_t kMaxDrawTriangles = 45000;
 constexpr size_t kMaxDrawTriangles3d = 18000;
-constexpr uint64_t kMaxGridPreviewValues = 20000000;
 constexpr uint64_t kMaxContourDrawVertices = 200000;
 
 enum CommandId {
@@ -559,7 +558,6 @@ private:
     bool gdal_cog_available_ = false;
     bool gdal_gpkg_available_ = false;
     dt_grid_info grid_info_{};
-    std::vector<double> grid_values_;
     std::vector<uint32_t> grid_preview_;
     uint32_t grid_preview_width_ = 0;
     uint32_t grid_preview_height_ = 0;
@@ -911,7 +909,6 @@ private:
         dt_grid_destroy(grid_);
         grid_ = nullptr;
         grid_info_ = {};
-        grid_values_.clear();
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
     }
@@ -2477,55 +2474,47 @@ private:
     }
 
     bool refresh_grid_cache() {
-        grid_values_.clear();
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
         if (!grid_) return false;
         grid_info_ = {};
         grid_info_.struct_size = sizeof(grid_info_);
         if (dt_grid_get_info(grid_, &grid_info_) != DT_OK) return false;
-        if (grid_info_.width == 0 || grid_info_.height == 0 ||
-            grid_info_.width > kMaxGridPreviewValues / grid_info_.height) {
-            return true;
-        }
-        const uint64_t count = grid_info_.width * grid_info_.height;
-        if (count > kMaxGridPreviewValues) return true;
-        grid_values_.resize(static_cast<size_t>(count));
-        if (dt_grid_read_window(grid_, 0, 0, grid_info_.width,
-                                grid_info_.height, grid_values_.data(),
-                                grid_info_.width) != DT_OK) {
-            grid_values_.clear();
-            return false;
-        }
-        grid_zmin_ = std::numeric_limits<double>::max();
-        grid_zmax_ = std::numeric_limits<double>::lowest();
-        for (double value : grid_values_) {
-            if (is_grid_nodata(value)) continue;
-            grid_zmin_ = std::min(grid_zmin_, value);
-            grid_zmax_ = std::max(grid_zmax_, value);
-        }
-        if (grid_zmax_ < grid_zmin_) {
-            grid_zmin_ = 0.0;
-            grid_zmax_ = 1.0;
-        } else if (grid_zmax_ == grid_zmin_) {
-            grid_zmax_ = grid_zmin_ + 1.0;
-        }
+        if (grid_info_.width == 0 || grid_info_.height == 0) return false;
         grid_preview_width_ = static_cast<uint32_t>(
             std::min<uint64_t>(512, grid_info_.width));
         grid_preview_height_ = static_cast<uint32_t>(
             std::min<uint64_t>(512, grid_info_.height));
+        std::vector<double> overview(
+            static_cast<size_t>(grid_preview_width_) * grid_preview_height_);
+        dt_grid_overview_options options{};
+        options.struct_size = sizeof(options);
+        options.method = DT_GRID_OVERVIEW_AVERAGE;
+        options.worker_count = terrain_worker_count_;
+        options.tile_row_count = terrain_tile_rows_;
+        dt_grid_overview_result result{};
+        if (dt_grid_read_overview(grid_, &options, grid_preview_width_,
+                                  grid_preview_height_, overview.data(), 0,
+                                  &result) != DT_OK) {
+            grid_preview_width_ = grid_preview_height_ = 0;
+            return false;
+        }
+        if (result.valid_value_count == 0) {
+            grid_zmin_ = 0.0;
+            grid_zmax_ = 1.0;
+        } else {
+            grid_zmin_ = result.minimum_value;
+            grid_zmax_ = result.maximum_value;
+        }
+        if (grid_zmax_ == grid_zmin_) {
+            grid_zmax_ = grid_zmin_ + 1.0;
+        }
         grid_preview_.resize(static_cast<size_t>(grid_preview_width_) *
                              grid_preview_height_);
         for (uint32_t row = 0; row < grid_preview_height_; ++row) {
-            const uint64_t source_row = grid_preview_height_ == 1 ? 0 :
-                static_cast<uint64_t>(row) * (grid_info_.height - 1) /
-                (grid_preview_height_ - 1);
             for (uint32_t column = 0; column < grid_preview_width_; ++column) {
-                const uint64_t source_column = grid_preview_width_ == 1 ? 0 :
-                    static_cast<uint64_t>(column) * (grid_info_.width - 1) /
-                    (grid_preview_width_ - 1);
-                const double value = grid_values_[static_cast<size_t>(
-                    source_row * grid_info_.width + source_column)];
+                const double value = overview[static_cast<size_t>(row) *
+                                              grid_preview_width_ + column];
                 grid_preview_[static_cast<size_t>(row) * grid_preview_width_ +
                               column] = is_grid_nodata(value)
                                             ? 0x00191f24U
@@ -2543,30 +2532,30 @@ private:
         if (dt_grid_get_info(terrain_grid_, &info) != DT_OK) return false;
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
-        if (info.width == 0 || info.height == 0 ||
-            info.width > kMaxGridPreviewValues / info.height ||
-            info.width * info.height > kMaxGridPreviewValues) {
-            return true;
-        }
-        std::vector<double> values(static_cast<size_t>(info.width * info.height));
-        if (dt_grid_read_window(terrain_grid_, 0, 0, info.width, info.height,
-                                values.data(), info.width) != DT_OK) {
-            return false;
-        }
+        if (info.width == 0 || info.height == 0) return false;
         grid_preview_width_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.width));
         grid_preview_height_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.height));
+        std::vector<double> values(static_cast<size_t>(grid_preview_width_) *
+                                   grid_preview_height_);
+        dt_grid_overview_options options{};
+        options.struct_size = sizeof(options);
+        options.method = grid_theme_ == GridTheme::Aspect
+            ? DT_GRID_OVERVIEW_NEAREST
+            : DT_GRID_OVERVIEW_AVERAGE;
+        options.worker_count = terrain_worker_count_;
+        options.tile_row_count = terrain_tile_rows_;
+        if (dt_grid_read_overview(terrain_grid_, &options,
+                                  grid_preview_width_, grid_preview_height_,
+                                  values.data(), 0, nullptr) != DT_OK) {
+            grid_preview_width_ = grid_preview_height_ = 0;
+            return false;
+        }
         grid_preview_.resize(static_cast<size_t>(grid_preview_width_) *
                              grid_preview_height_);
         for (uint32_t row = 0; row < grid_preview_height_; ++row) {
-            const uint64_t source_row = grid_preview_height_ == 1 ? 0 :
-                static_cast<uint64_t>(row) * (info.height - 1) /
-                (grid_preview_height_ - 1);
             for (uint32_t column = 0; column < grid_preview_width_; ++column) {
-                const uint64_t source_column = grid_preview_width_ == 1 ? 0 :
-                    static_cast<uint64_t>(column) * (info.width - 1) /
-                    (grid_preview_width_ - 1);
                 const double value = values[static_cast<size_t>(
-                    source_row * info.width + source_column)];
+                    row) * grid_preview_width_ + column];
                 grid_preview_[static_cast<size_t>(row) * grid_preview_width_ +
                               column] = is_grid_nodata(info, value)
                                             ? 0x00191f24U
@@ -3917,12 +3906,12 @@ private:
                 action_text_ = L"生成等高线失败：请先生成或导入 GRID";
                 return;
             }
-            if (grid_values_.empty() && !refresh_grid_cache()) {
+            if (grid_preview_.empty() && !refresh_grid_cache()) {
                 action_text_ = L"读取 GRID 失败：" + last_error_text();
                 return;
             }
-            if (grid_values_.empty()) {
-                action_text_ = L"GRID 超过演示程序 2000 万节点缓存上限，未生成等高线";
+            if (grid_info_.valid_value_count == 0) {
+                action_text_ = L"生成等高线失败：GRID 没有有效高程节点";
                 return;
             }
             zmin = grid_zmin_;
@@ -4239,8 +4228,10 @@ private:
              << L"×" << grid_info_.height << L"，有效节点 "
              << grid_info_.valid_value_count << L"，耗时 " << std::fixed
              << std::setprecision(1) << ms << L" ms；量测多边形已清除";
-        if (grid_values_.empty())
-            text << L"（超过 2000 万节点，仅保留数据层）";
+        if (grid_info_.width > grid_preview_width_ ||
+            grid_info_.height > grid_preview_height_)
+            text << L"；LOD 预览 " << grid_preview_width_ << L"×"
+                 << grid_preview_height_;
         action_text_ = text.str();
         if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
         if (saw_quit) PostQuitMessage(quit_code);
@@ -4795,7 +4786,9 @@ private:
             text << terrain_worker_count_;
         text << L"，块高="
              << (terrain_tile_rows_ == 0 ? 64U : terrain_tile_rows_);
-        if (grid_preview_.empty()) text << L"（数据已生成，预览超过 2000 万节点上限）";
+        if (!grid_preview_.empty())
+            text << L"，LOD 预览 " << grid_preview_width_ << L"×"
+                 << grid_preview_height_;
         action_text_ = text.str();
         if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
         if (saw_quit) PostQuitMessage(quit_code);
@@ -4887,7 +4880,10 @@ private:
         text << L"已导入 GRID：" << grid_info_.width << L"×"
              << grid_info_.height << L"，有效节点 "
              << grid_info_.valid_value_count;
-        if (grid_values_.empty()) text << L"（超过 2000 万节点，仅保留数据层）";
+        if (grid_info_.width > grid_preview_width_ ||
+            grid_info_.height > grid_preview_height_)
+            text << L"；LOD 预览 " << grid_preview_width_ << L"×"
+                 << grid_preview_height_;
         action_text_ = text.str();
     }
 
@@ -4990,7 +4986,10 @@ private:
              << grid_info_.height << L"，有效节点 "
              << grid_info_.valid_value_count << L"，耗时 " << std::fixed
              << std::setprecision(1) << ms << L" ms";
-        if (grid_values_.empty()) text << L"（超过 2000 万节点，仅保留数据层）";
+        if (grid_info_.width > grid_preview_width_ ||
+            grid_info_.height > grid_preview_height_)
+            text << L"；LOD 预览 " << grid_preview_width_ << L"×"
+                 << grid_preview_height_;
         action_text_ = text.str();
     }
 

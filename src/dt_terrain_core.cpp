@@ -1711,6 +1711,273 @@ void Grid::read_window(uint64_t column, uint64_t row, uint64_t width,
     }
 }
 
+dt_grid_overview_result Grid::read_overview(
+    const dt_grid_overview_options& options, uint64_t output_width,
+    uint64_t output_height, double* output, uint64_t stride) const {
+    if (!output) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "overview output_values is null");
+    }
+    const uint32_t method = options.method == 0
+                                ? static_cast<uint32_t>(
+                                      DT_GRID_OVERVIEW_AVERAGE)
+                                : options.method;
+    if (method != DT_GRID_OVERVIEW_AVERAGE &&
+        method != DT_GRID_OVERVIEW_NEAREST &&
+        method != DT_GRID_OVERVIEW_MINIMUM &&
+        method != DT_GRID_OVERVIEW_MAXIMUM) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown GRID overview method");
+    }
+    constexpr uint32_t kKnownFlags = DT_GRID_OVERVIEW_STRICT_NODATA;
+    if ((options.flags & ~kKnownFlags) != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown GRID overview flags");
+    }
+    if (options.worker_count > 64) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID overview worker_count exceeds 64");
+    }
+    constexpr uint32_t kDefaultTileRows = 16;
+    constexpr uint32_t kMaximumTileRows = 1024U * 1024U;
+    const uint32_t tile_rows = options.tile_row_count == 0
+                                   ? kDefaultTileRows
+                                   : options.tile_row_count;
+    if (tile_rows > kMaximumTileRows) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID overview tile_row_count is too large");
+    }
+    if (options.source_column >= width() || options.source_row >= height()) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID overview source origin is outside the GRID");
+    }
+    const uint64_t source_width = options.source_width == 0
+        ? width() - options.source_column
+        : options.source_width;
+    const uint64_t source_height = options.source_height == 0
+        ? height() - options.source_row
+        : options.source_height;
+    if (source_width == 0 || source_height == 0 ||
+        source_width > width() - options.source_column ||
+        source_height > height() - options.source_row) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID overview source window is outside the GRID");
+    }
+    constexpr uint64_t kMaximumOverviewDimension = 1024ULL * 1024ULL;
+    if (output_width == 0 || output_height == 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID overview output dimensions must be positive");
+    }
+    if (output_width > kMaximumOverviewDimension ||
+        output_height > kMaximumOverviewDimension ||
+        output_width > kMaximumGridValues / output_height) {
+        throw Exception(DT_E_LIMIT_EXCEEDED,
+                        "GRID overview output size is invalid or too large");
+    }
+    const bool aggregate = method != DT_GRID_OVERVIEW_NEAREST;
+    if (aggregate &&
+        (output_width > source_width || output_height > source_height)) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "aggregate GRID overview cannot upsample");
+    }
+    if (stride == 0) stride = output_width;
+    if (stride < output_width) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID overview row_stride is smaller than output width");
+    }
+    const uint64_t maximum_index =
+        static_cast<uint64_t>(std::numeric_limits<std::ptrdiff_t>::max());
+    if (stride > maximum_index ||
+        output_height - 1 >
+            (maximum_index - (output_width - 1)) / stride) {
+        throw Exception(DT_E_LIMIT_EXCEEDED,
+                        "GRID overview output stride is too large");
+    }
+
+    struct Statistics {
+        uint64_t valid = 0;
+        uint64_t nodata = 0;
+        long double sum = 0.0L;
+        double minimum = std::numeric_limits<double>::infinity();
+        double maximum = -std::numeric_limits<double>::infinity();
+
+        void add(double value, bool invalid) {
+            if (invalid) {
+                ++nodata;
+                return;
+            }
+            ++valid;
+            sum += static_cast<long double>(value);
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+        }
+    };
+    std::vector<Statistics> row_statistics(static_cast<size_t>(output_height));
+    const bool strict_nodata =
+        (options.flags & DT_GRID_OVERVIEW_STRICT_NODATA) != 0;
+    const double output_nodata = (flags() & DT_GRID_HAS_NODATA) != 0
+        ? nodata()
+        : std::numeric_limits<double>::quiet_NaN();
+    const auto partition = [](uint64_t index, uint64_t source_extent,
+                              uint64_t output_extent) {
+        return index * source_extent / output_extent;
+    };
+    const auto nearest_index = [](uint64_t index, uint64_t source_extent,
+                                  uint64_t output_extent) {
+        return ((2U * index + 1U) * source_extent) /
+               (2U * output_extent);
+    };
+    const auto compute_row = [&](uint64_t output_row) {
+        Statistics statistics;
+        double* destination = output + static_cast<size_t>(output_row * stride);
+        if (method == DT_GRID_OVERVIEW_NEAREST) {
+            const uint64_t source_y = options.source_row + std::min(
+                source_height - 1,
+                nearest_index(output_row, source_height, output_height));
+            for (uint64_t output_column = 0; output_column < output_width;
+                 ++output_column) {
+                const uint64_t source_x = options.source_column + std::min(
+                    source_width - 1,
+                    nearest_index(output_column, source_width, output_width));
+                const double value = values_[offset(source_x, source_y)];
+                const bool invalid = is_nodata(value);
+                statistics.add(value, invalid);
+                destination[static_cast<size_t>(output_column)] =
+                    invalid ? output_nodata : value;
+            }
+            row_statistics[static_cast<size_t>(output_row)] = statistics;
+            return;
+        }
+
+        const uint64_t source_y_begin = options.source_row +
+            partition(output_row, source_height, output_height);
+        const uint64_t source_y_end = options.source_row +
+            partition(output_row + 1, source_height, output_height);
+        for (uint64_t output_column = 0; output_column < output_width;
+             ++output_column) {
+            const uint64_t source_x_begin = options.source_column +
+                partition(output_column, source_width, output_width);
+            const uint64_t source_x_end = options.source_column +
+                partition(output_column + 1, source_width, output_width);
+            uint64_t valid = 0;
+            bool invalid_seen = false;
+            long double sum = 0.0L;
+            double minimum = std::numeric_limits<double>::infinity();
+            double maximum = -std::numeric_limits<double>::infinity();
+            for (uint64_t source_y = source_y_begin;
+                 source_y < source_y_end; ++source_y) {
+                size_t source_index = offset(source_x_begin, source_y);
+                for (uint64_t source_x = source_x_begin;
+                     source_x < source_x_end; ++source_x, ++source_index) {
+                    const double value = values_[source_index];
+                    const bool invalid = is_nodata(value);
+                    statistics.add(value, invalid);
+                    if (invalid) {
+                        invalid_seen = true;
+                        continue;
+                    }
+                    ++valid;
+                    sum += static_cast<long double>(value);
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                }
+            }
+            double value = output_nodata;
+            if (valid != 0 && !(strict_nodata && invalid_seen)) {
+                if (method == DT_GRID_OVERVIEW_AVERAGE) {
+                    value = static_cast<double>(sum /
+                                                static_cast<long double>(valid));
+                } else if (method == DT_GRID_OVERVIEW_MINIMUM) {
+                    value = minimum;
+                } else {
+                    value = maximum;
+                }
+            }
+            destination[static_cast<size_t>(output_column)] = value;
+        }
+        row_statistics[static_cast<size_t>(output_row)] = statistics;
+    };
+
+    const uint64_t tile_count =
+        (output_height + static_cast<uint64_t>(tile_rows) - 1U) / tile_rows;
+    uint32_t worker_count = options.worker_count;
+    if (worker_count == 0) {
+        worker_count = std::thread::hardware_concurrency();
+        if (worker_count == 0) worker_count = 4;
+        worker_count = std::min(worker_count, 32U);
+    }
+    worker_count = static_cast<uint32_t>(std::min<uint64_t>(
+        worker_count, std::max<uint64_t>(1, tile_count)));
+    if (worker_count == 1) {
+        for (uint64_t row = 0; row < output_height; ++row) compute_row(row);
+    } else {
+        std::atomic<uint64_t> next_row{0};
+        std::atomic<bool> stop_requested{false};
+        std::mutex error_mutex;
+        std::exception_ptr worker_error;
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        const auto worker = [&] {
+            try {
+                while (!stop_requested.load()) {
+                    const uint64_t begin = next_row.fetch_add(tile_rows);
+                    if (begin >= output_height) break;
+                    const uint64_t end = std::min<uint64_t>(
+                        output_height,
+                        begin + static_cast<uint64_t>(tile_rows));
+                    for (uint64_t row = begin; row < end; ++row) {
+                        if (stop_requested.load()) break;
+                        compute_row(row);
+                    }
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!worker_error) worker_error = std::current_exception();
+                }
+                stop_requested.store(true);
+            }
+        };
+        try {
+            for (uint32_t index = 0; index < worker_count; ++index)
+                workers.emplace_back(worker);
+        } catch (...) {
+            stop_requested.store(true);
+            for (auto& thread : workers)
+                if (thread.joinable()) thread.join();
+            throw;
+        }
+        for (auto& thread : workers)
+            if (thread.joinable()) thread.join();
+        if (worker_error) std::rethrow_exception(worker_error);
+    }
+
+    Statistics total;
+    for (const auto& statistics : row_statistics) {
+        total.valid += statistics.valid;
+        total.nodata += statistics.nodata;
+        total.sum += statistics.sum;
+        total.minimum = std::min(total.minimum, statistics.minimum);
+        total.maximum = std::max(total.maximum, statistics.maximum);
+    }
+    dt_grid_overview_result result{};
+    result.struct_size = sizeof(result);
+    if (aggregate)
+        result.flags |= DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS;
+    result.valid_value_count = total.valid;
+    result.nodata_value_count = total.nodata;
+    if (total.valid != 0) {
+        result.minimum_value = total.minimum;
+        result.maximum_value = total.maximum;
+        result.mean_value = static_cast<double>(
+            total.sum / static_cast<long double>(total.valid));
+    } else {
+        result.minimum_value = std::numeric_limits<double>::quiet_NaN();
+        result.maximum_value = std::numeric_limits<double>::quiet_NaN();
+        result.mean_value = std::numeric_limits<double>::quiet_NaN();
+    }
+    return result;
+}
+
 void Grid::write_window(uint64_t column, uint64_t row, uint64_t width,
                         uint64_t height, const double* input, uint64_t stride) {
     if (!input) throw Exception(DT_E_INVALID_ARGUMENT, "values is null");

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.25.0
+    VERSION 0.26.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -196,6 +196,16 @@ if(DT_BUILD_TESTS)
     else()
         target_compile_options(dterrain_clip_tests PRIVATE -UNDEBUG)
     endif()
+
+    add_executable(dterrain_overview_tests tests/test_overview.cpp)
+    target_compile_features(dterrain_overview_tests PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_overview_tests PRIVATE dterrain)
+    add_test(NAME dterrain_overview_tests COMMAND dterrain_overview_tests)
+    if(MSVC)
+        target_compile_options(dterrain_overview_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(dterrain_overview_tests PRIVATE -UNDEBUG)
+    endif()
 endif()
 
 if(DT_BUILD_EXAMPLES)
@@ -234,6 +244,10 @@ if(DT_BUILD_BENCHMARKS)
         benchmarks/clip_benchmark.cpp)
     target_compile_features(dterrain_clip_benchmark PRIVATE cxx_std_17)
     target_link_libraries(dterrain_clip_benchmark PRIVATE dterrain)
+    add_executable(dterrain_overview_benchmark
+        benchmarks/overview_benchmark.cpp)
+    target_compile_features(dterrain_overview_benchmark PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_overview_benchmark PRIVATE dterrain)
 endif()
 
 if(DT_BUILD_GUI AND WIN32)

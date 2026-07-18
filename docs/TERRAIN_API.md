@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.25 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.26 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -22,6 +22,50 @@ TIN、GRID 和等高线句柄都可保存可选 CRS WKT。使用 `dt_set_crs_wkt
 
 `dt_grid_read_window()`、`dt_grid_write_window()` 支持局部窗口；`row_stride`
 以 `double` 个数计，零表示紧密排列。GRID 句柄由 `dt_grid_destroy()` 释放。
+
+## GRID 窗口概览与 LOD 读取
+
+`dt_grid_read_overview()` 把源 GRID 的任意行列窗口直接聚合到调用方拥有的小型
+double 缓冲区，不创建第二个 GRID 句柄，也不复制整幅源数组：
+
+```cpp
+dt_grid_overview_options options{};
+options.struct_size = sizeof(options);
+options.method = DT_GRID_OVERVIEW_AVERAGE; // 0 也表示平均
+options.source_column = 0;
+options.source_row = 0;
+options.source_width = 0;  // 到源 GRID 右边界
+options.source_height = 0; // 到源 GRID 下边界
+options.worker_count = 0;  // 自动最多 32；显式最多 64
+options.tile_row_count = 16;
+
+std::vector<double> preview(512 * 512);
+dt_grid_overview_result statistics{};
+dt_status status = dt_grid_read_overview(
+    grid, &options, 512, 512, preview.data(), 512, &statistics);
+```
+
+| 方法 | 分箱行为 | 常见用途 |
+|---|---|---|
+| `AVERAGE` | 有效源节点算术平均；默认方法 | 连续高程、坡度、阴影和高差预览 |
+| `NEAREST` | 取每个输出位置对应的源窗口中心样本；允许上采样 | 分类值、坡向角、极速预览 |
+| `MINIMUM` | 每个整数分箱的有效最小值 | 保留洼地或下包络 |
+| `MAXIMUM` | 每个整数分箱的有效最大值 | 保留峰值或上包络 |
+
+平均、最小和最大模式要求输出宽高不超过源窗口。其分箱边界使用整数比例计算，所有
+分箱无缝、无重叠地覆盖窗口，因此每个源节点恰好贡献一次。默认忽略 NoData；分箱
+没有有效值时输出源 NoData（源无 NoData 时为 NaN）。设置
+`DT_GRID_OVERVIEW_STRICT_NODATA` 后，只要分箱含一个无效节点，整个输出格就是
+NoData。该标志不改变最近邻。
+
+`dt_grid_overview_options` 和 `dt_grid_overview_result` 均固定为 64 字节。聚合模式的
+结果统计覆盖完整源窗口，并设置 `DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS`；最近邻
+统计只覆盖实际输出样本，因此该标志为空。结果结构可传 `nullptr`。`row_stride` 以
+double 计，0 表示输出宽度；输出维度上限为每轴 1,048,576 且总计不超过十亿个值。
+
+工作线程按输出行块写互不重叠的调用方区域，自动线程数最多 32，显式最多 64；所有
+统计按输出行顺序归并，所以串并行输出和均值确定一致。接口是同步调用：返回前调用方
+不得释放输出缓冲区，也不得并发修改源 GRID。
 
 ## GRID 显式重采样与节点对齐
 
@@ -358,6 +402,9 @@ O(width×height)，其中输出 GRID 占约 8×width×height 字节。
 ## 当前复杂度与大数据注意事项
 
 - GRID 存储为连续 `double` 数组，约占 `8 * width * height` 字节；
+- GRID 概览只分配与输出行数成比例的统计暂存；GUI 固定使用最多 512×512 输出，
+  因此不再复制整幅源 GRID。聚合方法仍须读取选定窗口的全部节点，耗时与源窗口节点数
+  线性相关；最近邻只读取输出样本；
 - TIN→GRID 当前逐节点定位，适合正确性基线和中等 GRID；下一阶段会增加按三角形
   分块光栅化；
 - 等高线生成不复制完整 GRID 三角面集，TIN 等高线也通过两次流式遍历三角形；

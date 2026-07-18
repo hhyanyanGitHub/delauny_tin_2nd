@@ -91,6 +91,9 @@ enum CommandId {
     ID_MEASURE_DATUM,
     ID_MEASURE_EXPORT,
     ID_MEASURE_CLEAR,
+    ID_GRID_MASK_MEASUREMENT,
+    ID_GRID_CLIP_MEASUREMENT,
+    ID_GRID_INVERT_MEASUREMENT,
     ID_SLOPE_MODE,
     ID_SLOPE_CLEAR,
     ID_TERRAIN_SLOPE_GRID,
@@ -737,6 +740,13 @@ private:
                     L"导出量测 CSV…");
         AppendMenuW(analysis_menu, MF_STRING, ID_MEASURE_CLEAR,
                     L"清除面积/土方量测");
+        AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(analysis_menu, MF_STRING, ID_GRID_MASK_MEASUREMENT,
+                    L"按量测多边形掩膜当前 GRID（保持范围）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_GRID_CLIP_MEASUREMENT,
+                    L"按量测多边形裁剪当前 GRID（紧凑适屏）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_GRID_INVERT_MEASUREMENT,
+                    L"按量测多边形反向掩膜当前 GRID");
         AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_LOAD_DESIGN,
                     L"加载设计面 DGRID…");
@@ -4114,6 +4124,128 @@ private:
         return true;
     }
 
+    void clip_grid_with_measurement(uint32_t flags) {
+        if (!grid_) {
+            action_text_ = L"GRID 区域处理失败：当前没有高程 GRID";
+            return;
+        }
+        if (!measurement_complete_ || measurement_polygon_.size() < 3) {
+            action_text_ = L"GRID 区域处理失败：请先完成一个面积/土方量测多边形";
+            return;
+        }
+        dt_grid_clip_options options{};
+        options.struct_size = sizeof(options);
+        options.flags = flags;
+        options.worker_count = terrain_worker_count_;
+        options.tile_row_count = terrain_tile_rows_;
+        options.output_nodata_value = -9999.0;
+        dt_task_handle task = nullptr;
+        const dt_status start_status = dt_grid_clip_polygon_async(
+            grid_, measurement_polygon_.data(), measurement_polygon_.size(),
+            &options, &task);
+        if (start_status != DT_OK) {
+            action_text_ = L"GRID 区域处理启动失败：" + last_error_text();
+            return;
+        }
+        const wchar_t* operation =
+            (flags & DT_GRID_CLIP_CROP_TO_BOUNDS) != 0
+                ? L"紧凑裁剪"
+                : (flags & DT_GRID_CLIP_INVERT) != 0
+                      ? L"反向掩膜"
+                      : L"区域掩膜";
+        terrain_task_ = task;
+        terrain_task_running_ = true;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        int32_t completed = 0;
+        int quit_code = 0;
+        bool saw_quit = false;
+        dt_task_info task_info{};
+        while (!completed) {
+            if (dt_task_wait(task, 25, &completed) != DT_OK) {
+                dt_task_request_cancel(task);
+                break;
+            }
+            if (dt_task_get_info(task, &task_info) == DT_OK) {
+                const int percent = static_cast<int>(std::clamp(
+                    task_info.progress * 100.0, 0.0, 100.0));
+                std::wostringstream status;
+                status << L"正在" << operation << L" GRID：" << percent
+                       << L"%（Esc 可取消）";
+                if (task_info.cancellation_requested) status << L"，正在取消…";
+                action_text_ = status.str();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                UpdateWindow(hwnd_);
+            }
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) {
+                    saw_quit = true;
+                    quit_code = static_cast<int>(message.wParam);
+                    dt_task_request_cancel(task);
+                    continue;
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if (!completed) dt_task_wait(task, UINT32_MAX, &completed);
+        dt_task_get_info(task, &task_info);
+        dt_grid_handle output = nullptr;
+        dt_status result_status = task_info.result_status;
+        if (task_info.state == DT_TASK_SUCCEEDED)
+            result_status = dt_task_get_grid_result(task, &output);
+        std::wstring task_error;
+        if (task_info.state == DT_TASK_FAILED) {
+            char buffer[1024]{};
+            if (dt_task_get_error(task, buffer, sizeof(buffer), nullptr) == DT_OK)
+                task_error = utf8_to_wide(buffer);
+        }
+        terrain_task_running_ = false;
+        terrain_task_ = nullptr;
+        dt_task_destroy(task);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (task_info.state == DT_TASK_CANCELLED) {
+            action_text_ = std::wstring(L"GRID ") + operation +
+                           L"已取消；原 GRID 保持不变";
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
+            return;
+        }
+        if (result_status != DT_OK || !output) {
+            dt_grid_destroy(output);
+            action_text_ = std::wstring(L"GRID ") + operation + L"失败：" +
+                           (task_error.empty() ? last_error_text() : task_error);
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
+            return;
+        }
+        destroy_grid_layer();
+        destroy_contour_layer();
+        clear_measurement();
+        grid_ = output;
+        show_grid_ = true;
+        grid_theme_ = GridTheme::Elevation;
+        update_layer_menu();
+        refresh_grid_cache();
+        enter_2d_view();
+        fit_view_to_bounds(grid_info_.bounds, 1.08);
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << L"GRID " << operation << L"完成：" << grid_info_.width
+             << L"×" << grid_info_.height << L"，有效节点 "
+             << grid_info_.valid_value_count << L"，耗时 " << std::fixed
+             << std::setprecision(1) << ms << L" ms；量测多边形已清除";
+        if (grid_values_.empty())
+            text << L"（超过 2000 万节点，仅保留数据层）";
+        action_text_ = text.str();
+        if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+        if (saw_quit) PostQuitMessage(quit_code);
+    }
+
     void clear_earthwork_output(bool clear_design) {
         if (grid_theme_ == GridTheme::Difference) {
             dt_grid_destroy(terrain_grid_);
@@ -5161,6 +5293,15 @@ private:
         case ID_MEASURE_CLEAR:
             clear_measurement();
             action_text_ = L"面积/土方量测已清除";
+            break;
+        case ID_GRID_MASK_MEASUREMENT:
+            clip_grid_with_measurement(0);
+            break;
+        case ID_GRID_CLIP_MEASUREMENT:
+            clip_grid_with_measurement(DT_GRID_CLIP_CROP_TO_BOUNDS);
+            break;
+        case ID_GRID_INVERT_MEASUREMENT:
+            clip_grid_with_measurement(DT_GRID_CLIP_INVERT);
             break;
         case ID_EARTHWORK_LOAD_DESIGN: load_earthwork_design(false); break;
         case ID_EARTHWORK_LOAD_DESIGN_GDAL: load_earthwork_design(true); break;

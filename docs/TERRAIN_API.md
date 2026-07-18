@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.24 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.25 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -62,6 +62,46 @@ if (status == DT_OK) dt_grid_destroy(aligned);
 源和参考 GRID 生命周期；用 `dt_task_get_info()` 查询进度、
 `dt_task_request_cancel()` 请求取消，成功后以 `dt_task_get_grid_result()` 取得调用方
 拥有的新句柄。失败或取消不发布半成品。
+
+## GRID 任意多边形裁剪与掩膜
+
+`dt_grid_clip_polygon()` 在世界 XY 中接收不少于三个 `dt_point3`；Z 被忽略，多边形
+自动闭合。边界节点属于区域内，自交边界按偶奇规则确定内外：
+
+```cpp
+dt_point3 polygon[] = {
+    {500000.0, 3200000.0, 0.0},
+    {500500.0, 3200000.0, 0.0},
+    {500450.0, 3200400.0, 0.0},
+    {500050.0, 3200450.0, 0.0}
+};
+dt_grid_clip_options options{};
+options.struct_size = sizeof(options);
+options.flags = DT_GRID_CLIP_CROP_TO_BOUNDS;
+options.worker_count = 0;   // 自动最多 32；显式最多 64
+options.tile_row_count = 0; // 默认 64 行
+
+dt_grid_handle clipped = nullptr;
+dt_status status = dt_grid_clip_polygon(
+    source, polygon, 4, &options, &clipped);
+if (status == DT_OK) dt_grid_destroy(clipped);
+```
+
+| flags | 输出几何 | 保留节点 |
+|---|---|---|
+| `0` | 与源 GRID 完全相同 | 多边形内部及边界 |
+| `DT_GRID_CLIP_CROP_TO_BOUNDS` | 缩小到多边形可能覆盖的源节点行列包络 | 多边形内部及边界 |
+| `DT_GRID_CLIP_INVERT` | 与源 GRID 完全相同 | 多边形外部，不含边界 |
+
+紧凑裁剪会平移仿射原点，像元列/行向量不变；若包络中没有任何源节点，返回
+`DT_E_NOT_FOUND`。紧凑裁剪与反向掩膜组合没有明确意义，因此返回
+`DT_E_INVALID_ARGUMENT`。输出始终带 NoData：`output_nodata_value=0` 时优先沿用源
+NoData，否则选择 NaN。源中的 NaN/NoData 即使落在保留区域内也不会变为有效值。
+
+实现把多边形一次性逆变换到源 GRID 连续行列空间，逐节点只执行边界/偶奇测试，支持
+旋转、剪切和负像元高。`dt_grid_clip_polygon_async()` 启动前深拷贝输入点，调用方可
+立即释放原数组；任务结果仍以 `DT_TASK_RESULT_GRID` 和
+`dt_task_get_grid_result()` 提取。同步/异步取消或失败均不发布半成品。
 
 ## TIN 与 GRID
 

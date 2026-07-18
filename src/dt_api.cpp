@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -156,6 +157,22 @@ void validate_options(const T* options, const char* name) {
                             std::string(name) +
                                 " has an incompatible struct_size");
     }
+}
+
+std::vector<dt_point3> copy_clip_polygon(const dt_point3* points,
+                                         uint64_t point_count) {
+    constexpr uint64_t kMaximumClipVertices = 10000000ULL;
+    if (!points || point_count < 3) {
+        throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                            "GRID clip polygon needs at least three points");
+    }
+    if (point_count > kMaximumClipVertices ||
+        point_count > static_cast<uint64_t>(
+                          std::numeric_limits<size_t>::max())) {
+        throw dt::Exception(DT_E_LIMIT_EXCEEDED,
+                            "GRID clip polygon has too many points");
+    }
+    return std::vector<dt_point3>(points, points + point_count);
 }
 
 bool task_finished(int32_t state) noexcept {
@@ -481,6 +498,25 @@ dt_status DT_CALL dt_grid_resample_like(
     });
 }
 
+dt_status DT_CALL dt_grid_clip_polygon(
+    dt_grid_handle source_grid, const dt_point3* polygon_points,
+    uint64_t point_count, const dt_grid_clip_options* options,
+    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_clip_options");
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_grid is null");
+        }
+        auto polygon = copy_clip_polygon(polygon_points, point_count);
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::grid_clip_polygon(
+            require_grid(source_grid), polygon, *options);
+        *output_grid = result.release();
+    });
+}
+
 dt_status DT_CALL dt_grid_compare_earthwork(
     dt_grid_handle existing_grid, dt_grid_handle design_grid,
     const dt_grid_earthwork_options* options,
@@ -768,6 +804,31 @@ dt_status DT_CALL dt_grid_resample_like_async(
             [source, reference, copied_options](dt_task_t& task) {
                 task.grid_result = dt::grid_resample_like(
                     *source, *reference, copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+            });
+    });
+}
+
+dt_status DT_CALL dt_grid_clip_polygon_async(
+    dt_grid_handle source_grid, const dt_point3* polygon_points,
+    uint64_t point_count, const dt_grid_clip_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_clip_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto source = require_grid_shared(source_grid);
+        const auto copied_options = *options;
+        auto polygon = copy_clip_polygon(polygon_points, point_count);
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID,
+            [source, copied_options, polygon = std::move(polygon)](
+                dt_task_t& task) {
+                task.grid_result = dt::grid_clip_polygon(
+                    *source, polygon, copied_options,
                     [&](double value) { task.progress.store(value); },
                     [&] { return task.cancellation_requested.load(); });
             });

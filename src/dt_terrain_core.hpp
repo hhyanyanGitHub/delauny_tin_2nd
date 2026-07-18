@@ -55,6 +55,10 @@ private:
         const Grid& source, const Grid& reference,
         const dt_grid_resample_options& options,
         const ProgressCallback& progress, const CancelCallback& cancelled);
+    friend std::unique_ptr<Grid> grid_clip_polygon(
+        const Grid& source, const std::vector<dt_point3>& polygon,
+        const dt_grid_clip_options& options,
+        const ProgressCallback& progress, const CancelCallback& cancelled);
 
     dt_grid_create_options options_{};
     std::vector<double> values_;
@@ -107,6 +111,11 @@ GridEarthworkComputation grid_compare_earthwork(
 std::unique_ptr<Grid> grid_resample_like(
     const Grid& source, const Grid& reference,
     const dt_grid_resample_options& options,
+    const ProgressCallback& progress = {},
+    const CancelCallback& cancelled = {});
+std::unique_ptr<Grid> grid_clip_polygon(
+    const Grid& source, const std::vector<dt_point3>& polygon,
+    const dt_grid_clip_options& options,
     const ProgressCallback& progress = {},
     const CancelCallback& cancelled = {});
 std::vector<dt_point3> points_from_grid(

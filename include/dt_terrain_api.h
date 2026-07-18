@@ -47,6 +47,15 @@ enum dt_grid_resample_flags {
     DT_GRID_RESAMPLE_RENORMALIZE_NODATA = 1u << 0
 };
 
+enum dt_grid_clip_flags {
+    /* Shrinks the output to the source-node bounding rectangle that can
+       contain the polygon. Without this flag the source geometry is kept. */
+    DT_GRID_CLIP_CROP_TO_BOUNDS = 1u << 0,
+    /* Keeps nodes outside the polygon instead of inside it. This cannot be
+       combined with DT_GRID_CLIP_CROP_TO_BOUNDS. */
+    DT_GRID_CLIP_INVERT = 1u << 1
+};
+
 typedef struct dt_grid_create_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -161,6 +170,20 @@ typedef struct dt_grid_resample_options {
     uint64_t reserved[4];
 } dt_grid_resample_options;
 
+typedef struct dt_grid_clip_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Zero selects an implementation-defined automatic count. One forces
+       single-thread execution. Values above 64 are rejected. */
+    uint32_t worker_count;
+    /* Output rows claimed by one worker at a time. Zero selects 64 rows. */
+    uint32_t tile_row_count;
+    /* Zero preserves the source NoData value when present, otherwise NaN.
+       A nonzero value may be finite or NaN. */
+    double output_nodata_value;
+    uint64_t reserved[5];
+} dt_grid_clip_options;
+
 typedef struct dt_contours_to_tin_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -264,6 +287,14 @@ DT_API dt_status DT_CALL dt_grid_compare_earthwork(
 DT_API dt_status DT_CALL dt_grid_resample_like(
     dt_grid_handle source_grid, dt_grid_handle reference_grid,
     const dt_grid_resample_options* options,
+    dt_grid_handle* output_grid);
+
+/* Applies an even-odd XY polygon mask to source_grid. Point Z values are
+   ignored and the polygon is implicitly closed. Boundary nodes are inside.
+   The output always has NoData and inherits the source CRS. */
+DT_API dt_status DT_CALL dt_grid_clip_polygon(
+    dt_grid_handle source_grid, const dt_point3* polygon_points,
+    uint64_t point_count, const dt_grid_clip_options* options,
     dt_grid_handle* output_grid);
 
 /* DGRID 1 is a portable UTF-8 text format intended for tests and exchange. */

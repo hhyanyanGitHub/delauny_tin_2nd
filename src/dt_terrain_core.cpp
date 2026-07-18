@@ -28,6 +28,7 @@ constexpr uint64_t kMaximumGridValues = 1000000000ULL;
 constexpr uint64_t kMaximumContourLevels = 1000000ULL;
 constexpr uint64_t kMaximumContourLines = 100000000ULL;
 constexpr uint64_t kMaximumContourVertices = 1000000000ULL;
+constexpr uint64_t kMaximumClipVertices = 10000000ULL;
 
 void check_cancelled(const CancelCallback& cancelled) {
     if (cancelled && cancelled()) {
@@ -991,6 +992,334 @@ std::unique_ptr<Grid> grid_resample_like(
             throw Exception(DT_E_CANCELLED,
                             "GRID resampling was cancelled");
         }
+    }
+    ++output->generation_;
+    report_progress(progress, 1.0);
+    return output;
+}
+
+std::unique_ptr<Grid> grid_clip_polygon(
+    const Grid& source, const std::vector<dt_point3>& input_polygon,
+    const dt_grid_clip_options& options,
+    const ProgressCallback& progress, const CancelCallback& cancelled) {
+    constexpr uint32_t kKnownFlags =
+        DT_GRID_CLIP_CROP_TO_BOUNDS | DT_GRID_CLIP_INVERT;
+    if ((options.flags & ~kKnownFlags) != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown GRID polygon clip flags");
+    }
+    const bool crop = (options.flags & DT_GRID_CLIP_CROP_TO_BOUNDS) != 0;
+    const bool invert = (options.flags & DT_GRID_CLIP_INVERT) != 0;
+    if (crop && invert) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "cropped GRID polygon output cannot be inverted");
+    }
+    if (input_polygon.size() < 3) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID clip polygon needs at least three points");
+    }
+    if (input_polygon.size() > kMaximumClipVertices) {
+        throw Exception(DT_E_LIMIT_EXCEEDED,
+                        "GRID clip polygon has too many points");
+    }
+    if (options.worker_count > 64) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID clip worker_count exceeds 64");
+    }
+    constexpr uint32_t kDefaultTileRows = 64;
+    constexpr uint32_t kMaximumTileRows = 1024U * 1024U;
+    const uint32_t tile_rows = options.tile_row_count == 0
+                                   ? kDefaultTileRows
+                                   : options.tile_row_count;
+    if (tile_rows > kMaximumTileRows) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID clip tile_row_count is too large");
+    }
+    const double output_nodata = options.output_nodata_value == 0.0
+        ? ((source.flags() & DT_GRID_HAS_NODATA) != 0
+               ? source.nodata()
+               : std::numeric_limits<double>::quiet_NaN())
+        : options.output_nodata_value;
+    if (!(finite(output_nodata) || std::isnan(output_nodata))) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID clip output NoData must be finite or NaN");
+    }
+
+    struct Point2 {
+        double x = 0.0;
+        double y = 0.0;
+    };
+    std::vector<Point2> polygon;
+    polygon.reserve(input_polygon.size());
+    size_t input_count = input_polygon.size();
+    if (input_count > 3 &&
+        input_polygon.front().x == input_polygon.back().x &&
+        input_polygon.front().y == input_polygon.back().y) {
+        --input_count;
+    }
+    if (input_count < 3) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID clip polygon is degenerate");
+    }
+    const double* gt = source.transform();
+    const double determinant = gt[1] * gt[5] - gt[2] * gt[4];
+    for (size_t index = 0; index < input_count; ++index) {
+        const auto& point = input_polygon[index];
+        if (!finite(point.x) || !finite(point.y)) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "GRID clip polygon coordinates must be finite");
+        }
+        const double dx = point.x - gt[0];
+        const double dy = point.y - gt[3];
+        Point2 transformed{
+            (dx * gt[5] - dy * gt[2]) / determinant,
+            (dy * gt[1] - dx * gt[4]) / determinant};
+        if (!finite(transformed.x) || !finite(transformed.y)) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "GRID clip polygon coordinates are too large");
+        }
+        polygon.push_back(transformed);
+    }
+    double xmin = polygon.front().x;
+    double xmax = xmin;
+    double ymin = polygon.front().y;
+    double ymax = ymin;
+    for (const auto& point : polygon) {
+        xmin = std::min(xmin, point.x);
+        xmax = std::max(xmax, point.x);
+        ymin = std::min(ymin, point.y);
+        ymax = std::max(ymax, point.y);
+    }
+    const double coordinate_scale = std::max({
+        1.0, std::abs(xmin), std::abs(xmax), std::abs(ymin), std::abs(ymax),
+        static_cast<double>(source.width()),
+        static_cast<double>(source.height())});
+    const double length_tolerance =
+        std::numeric_limits<double>::epsilon() * coordinate_scale * 128.0;
+    const double area_tolerance = length_tolerance * coordinate_scale;
+    for (size_t index = 0; index < polygon.size(); ++index) {
+        const auto& a = polygon[index];
+        const auto& b = polygon[(index + 1) % polygon.size()];
+        if (std::hypot(b.x - a.x, b.y - a.y) <= length_tolerance) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "GRID clip polygon has duplicate adjacent points");
+        }
+    }
+    bool has_turn = false;
+    for (size_t index = 0; index < polygon.size(); ++index) {
+        const auto& a = polygon[index];
+        const auto& b = polygon[(index + 1) % polygon.size()];
+        const auto& c = polygon[(index + 2) % polygon.size()];
+        const double turn = (b.x - a.x) * (c.y - b.y) -
+                            (b.y - a.y) * (c.x - b.x);
+        if (std::abs(turn) > area_tolerance) {
+            has_turn = true;
+            break;
+        }
+    }
+    if (xmax - xmin <= length_tolerance ||
+        ymax - ymin <= length_tolerance || !has_turn) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "GRID clip polygon is degenerate");
+    }
+
+    uint64_t first_column = 0;
+    uint64_t last_column = source.width() - 1;
+    uint64_t first_row = 0;
+    uint64_t last_row = source.height() - 1;
+    if (crop) {
+        const double clipped_xmin = std::max(0.0, xmin - length_tolerance);
+        const double clipped_xmax = std::min(
+            static_cast<double>(last_column), xmax + length_tolerance);
+        const double clipped_ymin = std::max(0.0, ymin - length_tolerance);
+        const double clipped_ymax = std::min(
+            static_cast<double>(last_row), ymax + length_tolerance);
+        if (clipped_xmin > clipped_xmax || clipped_ymin > clipped_ymax) {
+            throw Exception(DT_E_NOT_FOUND,
+                            "GRID clip polygon contains no source nodes");
+        }
+        first_column = static_cast<uint64_t>(std::ceil(clipped_xmin));
+        last_column = static_cast<uint64_t>(std::floor(clipped_xmax));
+        first_row = static_cast<uint64_t>(std::ceil(clipped_ymin));
+        last_row = static_cast<uint64_t>(std::floor(clipped_ymax));
+        if (first_column > last_column || first_row > last_row) {
+            throw Exception(DT_E_NOT_FOUND,
+                            "GRID clip polygon contains no source nodes");
+        }
+    }
+
+    dt_grid_create_options create{};
+    create.struct_size = sizeof(create);
+    create.flags = DT_GRID_HAS_NODATA;
+    create.width = last_column - first_column + 1;
+    create.height = last_row - first_row + 1;
+    std::copy(gt, gt + 6, create.geo_transform);
+    create.geo_transform[0] =
+        gt[0] + static_cast<double>(first_column) * gt[1] +
+        static_cast<double>(first_row) * gt[2];
+    create.geo_transform[3] =
+        gt[3] + static_cast<double>(first_column) * gt[4] +
+        static_cast<double>(first_row) * gt[5];
+    create.nodata_value = output_nodata;
+    auto output = std::make_unique<Grid>(create);
+    output->set_crs_wkt(source.crs_wkt());
+
+    const auto cross = [](const Point2& a, const Point2& b,
+                          double x, double y) {
+        return (b.x - a.x) * (y - a.y) -
+               (b.y - a.y) * (x - a.x);
+    };
+    const auto contains = [&](double x, double y) {
+        if (x < xmin - length_tolerance || x > xmax + length_tolerance ||
+            y < ymin - length_tolerance || y > ymax + length_tolerance) {
+            return false;
+        }
+        bool inside = false;
+        for (size_t index = 0; index < polygon.size(); ++index) {
+            const auto& a = polygon[index];
+            const auto& b = polygon[(index + 1) % polygon.size()];
+            if (std::abs(cross(a, b, x, y)) <= area_tolerance &&
+                x >= std::min(a.x, b.x) - length_tolerance &&
+                x <= std::max(a.x, b.x) + length_tolerance &&
+                y >= std::min(a.y, b.y) - length_tolerance &&
+                y <= std::max(a.y, b.y) + length_tolerance) {
+                return true;
+            }
+            if ((a.y > y) != (b.y > y)) {
+                const double crossing =
+                    a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y);
+                if (x < crossing) inside = !inside;
+            }
+        }
+        return inside;
+    };
+    const auto& source_values = source.values();
+    const uint64_t output_width = output->width();
+    const uint64_t output_height = output->height();
+    std::atomic<uint64_t> selected_node_count{0};
+    const auto compute_row = [&](uint64_t output_row,
+                                  const std::atomic<bool>* stop_requested) {
+        const uint64_t source_row = first_row + output_row;
+        double* destination = output->values_.data() +
+            static_cast<size_t>(output_row * output_width);
+        const double y = static_cast<double>(source_row);
+        uint64_t selected_in_row = 0;
+        for (uint64_t output_column = 0; output_column < output_width;
+             ++output_column) {
+            if (stop_requested && (output_column & 4095U) == 0U &&
+                stop_requested->load()) {
+                return false;
+            }
+            const uint64_t source_column = first_column + output_column;
+            const bool selected =
+                contains(static_cast<double>(source_column), y) != invert;
+            if (selected) ++selected_in_row;
+            const double value = source_values[static_cast<size_t>(
+                source_row * source.width() + source_column)];
+            destination[static_cast<size_t>(output_column)] =
+                selected && finite(value) && !source.is_nodata(value)
+                    ? value
+                    : output_nodata;
+        }
+        selected_node_count.fetch_add(selected_in_row);
+        return true;
+    };
+
+    const uint64_t tile_count =
+        (output_height + static_cast<uint64_t>(tile_rows) - 1U) / tile_rows;
+    uint32_t worker_count = options.worker_count;
+    if (worker_count == 0) {
+        worker_count = std::thread::hardware_concurrency();
+        if (worker_count == 0) worker_count = 4;
+        worker_count = std::min(worker_count, 32U);
+    }
+    worker_count = static_cast<uint32_t>(std::min<uint64_t>(
+        worker_count, std::max<uint64_t>(1, tile_count)));
+    report_progress(progress, 0.0);
+    if (worker_count == 1) {
+        for (uint64_t row = 0; row < output_height; ++row) {
+            check_cancelled(cancelled);
+            compute_row(row, nullptr);
+            report_progress(progress, static_cast<double>(row + 1) /
+                                          static_cast<double>(output_height));
+        }
+    } else {
+        std::atomic<uint64_t> next_row{0};
+        std::atomic<uint64_t> completed_rows{0};
+        std::atomic<uint32_t> active_workers{worker_count};
+        std::atomic<bool> stop_requested{false};
+        std::mutex event_mutex;
+        std::condition_variable event;
+        std::mutex error_mutex;
+        std::exception_ptr worker_error;
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        const auto worker = [&] {
+            try {
+                while (!stop_requested.load()) {
+                    const uint64_t begin = next_row.fetch_add(tile_rows);
+                    if (begin >= output_height) break;
+                    const uint64_t end = std::min<uint64_t>(
+                        output_height,
+                        begin + static_cast<uint64_t>(tile_rows));
+                    for (uint64_t row = begin; row < end; ++row) {
+                        if (stop_requested.load() ||
+                            !compute_row(row, &stop_requested)) break;
+                        completed_rows.fetch_add(1);
+                    }
+                    event.notify_one();
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!worker_error) worker_error = std::current_exception();
+                }
+                stop_requested.store(true);
+            }
+            active_workers.fetch_sub(1);
+            event.notify_one();
+        };
+        try {
+            for (uint32_t index = 0; index < worker_count; ++index)
+                workers.emplace_back(worker);
+        } catch (...) {
+            stop_requested.store(true);
+            for (auto& thread : workers)
+                if (thread.joinable()) thread.join();
+            throw;
+        }
+        bool cancellation_seen = false;
+        std::exception_ptr coordinator_error;
+        try {
+            while (active_workers.load() != 0) {
+                if (cancelled && cancelled()) {
+                    cancellation_seen = true;
+                    stop_requested.store(true);
+                }
+                report_progress(progress,
+                    static_cast<double>(completed_rows.load()) /
+                    static_cast<double>(output_height));
+                std::unique_lock<std::mutex> lock(event_mutex);
+                event.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                    return active_workers.load() == 0;
+                });
+            }
+        } catch (...) {
+            coordinator_error = std::current_exception();
+            stop_requested.store(true);
+        }
+        for (auto& thread : workers)
+            if (thread.joinable()) thread.join();
+        if (coordinator_error) std::rethrow_exception(coordinator_error);
+        if (worker_error) std::rethrow_exception(worker_error);
+        if (cancellation_seen || (cancelled && cancelled())) {
+            throw Exception(DT_E_CANCELLED,
+                            "GRID polygon clip was cancelled");
+        }
+    }
+    if (crop && selected_node_count.load() == 0) {
+        throw Exception(DT_E_NOT_FOUND,
+                        "GRID clip polygon contains no source nodes");
     }
     ++output->generation_;
     report_progress(progress, 1.0);

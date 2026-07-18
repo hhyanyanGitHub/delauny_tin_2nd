@@ -3,6 +3,7 @@
 #include "dt_core.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <limits>
@@ -41,6 +42,11 @@ GridStorage::~GridStorage() = default;
 void GridStorage::assign(size_t count, double value) {
     mapping_.reset();
     owned_.assign(count, value);
+}
+
+void GridStorage::adopt(std::vector<double>&& values) {
+    mapping_.reset();
+    owned_ = std::move(values);
 }
 
 void GridStorage::map_copy_on_write(const std::filesystem::path& file,
@@ -121,6 +127,31 @@ void GridStorage::materialize() {
                              mapping_->data + mapping_->count);
     mapping_.reset();
     owned_ = std::move(copy);
+}
+
+void GridStorage::prefetch(size_t first, size_t count) const noexcept {
+#ifdef _WIN32
+    if (!mapping_ || count == 0 || first >= mapping_->count ||
+        count > mapping_->count - first) {
+        return;
+    }
+    using PrefetchVirtualMemoryFunction = BOOL(WINAPI*)(
+        HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (!kernel) return;
+    const FARPROC address = GetProcAddress(kernel, "PrefetchVirtualMemory");
+    PrefetchVirtualMemoryFunction function = nullptr;
+    static_assert(sizeof(function) == sizeof(address));
+    std::memcpy(&function, &address, sizeof(function));
+    if (!function) return;
+    WIN32_MEMORY_RANGE_ENTRY range{};
+    range.VirtualAddress = mapping_->data + first;
+    range.NumberOfBytes = count * sizeof(double);
+    function(GetCurrentProcess(), 1, &range, 0);
+#else
+    (void)first;
+    (void)count;
+#endif
 }
 
 bool GridStorage::is_mapped() const noexcept {

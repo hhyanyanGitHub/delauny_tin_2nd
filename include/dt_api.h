@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define DT_VERSION_MAJOR 0
-#define DT_VERSION_MINOR 28
+#define DT_VERSION_MINOR 29
 #define DT_VERSION_PATCH 0
 
 typedef int32_t dt_status;

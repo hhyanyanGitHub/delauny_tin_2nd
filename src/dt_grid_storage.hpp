@@ -19,10 +19,12 @@ public:
     GridStorage& operator=(const GridStorage&) = delete;
 
     void assign(size_t count, double value);
+    void adopt(std::vector<double>&& values);
     void map_copy_on_write(const std::filesystem::path& file,
                            size_t byte_offset, size_t count);
     bool maps_file(const std::filesystem::path& file) const;
     void materialize();
+    void prefetch(size_t first, size_t count) const noexcept;
 
     bool is_mapped() const noexcept;
     size_t size() const noexcept;

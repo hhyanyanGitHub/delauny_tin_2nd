@@ -28,6 +28,8 @@ public:
     dt_grid_info info() const;
     void read_window(uint64_t column, uint64_t row, uint64_t width,
                      uint64_t height, double* output, uint64_t stride) const;
+    void prefetch_window(uint64_t column, uint64_t row, uint64_t width,
+                         uint64_t height) const;
     dt_grid_overview_result read_overview(
         const dt_grid_overview_options& options, uint64_t output_width,
         uint64_t output_height, double* output, uint64_t stride) const;
@@ -38,6 +40,7 @@ public:
     static std::unique_ptr<Grid> load_text(const char* file_name);
     void save_binary(const char* file_name);
     static std::unique_ptr<Grid> load_binary(const char* file_name);
+    static void verify_binary_file(const char* file_name);
 
     uint64_t width() const noexcept { return options_.width; }
     uint64_t height() const noexcept { return options_.height; }
@@ -76,6 +79,15 @@ private:
     uint64_t persistent_overview_width_ = 0;
     uint64_t persistent_overview_height_ = 0;
     dt_grid_overview_result persistent_overview_result_{};
+    struct PyramidLevel {
+        uint32_t scale = 0;
+        uint64_t width = 0;
+        uint64_t height = 0;
+        std::unique_ptr<GridStorage> values;
+    };
+    std::vector<PyramidLevel> pyramid_;
+    std::vector<uint64_t> binary_checksums_;
+    uint64_t binary_checksum_block_bytes_ = 0;
     bool binary_valid_count_available_ = false;
     uint64_t binary_valid_count_ = 0;
 

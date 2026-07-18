@@ -12,7 +12,9 @@ enum dt_grid_flags {
     /* Output-only dt_grid_info flags. Binary GRID loading uses a private,
        copy-on-write view, so edits do not modify the source file. */
     DT_GRID_STORAGE_MEMORY_MAPPED = 1u << 1,
-    DT_GRID_HAS_PERSISTENT_OVERVIEW = 1u << 2
+    DT_GRID_HAS_PERSISTENT_OVERVIEW = 1u << 2,
+    DT_GRID_HAS_PYRAMID = 1u << 3,
+    DT_GRID_HAS_BLOCK_CHECKSUMS = 1u << 4
 };
 
 enum dt_grid_to_tin_flags {
@@ -73,14 +75,18 @@ enum dt_grid_overview_flags {
     /* Aggregate cells become NoData when any contributing source node is
        NoData. Without this flag invalid nodes are ignored and remaining
        weights are renormalized. Nearest-neighbor output is unchanged. */
-    DT_GRID_OVERVIEW_STRICT_NODATA = 1u << 0
+    DT_GRID_OVERVIEW_STRICT_NODATA = 1u << 0,
+    /* Allows average overviews to use a persisted DGRIDB pyramid level.
+       Output is a display-oriented approximation; result flags identify it. */
+    DT_GRID_OVERVIEW_USE_PYRAMID = 1u << 1
 };
 
 enum dt_grid_overview_result_flags {
     /* Statistics cover every node in the selected source window. Aggregate
        methods set this flag; nearest-neighbor statistics cover output samples
        only and leave it clear. */
-    DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS = 1u << 0
+    DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS = 1u << 0,
+    DT_GRID_OVERVIEW_USED_PYRAMID = 1u << 1
 };
 
 enum dt_grid_view_window_flags {
@@ -339,6 +345,12 @@ DT_API dt_status DT_CALL dt_grid_read_window(
     uint64_t width, uint64_t height, double* output_values,
     uint64_t row_stride);
 
+/* Best-effort operating-system hint that pages covering the selected source
+   window will be needed soon. It is a no-op for ordinary in-memory grids. */
+DT_API dt_status DT_CALL dt_grid_prefetch_window(
+    dt_grid_handle grid, uint64_t column, uint64_t row,
+    uint64_t width, uint64_t height);
+
 /* Reads an in-memory, caller-owned overview of a source GRID window without
    constructing another GRID handle. row_stride is measured in doubles and
    zero means output_width. output_result may be NULL. Aggregate bins use an
@@ -415,6 +427,11 @@ DT_API dt_status DT_CALL dt_grid_save_binary(
     dt_grid_handle grid, const char* utf8_file_name);
 DT_API dt_status DT_CALL dt_grid_load_binary(
     const char* utf8_file_name, dt_grid_handle* output_grid);
+
+/* Fully scans and verifies all persisted raw-node block checksums. Loading is
+   intentionally lazy and does not perform this potentially expensive scan. */
+DT_API dt_status DT_CALL dt_grid_verify_binary_file(
+    const char* utf8_file_name);
 
 /* Samples the piecewise-linear TIN surface at each output grid node. */
 DT_API dt_status DT_CALL dt_grid_from_tin(

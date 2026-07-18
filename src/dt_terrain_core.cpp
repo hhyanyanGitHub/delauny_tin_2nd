@@ -34,9 +34,16 @@ constexpr uint64_t kMaximumClipVertices = 10000000ULL;
 constexpr size_t kBinaryGridHeaderSize = 65536;
 constexpr size_t kBinaryGridCrsOffset = 256;
 constexpr size_t kBinaryGridChecksumOffset = 192;
+constexpr size_t kBinaryGridExtensionOffset = 200;
 constexpr uint32_t kBinaryGridVersion = 1;
 constexpr uint32_t kBinaryGridEndianMarker = 0x01020304U;
 constexpr char kBinaryGridMagic[8] = {'D', 'G', 'R', 'I', 'D', 'B', '1', '\0'};
+constexpr char kBinaryGridExtensionMagic[8] =
+    {'D', 'G', 'B', 'X', '1', '\0', '\0', '\0'};
+constexpr uint32_t kBinaryGridExtensionVersion = 1;
+constexpr uint32_t kBinaryGridPyramidDescriptorSize = 32;
+constexpr uint32_t kBinaryGridChecksumAlgorithm = 1;
+constexpr uint64_t kBinaryGridChecksumBlockBytes = 4ULL * 1024ULL * 1024ULL;
 
 template <typename T>
 void header_store(std::array<unsigned char, kBinaryGridHeaderSize>& header,
@@ -68,6 +75,37 @@ uint64_t binary_header_hash(
         hash *= 1099511628211ULL;
     }
     return hash;
+}
+
+uint64_t binary_block_hash(const unsigned char* data, size_t size) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t index = 0; index < size; ++index) {
+        hash ^= data[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+template <typename T>
+void buffer_store(std::vector<unsigned char>& buffer, size_t offset,
+                  const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (offset > buffer.size() || sizeof(T) > buffer.size() - offset) {
+        throw Exception(DT_E_INTERNAL, "binary GRID directory write overflow");
+    }
+    std::memcpy(buffer.data() + offset, &value, sizeof(T));
+}
+
+template <typename T>
+T buffer_load(const std::vector<unsigned char>& buffer, size_t offset) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (offset > buffer.size() || sizeof(T) > buffer.size() - offset) {
+        throw Exception(DT_E_CORRUPTED_DATA,
+                        "binary GRID pyramid directory is invalid");
+    }
+    T value{};
+    std::memcpy(&value, buffer.data() + offset, sizeof(T));
+    return value;
 }
 
 uint64_t align_binary_offset(uint64_t value) {
@@ -516,6 +554,8 @@ dt_grid_info Grid::info() const {
     if (values_.is_mapped()) result.flags |= DT_GRID_STORAGE_MEMORY_MAPPED;
     if (!persistent_overview_.empty())
         result.flags |= DT_GRID_HAS_PERSISTENT_OVERVIEW;
+    if (!pyramid_.empty()) result.flags |= DT_GRID_HAS_PYRAMID;
+    if (!binary_checksums_.empty()) result.flags |= DT_GRID_HAS_BLOCK_CHECKSUMS;
     result.width = options_.width;
     result.height = options_.height;
     std::copy(std::begin(options_.geo_transform),
@@ -1782,6 +1822,14 @@ void Grid::read_window(uint64_t column, uint64_t row, uint64_t width,
     }
 }
 
+void Grid::prefetch_window(uint64_t column, uint64_t row, uint64_t width,
+                           uint64_t height) const {
+    validate_window(column, row, width, height, width);
+    const size_t first = offset(column, row);
+    const size_t last = offset(column + width - 1, row + height - 1);
+    values_.prefetch(first, last - first + 1);
+}
+
 dt_grid_window Grid::view_window(const dt_grid_view_options& options) const {
     if (options.flags != 0) {
         throw Exception(DT_E_INVALID_ARGUMENT, "unknown GRID view flags");
@@ -1934,7 +1982,8 @@ dt_grid_overview_result Grid::read_overview(
         throw Exception(DT_E_INVALID_ARGUMENT,
                         "unknown GRID overview method");
     }
-    constexpr uint32_t kKnownFlags = DT_GRID_OVERVIEW_STRICT_NODATA;
+    constexpr uint32_t kKnownFlags = DT_GRID_OVERVIEW_STRICT_NODATA |
+                                     DT_GRID_OVERVIEW_USE_PYRAMID;
     if ((options.flags & ~kKnownFlags) != 0) {
         throw Exception(DT_E_INVALID_ARGUMENT,
                         "unknown GRID overview flags");
@@ -2014,6 +2063,123 @@ dt_grid_overview_result Grid::read_overview(
                         output + static_cast<size_t>(row * stride));
         }
         return persistent_overview_result_;
+    }
+
+    const bool request_pyramid =
+        (options.flags & DT_GRID_OVERVIEW_USE_PYRAMID) != 0;
+    const bool strict_pyramid =
+        (options.flags & DT_GRID_OVERVIEW_STRICT_NODATA) != 0;
+    if (request_pyramid && !strict_pyramid &&
+        method == DT_GRID_OVERVIEW_AVERAGE && !pyramid_.empty()) {
+        const PyramidLevel* selected = nullptr;
+        uint64_t selected_column = 0;
+        uint64_t selected_row = 0;
+        uint64_t selected_width = 0;
+        uint64_t selected_height = 0;
+        for (auto level = pyramid_.rbegin(); level != pyramid_.rend(); ++level) {
+            const uint64_t scale = level->scale;
+            const uint64_t column_begin = options.source_column / scale;
+            const uint64_t row_begin = options.source_row / scale;
+            const uint64_t column_end =
+                (options.source_column + source_width + scale - 1) / scale;
+            const uint64_t row_end =
+                (options.source_row + source_height + scale - 1) / scale;
+            const uint64_t level_width = column_end - column_begin;
+            const uint64_t level_height = row_end - row_begin;
+            if (level_width >= output_width &&
+                level_height >= output_height) {
+                selected = &*level;
+                selected_column = column_begin;
+                selected_row = row_begin;
+                selected_width = level_width;
+                selected_height = level_height;
+                break;
+            }
+        }
+        if (selected) {
+            struct PyramidStatistics {
+                uint64_t valid = 0;
+                uint64_t nodata = 0;
+                long double sum = 0.0L;
+                double minimum = std::numeric_limits<double>::infinity();
+                double maximum = -std::numeric_limits<double>::infinity();
+            } statistics;
+            const double output_nodata =
+                (flags() & DT_GRID_HAS_NODATA) != 0
+                    ? nodata()
+                    : std::numeric_limits<double>::quiet_NaN();
+            const auto partition = [](uint64_t index, uint64_t extent,
+                                      uint64_t output_extent) {
+                return index * extent / output_extent;
+            };
+            const size_t first = static_cast<size_t>(
+                selected_row * selected->width + selected_column);
+            const size_t last = static_cast<size_t>(
+                (selected_row + selected_height - 1) * selected->width +
+                selected_column + selected_width - 1);
+            selected->values->prefetch(first, last - first + 1);
+            for (uint64_t output_row = 0; output_row < output_height;
+                 ++output_row) {
+                const uint64_t y_begin = selected_row +
+                    partition(output_row, selected_height, output_height);
+                const uint64_t y_end = selected_row +
+                    partition(output_row + 1, selected_height, output_height);
+                double* destination =
+                    output + static_cast<size_t>(output_row * stride);
+                for (uint64_t output_column = 0;
+                     output_column < output_width; ++output_column) {
+                    const uint64_t x_begin = selected_column + partition(
+                        output_column, selected_width, output_width);
+                    const uint64_t x_end = selected_column + partition(
+                        output_column + 1, selected_width, output_width);
+                    uint64_t valid = 0;
+                    long double sum = 0.0L;
+                    for (uint64_t y = y_begin; y < y_end; ++y) {
+                        size_t index = static_cast<size_t>(
+                            y * selected->width + x_begin);
+                        for (uint64_t x = x_begin; x < x_end; ++x, ++index) {
+                            const double value = (*selected->values)[index];
+                            if (is_nodata(value)) {
+                                ++statistics.nodata;
+                                continue;
+                            }
+                            ++statistics.valid;
+                            statistics.sum += static_cast<long double>(value);
+                            statistics.minimum =
+                                std::min(statistics.minimum, value);
+                            statistics.maximum =
+                                std::max(statistics.maximum, value);
+                            ++valid;
+                            sum += static_cast<long double>(value);
+                        }
+                    }
+                    destination[static_cast<size_t>(output_column)] = valid == 0
+                        ? output_nodata
+                        : static_cast<double>(sum /
+                                              static_cast<long double>(valid));
+                }
+            }
+            dt_grid_overview_result result{};
+            result.struct_size = sizeof(result);
+            result.flags = DT_GRID_OVERVIEW_USED_PYRAMID;
+            result.valid_value_count = statistics.valid;
+            result.nodata_value_count = statistics.nodata;
+            if (statistics.valid != 0) {
+                result.minimum_value = statistics.minimum;
+                result.maximum_value = statistics.maximum;
+                result.mean_value = static_cast<double>(
+                    statistics.sum /
+                    static_cast<long double>(statistics.valid));
+            } else {
+                result.minimum_value =
+                    std::numeric_limits<double>::quiet_NaN();
+                result.maximum_value =
+                    std::numeric_limits<double>::quiet_NaN();
+                result.mean_value =
+                    std::numeric_limits<double>::quiet_NaN();
+            }
+            return result;
+        }
     }
 
     struct Statistics {
@@ -2232,6 +2398,9 @@ void Grid::write_window(uint64_t column, uint64_t row, uint64_t width,
     persistent_overview_.clear();
     persistent_overview_width_ = persistent_overview_height_ = 0;
     persistent_overview_result_ = {};
+    pyramid_.clear();
+    binary_checksums_.clear();
+    binary_checksum_block_bytes_ = 0;
     if (binary_valid_count_available_) {
         if (valid_delta < 0) {
             binary_valid_count_ -= static_cast<uint64_t>(-valid_delta);
@@ -2344,14 +2513,105 @@ void Grid::save_binary(const char* file_name) {
 
     const uint64_t overview_offset = kBinaryGridHeaderSize;
     const uint64_t overview_bytes = overview.size() * sizeof(double);
-    const uint64_t data_offset = align_binary_offset(
-        overview_offset + overview_bytes);
     const uint64_t value_count = width() * height();
+    const uint64_t raw_bytes = value_count * sizeof(double);
+
+    struct SavePyramidLevel {
+        uint32_t scale = 0;
+        uint64_t width = 0;
+        uint64_t height = 0;
+        uint64_t file_offset = 0;
+        std::vector<double> values;
+    };
+    std::vector<SavePyramidLevel> levels;
+    const double pyramid_nodata = (flags() & DT_GRID_HAS_NODATA) != 0
+        ? nodata()
+        : std::numeric_limits<double>::quiet_NaN();
+    const double* previous_values = values_.data();
+    uint64_t previous_width = width();
+    uint64_t previous_height = height();
+    uint32_t scale = 1;
+    while (previous_width > 512 || previous_height > 512) {
+        SavePyramidLevel level;
+        if (scale > std::numeric_limits<uint32_t>::max() / 2U) {
+            throw Exception(DT_E_LIMIT_EXCEEDED,
+                            "binary GRID pyramid has too many levels");
+        }
+        scale *= 2U;
+        level.scale = scale;
+        level.width = (previous_width + 1) / 2;
+        level.height = (previous_height + 1) / 2;
+        level.values.resize(static_cast<size_t>(level.width * level.height));
+        for (uint64_t row = 0; row < level.height; ++row) {
+            for (uint64_t column = 0; column < level.width; ++column) {
+                uint64_t valid = 0;
+                long double sum = 0.0L;
+                for (uint64_t dy = 0; dy < 2; ++dy) {
+                    const uint64_t source_row = row * 2 + dy;
+                    if (source_row >= previous_height) continue;
+                    for (uint64_t dx = 0; dx < 2; ++dx) {
+                        const uint64_t source_column = column * 2 + dx;
+                        if (source_column >= previous_width) continue;
+                        const double value = previous_values[
+                            static_cast<size_t>(source_row * previous_width +
+                                                source_column)];
+                        if (is_nodata(value)) continue;
+                        ++valid;
+                        sum += static_cast<long double>(value);
+                    }
+                }
+                level.values[static_cast<size_t>(row * level.width + column)] =
+                    valid == 0 ? pyramid_nodata
+                               : static_cast<double>(
+                                     sum / static_cast<long double>(valid));
+            }
+        }
+        levels.push_back(std::move(level));
+        previous_values = levels.back().values.data();
+        previous_width = levels.back().width;
+        previous_height = levels.back().height;
+    }
+
+    const uint64_t directory_offset = overview_offset + overview_bytes;
+    const uint64_t directory_bytes =
+        levels.size() * kBinaryGridPyramidDescriptorSize;
+    uint64_t cursor = align_binary_offset(directory_offset + directory_bytes);
+    for (auto& level : levels) {
+        level.file_offset = cursor;
+        const uint64_t level_bytes =
+            level.values.size() * sizeof(double);
+        cursor = align_binary_offset(cursor + level_bytes);
+    }
+    const uint64_t checksum_count =
+        (raw_bytes + kBinaryGridChecksumBlockBytes - 1) /
+        kBinaryGridChecksumBlockBytes;
+    const uint64_t checksum_offset = cursor;
+    const uint64_t data_offset = align_binary_offset(
+        checksum_offset + checksum_count * sizeof(uint64_t));
     if (value_count > (std::numeric_limits<uint64_t>::max() - data_offset) /
                           sizeof(double)) {
         throw Exception(DT_E_LIMIT_EXCEEDED, "binary GRID file is too large");
     }
-    const uint64_t file_size = data_offset + value_count * sizeof(double);
+    const uint64_t file_size = data_offset + raw_bytes;
+
+    std::vector<unsigned char> directory(static_cast<size_t>(directory_bytes));
+    for (size_t index = 0; index < levels.size(); ++index) {
+        const size_t offset = index * kBinaryGridPyramidDescriptorSize;
+        buffer_store(directory, offset, levels[index].scale);
+        buffer_store(directory, offset + 4, uint32_t{0});
+        buffer_store(directory, offset + 8, levels[index].width);
+        buffer_store(directory, offset + 16, levels[index].height);
+        buffer_store(directory, offset + 24, levels[index].file_offset);
+    }
+    std::vector<uint64_t> checksums(static_cast<size_t>(checksum_count));
+    const auto* raw = reinterpret_cast<const unsigned char*>(values_.data());
+    for (uint64_t index = 0; index < checksum_count; ++index) {
+        const uint64_t begin = index * kBinaryGridChecksumBlockBytes;
+        const size_t bytes = static_cast<size_t>(std::min<uint64_t>(
+            kBinaryGridChecksumBlockBytes, raw_bytes - begin));
+        checksums[static_cast<size_t>(index)] =
+            binary_block_hash(raw + begin, bytes);
+    }
 
     std::array<unsigned char, kBinaryGridHeaderSize> header{};
     std::memcpy(header.data(), kBinaryGridMagic, sizeof(kBinaryGridMagic));
@@ -2377,6 +2637,18 @@ void Grid::save_binary(const char* file_name) {
     header_store(header, 168, overview_result.maximum_value);
     header_store(header, 176, overview_result.mean_value);
     header_store(header, 184, file_size);
+    std::memcpy(header.data() + kBinaryGridExtensionOffset,
+                kBinaryGridExtensionMagic,
+                sizeof(kBinaryGridExtensionMagic));
+    header_store(header, 208, kBinaryGridExtensionVersion);
+    header_store(header, 212, static_cast<uint32_t>(levels.size()));
+    header_store(header, 216, directory_offset);
+    header_store(header, 224, directory_bytes);
+    header_store(header, 232, checksum_offset);
+    header_store(header, 240, checksum_count);
+    header_store(header, 248,
+                 static_cast<uint32_t>(kBinaryGridChecksumBlockBytes));
+    header_store(header, 252, kBinaryGridChecksumAlgorithm);
     if (!crs_wkt_.empty()) {
         std::memcpy(header.data() + kBinaryGridCrsOffset, crs_wkt_.data(),
                     crs_wkt_.size());
@@ -2396,19 +2668,46 @@ void Grid::save_binary(const char* file_name) {
         }
         write_binary_bytes(stream, header.data(), header.size());
         write_binary_bytes(stream, overview.data(), overview_bytes);
-        const uint64_t padding = data_offset - overview_offset - overview_bytes;
-        std::vector<unsigned char> zeros(static_cast<size_t>(padding), 0);
-        if (!zeros.empty()) write_binary_bytes(stream, zeros.data(), zeros.size());
-        write_binary_bytes(stream, values_.data(), value_count * sizeof(double));
+        if (!directory.empty())
+            write_binary_bytes(stream, directory.data(), directory.size());
+        for (const auto& level : levels) {
+            stream.seekp(static_cast<std::streamoff>(level.file_offset));
+            if (!stream) throw Exception(DT_E_IO, "failed to seek DGRIDB pyramid");
+            write_binary_bytes(stream, level.values.data(),
+                               level.values.size() * sizeof(double));
+        }
+        stream.seekp(static_cast<std::streamoff>(checksum_offset));
+        if (!stream) throw Exception(DT_E_IO, "failed to seek DGRIDB checksums");
+        write_binary_bytes(stream, checksums.data(),
+                           checksums.size() * sizeof(uint64_t));
+        stream.seekp(static_cast<std::streamoff>(data_offset));
+        if (!stream) throw Exception(DT_E_IO, "failed to seek DGRIDB values");
+        write_binary_bytes(stream, values_.data(), raw_bytes);
         stream.flush();
         if (!stream) throw Exception(DT_E_IO, "failed to flush binary GRID");
         stream.close();
-        if (values_.maps_file(destination)) values_.materialize();
+        if (values_.maps_file(destination)) {
+            values_.materialize();
+            pyramid_.clear();
+        }
         replace_file_atomically(temporary, destination);
         persistent_overview_ = std::move(overview);
         persistent_overview_width_ = overview_width;
         persistent_overview_height_ = overview_height;
         persistent_overview_result_ = overview_result;
+        pyramid_.clear();
+        pyramid_.reserve(levels.size());
+        for (auto& level : levels) {
+            PyramidLevel stored;
+            stored.scale = level.scale;
+            stored.width = level.width;
+            stored.height = level.height;
+            stored.values = std::make_unique<GridStorage>();
+            stored.values->adopt(std::move(level.values));
+            pyramid_.push_back(std::move(stored));
+        }
+        binary_checksums_ = std::move(checksums);
+        binary_checksum_block_bytes_ = kBinaryGridChecksumBlockBytes;
         binary_valid_count_available_ = true;
         binary_valid_count_ = overview_result.valid_value_count;
     } catch (...) {
@@ -2468,6 +2767,30 @@ std::unique_ptr<Grid> Grid::load_binary(const char* file_name) {
     const double maximum = header_load<double>(header, 168);
     const double mean = header_load<double>(header, 176);
     const uint64_t declared_file_size = header_load<uint64_t>(header, 184);
+    const bool has_extension = std::memcmp(
+        header.data() + kBinaryGridExtensionOffset,
+        kBinaryGridExtensionMagic, sizeof(kBinaryGridExtensionMagic)) == 0;
+    uint32_t pyramid_level_count = 0;
+    uint64_t directory_offset = 0;
+    uint64_t directory_bytes = 0;
+    uint64_t checksum_offset = 0;
+    uint64_t checksum_count = 0;
+    uint32_t checksum_block_bytes = 0;
+    if (has_extension) {
+        if (header_load<uint32_t>(header, 208) !=
+                kBinaryGridExtensionVersion ||
+            header_load<uint32_t>(header, 252) !=
+                kBinaryGridChecksumAlgorithm) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "unsupported DGRIDB extension metadata");
+        }
+        pyramid_level_count = header_load<uint32_t>(header, 212);
+        directory_offset = header_load<uint64_t>(header, 216);
+        directory_bytes = header_load<uint64_t>(header, 224);
+        checksum_offset = header_load<uint64_t>(header, 232);
+        checksum_count = header_load<uint64_t>(header, 240);
+        checksum_block_bytes = header_load<uint32_t>(header, 248);
+    }
     if ((options.flags & ~static_cast<uint32_t>(DT_GRID_HAS_NODATA)) != 0 ||
         crs_size > kBinaryGridHeaderSize - kBinaryGridCrsOffset ||
         overview_width != std::min<uint64_t>(512, options.width) ||
@@ -2484,6 +2807,24 @@ std::unique_ptr<Grid> Grid::load_binary(const char* file_name) {
                           sizeof(double) ||
         declared_file_size != data_offset + value_count * sizeof(double)) {
         throw Exception(DT_E_CORRUPTED_DATA, "invalid DGRIDB metadata");
+    }
+    const uint64_t raw_bytes = value_count * sizeof(double);
+    if (has_extension &&
+        (pyramid_level_count > 31 ||
+         directory_bytes != static_cast<uint64_t>(pyramid_level_count) *
+                                kBinaryGridPyramidDescriptorSize ||
+         directory_offset != overview_offset +
+                                 overview_width * overview_height *
+                                     sizeof(double) ||
+         directory_offset > data_offset ||
+         directory_bytes > data_offset - directory_offset ||
+         checksum_block_bytes != kBinaryGridChecksumBlockBytes ||
+         checksum_count !=
+             (raw_bytes + checksum_block_bytes - 1) / checksum_block_bytes ||
+         checksum_offset > data_offset ||
+         checksum_count > (data_offset - checksum_offset) / sizeof(uint64_t))) {
+        throw Exception(DT_E_CORRUPTED_DATA,
+                        "invalid DGRIDB extension layout");
     }
     std::error_code size_error;
     const uint64_t actual_file_size =
@@ -2520,9 +2861,111 @@ std::unique_ptr<Grid> Grid::load_binary(const char* file_name) {
     grid->persistent_overview_result_.mean_value = mean;
     grid->binary_valid_count_available_ = true;
     grid->binary_valid_count_ = valid_count;
+    if (has_extension) {
+        std::vector<unsigned char> directory(
+            static_cast<size_t>(directory_bytes));
+        if (!directory.empty()) {
+            stream.seekg(static_cast<std::streamoff>(directory_offset));
+            stream.read(reinterpret_cast<char*>(directory.data()),
+                        static_cast<std::streamsize>(directory.size()));
+            if (!stream) {
+                throw Exception(DT_E_CORRUPTED_DATA,
+                                "truncated DGRIDB pyramid directory");
+            }
+        }
+        uint32_t expected_scale = 2;
+        uint64_t previous_end = align_binary_offset(
+            directory_offset + directory_bytes);
+        grid->pyramid_.reserve(pyramid_level_count);
+        for (uint32_t index = 0; index < pyramid_level_count; ++index) {
+            const size_t descriptor =
+                static_cast<size_t>(index) *
+                kBinaryGridPyramidDescriptorSize;
+            const uint32_t level_scale =
+                buffer_load<uint32_t>(directory, descriptor);
+            const uint32_t reserved =
+                buffer_load<uint32_t>(directory, descriptor + 4);
+            const uint64_t level_width =
+                buffer_load<uint64_t>(directory, descriptor + 8);
+            const uint64_t level_height =
+                buffer_load<uint64_t>(directory, descriptor + 16);
+            const uint64_t level_offset =
+                buffer_load<uint64_t>(directory, descriptor + 24);
+            const uint64_t expected_width =
+                (options.width + level_scale - 1) / level_scale;
+            const uint64_t expected_height =
+                (options.height + level_scale - 1) / level_scale;
+            const uint64_t level_values = level_width * level_height;
+            const uint64_t level_bytes = level_values * sizeof(double);
+            if (reserved != 0 || level_scale != expected_scale ||
+                level_width != expected_width ||
+                level_height != expected_height ||
+                level_offset % kBinaryGridHeaderSize != 0 ||
+                level_offset < previous_end || level_offset > checksum_offset ||
+                level_bytes > checksum_offset - level_offset) {
+                throw Exception(DT_E_CORRUPTED_DATA,
+                                "invalid DGRIDB pyramid level");
+            }
+            PyramidLevel level;
+            level.scale = level_scale;
+            level.width = level_width;
+            level.height = level_height;
+            level.values = std::make_unique<GridStorage>();
+            level.values->map_copy_on_write(
+                file, static_cast<size_t>(level_offset),
+                static_cast<size_t>(level_values));
+            grid->pyramid_.push_back(std::move(level));
+            previous_end = align_binary_offset(level_offset + level_bytes);
+            if (expected_scale > std::numeric_limits<uint32_t>::max() / 2U &&
+                index + 1 != pyramid_level_count) {
+                throw Exception(DT_E_CORRUPTED_DATA,
+                                "DGRIDB pyramid scale overflow");
+            }
+            expected_scale *= 2U;
+        }
+        if (previous_end > checksum_offset) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "overlapping DGRIDB pyramid/checksum sections");
+        }
+        grid->binary_checksums_.resize(static_cast<size_t>(checksum_count));
+        stream.clear();
+        stream.seekg(static_cast<std::streamoff>(checksum_offset));
+        stream.read(reinterpret_cast<char*>(grid->binary_checksums_.data()),
+                    static_cast<std::streamsize>(checksum_count *
+                                                 sizeof(uint64_t)));
+        if (!stream) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "truncated DGRIDB checksum table");
+        }
+        grid->binary_checksum_block_bytes_ = checksum_block_bytes;
+    }
     grid->values_.map_copy_on_write(file, static_cast<size_t>(data_offset),
                                     static_cast<size_t>(value_count));
     return grid;
+}
+
+void Grid::verify_binary_file(const char* file_name) {
+    auto grid = load_binary(file_name);
+    if (grid->binary_checksums_.empty() ||
+        grid->binary_checksum_block_bytes_ == 0) {
+        throw Exception(DT_E_UNSUPPORTED,
+                        "DGRIDB file has no block checksum table");
+    }
+    const auto* raw = reinterpret_cast<const unsigned char*>(
+        grid->values_.data());
+    const uint64_t raw_bytes = grid->values_.size() * sizeof(double);
+    for (size_t index = 0; index < grid->binary_checksums_.size(); ++index) {
+        const uint64_t begin =
+            static_cast<uint64_t>(index) *
+            grid->binary_checksum_block_bytes_;
+        const size_t bytes = static_cast<size_t>(std::min<uint64_t>(
+            grid->binary_checksum_block_bytes_, raw_bytes - begin));
+        if (binary_block_hash(raw + begin, bytes) !=
+            grid->binary_checksums_[index]) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "DGRIDB raw value block checksum mismatch");
+        }
+    }
 }
 
 dt_contour_info ContourSet::info() const {

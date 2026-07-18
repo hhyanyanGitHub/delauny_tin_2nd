@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.28 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.29 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -41,16 +41,29 @@ if (opened == DT_OK) {
 ```
 
 `DGRIDB 1` 保存完整六参数仿射、NoData、UTF-8 CRS、源统计、最多 512×512 的全幅平均
-概览和按行优先排列的 double 节点。Windows 加载使用私有写时复制映射，句柄仍可传给
-全部现有 GRID API；窗口写入不会修改源文件。保存采用同目录临时文件加成功后原子替换。
+概览、2× 多级平均金字塔、4 MiB 原始节点块校验表和按行优先排列的 double 节点。
+Windows 加载使用私有写时复制映射，原始节点和各金字塔层按需调页，句柄仍可传给全部
+现有 GRID API；窗口写入不会修改源文件。保存采用同目录临时文件加成功后原子替换。
 保存回当前映射源时，为解除 Windows 映射锁定会在替换前实体化当前视图；另存为其他
 路径不需要完整副本。格式字段见 [DGRIDB_FORMAT.md](DGRIDB_FORMAT.md)。
 
-`DT_GRID_STORAGE_MEMORY_MAPPED` 和 `DT_GRID_HAS_PERSISTENT_OVERVIEW` 是
+`DT_GRID_STORAGE_MEMORY_MAPPED`、`DT_GRID_HAS_PERSISTENT_OVERVIEW`、
+`DT_GRID_HAS_PYRAMID` 和 `DT_GRID_HAS_BLOCK_CHECKSUMS` 是
 `dt_grid_info.flags` 的输出能力位，不允许作为 `dt_grid_create_options.flags` 输入。
 对完整源范围、默认 NoData 策略、平均方法和文件内记录尺寸的概览请求会直接复制持久
 概览；写入任意节点后旧概览自动失效，下一次二进制保存重建。DGRIDB 是本机高性能
 格式；文本交换仍用 DGRID，GIS 互操作使用 GeoTIFF/COG。
+
+加载不会为校验而扫描全部原始节点。需要传输、归档或故障排查级完整性检查时显式调用：
+
+```cpp
+dt_status checked = dt_grid_verify_binary_file("terrain.dgridb");
+```
+
+该函数重新加载头部并逐一验证 4 MiB 原始节点块；无扩展的 v0.28 文件返回
+`DT_E_UNSUPPORTED`，校验不一致返回 `DT_E_CORRUPTED_DATA`。对即将进行精确窗口读取的
+映射 GRID，可先调用 `dt_grid_prefetch_window()` 发出最佳努力的操作系统预取提示；普通
+内存 GRID 上该函数成功但不执行额外操作。
 
 ## GRID 窗口概览与 LOD 读取
 
@@ -73,6 +86,22 @@ dt_grid_overview_result statistics{};
 dt_status status = dt_grid_read_overview(
     grid, &options, 512, 512, preview.data(), 512, &statistics);
 ```
+
+平均方法还可显式启用显示型金字塔路径：
+
+```cpp
+options.flags |= DT_GRID_OVERVIEW_USE_PYRAMID;
+dt_grid_overview_result result{};
+result.struct_size = sizeof(result);
+dt_grid_read_overview(grid, &options, 512, 256, pixels, 0, &result);
+bool approximate =
+    (result.flags & DT_GRID_OVERVIEW_USED_PYRAMID) != 0;
+```
+
+库选择仍不小于输出尺寸的最低分辨率持久层级。金字塔像元是逐级 2×2 忽略 NoData 的
+平均，因此该路径是可预期的显示近似，结果统计覆盖实际读取的金字塔像元，不设置
+`DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS`。严格 NoData、最小值、最大值、最近邻、没有
+持久金字塔或层级分辨率不足时自动回到原始节点路径；不设置该标志时旧精确语义不变。
 
 | 方法 | 分箱行为 | 常见用途 |
 |---|---|---|

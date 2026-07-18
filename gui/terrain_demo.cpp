@@ -60,6 +60,7 @@ enum CommandId {
     ID_CONTOURS_FROM_CDT,
     ID_IMPORT_GRID,
     ID_EXPORT_GRID,
+    ID_VERIFY_DGRIDB,
     ID_IMPORT_CONTOURS,
     ID_EXPORT_CONTOURS,
     ID_IMPORT_GDAL_RASTER,
@@ -567,6 +568,7 @@ private:
     uint64_t grid_preview_source_height_ = 0;
     dt_grid_handle grid_preview_source_ = nullptr;
     bool grid_preview_view_valid_ = false;
+    bool grid_preview_used_pyramid_ = false;
     double grid_zmin_ = 0.0;
     double grid_zmax_ = 1.0;
     GridTheme grid_theme_ = GridTheme::Elevation;
@@ -675,6 +677,8 @@ private:
                     L"导入 GRID（DGRIDB / 文本）…");
         AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_GRID,
                     L"导出 GRID（DGRIDB / 文本）…");
+        AppendMenuW(exchange_menu, MF_STRING, ID_VERIFY_DGRIDB,
+                    L"验证 DGRIDB 数据块…");
         AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CONTOURS,
                     L"导入等高线文本…");
@@ -921,6 +925,7 @@ private:
         grid_preview_source_width_ = grid_preview_source_height_ = 0;
         grid_preview_source_ = nullptr;
         grid_preview_view_valid_ = false;
+        grid_preview_used_pyramid_ = false;
     }
 
     void destroy_contour_layer() {
@@ -2499,6 +2504,7 @@ private:
     bool refresh_grid_cache() {
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
+        grid_preview_used_pyramid_ = false;
         if (!grid_) return false;
         grid_info_ = {};
         grid_info_.struct_size = sizeof(grid_info_);
@@ -2560,6 +2566,7 @@ private:
         if (dt_grid_get_info(terrain_grid_, &info) != DT_OK) return false;
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
+        grid_preview_used_pyramid_ = false;
         if (info.width == 0 || info.height == 0) return false;
         grid_preview_width_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.width));
         grid_preview_height_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.height));
@@ -2618,6 +2625,7 @@ private:
             grid_preview_source_width_ = grid_preview_source_height_ = 0;
             grid_preview_source_ = source_grid;
             grid_preview_view_valid_ = true;
+            grid_preview_used_pyramid_ = false;
             return true;
         }
         if (window_status != DT_OK) return false;
@@ -2649,9 +2657,18 @@ private:
         overview.source_row = window.row;
         overview.source_width = window.width;
         overview.source_height = window.height;
+        if (overview.method == DT_GRID_OVERVIEW_AVERAGE &&
+            (source_info.flags & DT_GRID_HAS_PYRAMID) != 0) {
+            overview.flags |= DT_GRID_OVERVIEW_USE_PYRAMID;
+        } else {
+            dt_grid_prefetch_window(source_grid, window.column, window.row,
+                                    window.width, window.height);
+        }
+        dt_grid_overview_result overview_result{};
+        overview_result.struct_size = sizeof(overview_result);
         if (dt_grid_read_overview(source_grid, &overview, output_width,
                                   output_height, values.data(), 0,
-                                  nullptr) != DT_OK) {
+                                  &overview_result) != DT_OK) {
             return false;
         }
 
@@ -2674,6 +2691,8 @@ private:
         grid_preview_source_height_ = window.height;
         grid_preview_source_ = source_grid;
         grid_preview_view_valid_ = true;
+        grid_preview_used_pyramid_ =
+            (overview_result.flags & DT_GRID_OVERVIEW_USED_PYRAMID) != 0;
         return true;
     }
 
@@ -3556,7 +3575,8 @@ private:
             grid_preview_source_width_ != 0 &&
             (grid_preview_source_width_ < grid_info_.width ||
              grid_preview_source_height_ < grid_info_.height)) {
-            text << L"局部LOD " << grid_preview_source_width_ << L"×"
+            text << (grid_preview_used_pyramid_ ? L"金字塔LOD " : L"局部LOD ")
+                 << grid_preview_source_width_ << L"×"
                  << grid_preview_source_height_ << L"→"
                  << grid_preview_width_ << L"×" << grid_preview_height_
                  << L" | ";
@@ -5026,6 +5046,10 @@ private:
             text << L"；写时复制映射";
         if ((grid_info_.flags & DT_GRID_HAS_PERSISTENT_OVERVIEW) != 0)
             text << L"；内置概览";
+        if ((grid_info_.flags & DT_GRID_HAS_PYRAMID) != 0)
+            text << L"；多级金字塔";
+        if ((grid_info_.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0)
+            text << L"；块校验";
         if (grid_info_.width > grid_preview_width_ ||
             grid_info_.height > grid_preview_height_)
             text << L"；LOD 预览 " << grid_preview_width_ << L"×"
@@ -5060,6 +5084,29 @@ private:
             action_text_ = text.str();
         } else {
             action_text_ = L"GRID 导出失败：" + last_error_text();
+        }
+    }
+
+    void verify_dgridb_file() {
+        const auto file = choose_file(false, L"terrain.dgridb",
+            L"DGRIDB 映射网格 (*.dgridb)\0*.dgridb\0所有文件 (*.*)\0*.*\0",
+            L"dgridb");
+        if (file.empty()) return;
+        const auto utf8 = wide_to_utf8(file.c_str());
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_grid_verify_binary_file(utf8.c_str());
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status == DT_OK) {
+            std::wostringstream text;
+            text << L"DGRIDB 数据块校验通过：" << file << L"，耗时 "
+                 << std::fixed << std::setprecision(1)
+                 << std::chrono::duration<double, std::milli>(end - begin).count()
+                 << L" ms";
+            action_text_ = text.str();
+        } else {
+            action_text_ = L"DGRIDB 校验失败：" + last_error_text();
         }
     }
 
@@ -5514,6 +5561,7 @@ private:
         case ID_CONTOURS_FROM_CDT: generate_cdt_contours(); break;
         case ID_IMPORT_GRID: import_grid_file(); break;
         case ID_EXPORT_GRID: export_grid_file(); break;
+        case ID_VERIFY_DGRIDB: verify_dgridb_file(); break;
         case ID_IMPORT_CONTOURS: import_contour_file(); break;
         case ID_EXPORT_CONTOURS: export_contour_file(); break;
         case ID_IMPORT_GDAL_RASTER: import_gdal_raster(); break;

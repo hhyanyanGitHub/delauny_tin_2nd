@@ -49,15 +49,48 @@ int main(int argc, char** argv) {
                               nullptr) != DT_OK)
         return 5;
     const auto preview_end = std::chrono::steady_clock::now();
+    const uint64_t pyramid_source_width = std::min<uint64_t>(4096, width);
+    const uint64_t pyramid_source_height = std::min<uint64_t>(2048, height);
+    const uint64_t pyramid_width = std::min<uint64_t>(512,
+                                                       pyramid_source_width);
+    const uint64_t pyramid_height = std::min<uint64_t>(256,
+                                                        pyramid_source_height);
+    std::vector<double> pyramid(pyramid_width * pyramid_height);
+    overview.flags = 0;
+    overview.source_column = (width - pyramid_source_width) / 2;
+    overview.source_row = (height - pyramid_source_height) / 2;
+    overview.source_width = pyramid_source_width;
+    overview.source_height = pyramid_source_height;
+    std::vector<double> exact_local(pyramid_width * pyramid_height);
+    const auto exact_local_begin = std::chrono::steady_clock::now();
+    if (dt_grid_read_overview(grid, &overview, pyramid_width, pyramid_height,
+                              exact_local.data(), 0, nullptr) != DT_OK)
+        return 6;
+    const auto exact_local_end = std::chrono::steady_clock::now();
+    overview.flags = DT_GRID_OVERVIEW_USE_PYRAMID;
+    dt_grid_overview_result pyramid_result{};
+    pyramid_result.struct_size = sizeof(pyramid_result);
+    const auto pyramid_begin = std::chrono::steady_clock::now();
+    if (dt_grid_read_overview(grid, &overview, pyramid_width, pyramid_height,
+                              pyramid.data(), 0, &pyramid_result) != DT_OK ||
+        (pyramid_result.flags & DT_GRID_OVERVIEW_USED_PYRAMID) == 0)
+        return 7;
+    const auto pyramid_end = std::chrono::steady_clock::now();
     const uint64_t local_width = std::min<uint64_t>(1024, width);
     const uint64_t local_height = std::min<uint64_t>(768, height);
     std::vector<double> local(local_width * local_height);
+    dt_grid_prefetch_window(grid, (width - local_width) / 2,
+                            (height - local_height) / 2, local_width,
+                            local_height);
     const auto local_begin = std::chrono::steady_clock::now();
     if (dt_grid_read_window(grid, (width - local_width) / 2,
                             (height - local_height) / 2, local_width,
                             local_height, local.data(), 0) != DT_OK)
-        return 6;
+        return 8;
     const auto local_end = std::chrono::steady_clock::now();
+    const auto verify_begin = std::chrono::steady_clock::now();
+    if (dt_grid_verify_binary_file(file.string().c_str()) != DT_OK) return 9;
+    const auto verify_end = std::chrono::steady_clock::now();
 
     const auto seconds = [](auto begin, auto end) {
         return std::chrono::duration<double>(end - begin).count();
@@ -70,8 +103,14 @@ int main(int argc, char** argv) {
               << " open_seconds=" << seconds(open_begin, open_end)
               << " persistent_overview_seconds="
               << seconds(preview_begin, preview_end)
+              << " exact_local_overview_seconds="
+              << seconds(exact_local_begin, exact_local_end)
+              << " pyramid_overview_seconds="
+              << seconds(pyramid_begin, pyramid_end)
               << " local_read_seconds=" << seconds(local_begin, local_end)
+              << " verify_seconds=" << seconds(verify_begin, verify_end)
               << " checksum=" << preview.front() + preview.back() +
+                                      pyramid.front() + pyramid.back() +
                                       local.front() + local.back()
               << '\n';
     dt_grid_destroy(grid);

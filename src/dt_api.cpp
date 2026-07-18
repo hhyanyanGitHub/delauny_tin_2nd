@@ -441,6 +441,14 @@ dt_status DT_CALL dt_grid_read_window(dt_grid_handle grid, uint64_t column,
     });
 }
 
+dt_status DT_CALL dt_grid_prefetch_window(dt_grid_handle grid,
+                                           uint64_t column, uint64_t row,
+                                           uint64_t width, uint64_t height) {
+    return guarded([&] {
+        require_grid(grid).prefetch_window(column, row, width, height);
+    });
+}
+
 dt_status DT_CALL dt_grid_read_overview(
     dt_grid_handle grid, const dt_grid_overview_options* options,
     uint64_t output_width, uint64_t output_height, double* output_values,
@@ -609,6 +617,10 @@ dt_status DT_CALL dt_grid_load_binary(const char* utf8_file_name,
         result->grid = dt::Grid::load_binary(utf8_file_name);
         *output_grid = result.release();
     });
+}
+
+dt_status DT_CALL dt_grid_verify_binary_file(const char* utf8_file_name) {
+    return guarded([&] { dt::Grid::verify_binary_file(utf8_file_name); });
 }
 
 dt_status DT_CALL dt_grid_from_tin(dt_handle tin,

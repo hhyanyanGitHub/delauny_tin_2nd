@@ -1,4 +1,5 @@
 #include "dt_terrain_api.h"
+#include "dt_task_api.h"
 
 #include <chrono>
 #include <cmath>
@@ -92,6 +93,56 @@ int main(int argc, char** argv) {
     const double checksum_error = std::abs(checksum(serial) - checksum(parallel));
     const double mean_error =
         std::abs(serial_result.mean_value - parallel_result.mean_value);
+
+    dt_grid_overview_options async_options{};
+    async_options.struct_size = sizeof(async_options);
+    async_options.method = DT_GRID_OVERVIEW_AVERAGE;
+    async_options.worker_count = workers;
+    async_options.tile_row_count = tile_rows;
+    dt_task_handle async_task = nullptr;
+    const auto submit_begin = std::chrono::steady_clock::now();
+    require_ok(dt_grid_read_overview_async(
+                   grid, &async_options, output_width, output_height,
+                   &async_task),
+               "submit async overview");
+    const auto submit_end = std::chrono::steady_clock::now();
+    int32_t completed = 0;
+    require_ok(dt_task_wait(async_task, UINT32_MAX, &completed),
+               "wait async overview");
+    dt_grid_overview_view async_view{};
+    async_view.struct_size = sizeof(async_view);
+    require_ok(dt_task_get_grid_overview_result(async_task, &async_view),
+               "get async overview");
+    std::vector<double> async_values(
+        async_view.values,
+        async_view.values + async_view.width * async_view.height);
+    const double async_checksum_error =
+        std::abs(checksum(parallel) - checksum(async_values));
+    const double async_submit_microseconds =
+        std::chrono::duration<double, std::micro>(submit_end - submit_begin)
+            .count();
+    const double async_wait_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      submit_end)
+            .count();
+    dt_task_destroy(async_task);
+
+    dt_task_handle cancel_task = nullptr;
+    require_ok(dt_grid_read_overview_async(grid, &async_options, 1, 1,
+                                            &cancel_task),
+               "submit cancellable overview");
+    const auto cancel_begin = std::chrono::steady_clock::now();
+    require_ok(dt_task_request_cancel(cancel_task), "request cancellation");
+    require_ok(dt_task_wait(cancel_task, UINT32_MAX, &completed),
+               "wait cancellation");
+    dt_task_info cancel_info{};
+    cancel_info.struct_size = sizeof(cancel_info);
+    require_ok(dt_task_get_info(cancel_task, &cancel_info),
+               "get cancellation info");
+    const double cancel_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cancel_begin).count();
+    dt_task_destroy(cancel_task);
     std::cout << std::fixed << std::setprecision(6)
               << "grid=" << width << "x" << height
               << " overview=" << output_width << "x" << output_height
@@ -101,7 +152,15 @@ int main(int argc, char** argv) {
               << " parallel_seconds=" << parallel_seconds
               << " speedup=" << serial_seconds / parallel_seconds
               << " checksum_error=" << checksum_error
-              << " mean_error=" << mean_error << "\n";
+              << " mean_error=" << mean_error
+              << " async_submit_us=" << async_submit_microseconds
+              << " async_wait_seconds=" << async_wait_seconds
+              << " async_checksum_error=" << async_checksum_error
+              << " cancel_ms=" << cancel_milliseconds
+              << " cancel_state=" << cancel_info.state << "\n";
     dt_grid_destroy(grid);
-    return checksum_error == 0.0 && mean_error == 0.0 ? 0 : 3;
+    return checksum_error == 0.0 && mean_error == 0.0 &&
+                   async_checksum_error == 0.0
+        ? 0
+        : 3;
 }

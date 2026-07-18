@@ -32,7 +32,9 @@ public:
                          uint64_t height) const;
     dt_grid_overview_result read_overview(
         const dt_grid_overview_options& options, uint64_t output_width,
-        uint64_t output_height, double* output, uint64_t stride) const;
+        uint64_t output_height, double* output, uint64_t stride,
+        const ProgressCallback& progress = {},
+        const CancelCallback& cancelled = {}) const;
     dt_grid_window view_window(const dt_grid_view_options& options) const;
     void write_window(uint64_t column, uint64_t row, uint64_t width,
                       uint64_t height, const double* input, uint64_t stride);

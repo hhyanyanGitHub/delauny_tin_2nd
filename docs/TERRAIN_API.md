@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.29 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.30 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -122,8 +122,31 @@ NoData。该标志不改变最近邻。
 double 计，0 表示输出宽度；输出维度上限为每轴 1,048,576 且总计不超过十亿个值。
 
 工作线程按输出行块写互不重叠的调用方区域，自动线程数最多 32，显式最多 64；所有
-统计按输出行顺序归并，所以串并行输出和均值确定一致。接口是同步调用：返回前调用方
-不得释放输出缓冲区，也不得并发修改源 GRID。
+统计按输出行顺序归并，所以串并行输出和均值确定一致。同步接口返回前调用方不得释放
+输出缓冲区，也不得并发修改源 GRID。
+
+v0.30 增加任务自有结果缓冲区的异步入口：
+
+```cpp
+dt_task_handle task = nullptr;
+dt_grid_read_overview_async(grid, &options, 512, 512, &task);
+
+int32_t completed = 0;
+dt_task_wait(task, UINT32_MAX, &completed);
+dt_grid_overview_view view{};
+view.struct_size = sizeof(view);
+if (dt_task_get_grid_overview_result(task, &view) == DT_OK) {
+    // view.values[row * view.row_stride + column]
+    // view.result 保存统计和精确/金字塔标志
+}
+dt_task_destroy(task);
+```
+
+任务复制选项并持有源 GRID；调用方可在启动成功后释放源公开句柄。`view.values` 是只读
+借用指针，紧密排列且只在任务销毁前有效，不得由调用方释放或写入。结果类型为
+`DT_TASK_RESULT_GRID_OVERVIEW`。精确和金字塔路径均按输出行报告进度和检查取消，超大
+精确分箱还在源行内部检查；取消状态不发布部分数组。GUI 连续视口请求可取消旧任务并
+立即提交新任务，旧任务完成后只需销毁而不提取结果。
 
 ## 世界视口到 GRID 行列窗口
 
@@ -380,6 +403,10 @@ dt_task_destroy(task);
 任务在内部持有源 TIN/GRID 的共享生命周期，启动成功后可释放源公开句柄。取消为
 协作式：转换循环会检查请求并返回 `DT_E_CANCELLED`。`dt_task_destroy()` 会请求
 取消并等待工作线程退出。失败信息通过 `dt_task_get_error()` 读取。
+
+`DT_TASK_RESULT_GRID_OVERVIEW` 使用 `dt_task_get_grid_overview_result()` 返回任务拥有的
+借用视图；`GRID`、`CONTOURS` 和 `EARTHWORK` 结果仍分别按原 getter 提取。异步概览特别
+适合高频视口调度，因为提交不借用调用方输出数组，任务被取消或丢弃时也无需处理半成品。
 
 v0.21 将全幅 GRID 专题派生接入同一框架：
 

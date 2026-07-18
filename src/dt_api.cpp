@@ -65,6 +65,11 @@ struct dt_task_t {
     std::shared_ptr<dt::ContourSet> contour_result;
     dt_grid_earthwork_result earthwork_result{};
     bool earthwork_result_ready = false;
+    std::vector<double> overview_values;
+    dt_grid_overview_result overview_result{};
+    uint64_t overview_width = 0;
+    uint64_t overview_height = 0;
+    bool overview_result_ready = false;
 };
 
 namespace {
@@ -1023,6 +1028,51 @@ dt_status DT_CALL dt_contours_from_grid_async(
     });
 }
 
+dt_status DT_CALL dt_grid_read_overview_async(
+    dt_grid_handle grid, const dt_grid_overview_options* options,
+    uint64_t output_width, uint64_t output_height,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_overview_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto source = require_grid_shared(grid);
+        const auto copied_options = *options;
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID_OVERVIEW,
+            [source, copied_options, output_width, output_height](
+                dt_task_t& task) {
+                constexpr uint64_t kMaximumOverviewDimension =
+                    1024ULL * 1024ULL;
+                constexpr uint64_t kMaximumOverviewValues = 1000000000ULL;
+                if (output_width == 0 || output_height == 0) {
+                    throw dt::Exception(
+                        DT_E_INVALID_ARGUMENT,
+                        "GRID overview output dimensions must be positive");
+                }
+                if (output_width > kMaximumOverviewDimension ||
+                    output_height > kMaximumOverviewDimension ||
+                    output_width > kMaximumOverviewValues / output_height) {
+                    throw dt::Exception(
+                        DT_E_LIMIT_EXCEEDED,
+                        "GRID overview output size is invalid or too large");
+                }
+                task.overview_width = output_width;
+                task.overview_height = output_height;
+                task.overview_values.resize(static_cast<size_t>(
+                    output_width * output_height));
+                task.overview_result = source->read_overview(
+                    copied_options, output_width, output_height,
+                    task.overview_values.data(), output_width,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+                task.overview_result_ready = true;
+            });
+    });
+}
+
 dt_status DT_CALL dt_task_get_info(dt_task_handle task,
                                    dt_task_info* output_info) {
     return guarded([&] {
@@ -1132,6 +1182,33 @@ dt_status DT_CALL dt_task_get_earthwork_result(
             result->grid = required.grid_result;
             *output_difference_grid = result.release();
         }
+    });
+}
+
+dt_status DT_CALL dt_task_get_grid_overview_result(
+    dt_task_handle task, dt_grid_overview_view* output_view) {
+    if (output_view) *output_view = {};
+    return guarded([&] {
+        if (!output_view) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_view is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        if (required.state != DT_TASK_SUCCEEDED ||
+            !required.overview_result_ready) {
+            throw dt::Exception(
+                DT_E_NOT_FOUND,
+                "task has no completed GRID overview result");
+        }
+        dt_grid_overview_view view{};
+        view.struct_size = sizeof(view);
+        view.width = required.overview_width;
+        view.height = required.overview_height;
+        view.row_stride = required.overview_width;
+        view.values = required.overview_values.data();
+        view.result = required.overview_result;
+        *output_view = view;
     });
 }
 

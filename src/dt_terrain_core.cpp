@@ -1967,10 +1967,14 @@ dt_grid_window Grid::view_window(const dt_grid_view_options& options) const {
 
 dt_grid_overview_result Grid::read_overview(
     const dt_grid_overview_options& options, uint64_t output_width,
-    uint64_t output_height, double* output, uint64_t stride) const {
+    uint64_t output_height, double* output, uint64_t stride,
+    const ProgressCallback& progress,
+    const CancelCallback& cancelled) const {
     if (!output) {
         throw Exception(DT_E_INVALID_ARGUMENT, "overview output_values is null");
     }
+    check_cancelled(cancelled);
+    if (progress) progress(0.0);
     const uint32_t method = options.method == 0
                                 ? static_cast<uint32_t>(
                                       DT_GRID_OVERVIEW_AVERAGE)
@@ -2057,10 +2061,15 @@ dt_grid_overview_result Grid::read_overview(
         persistent_overview_.size() ==
             static_cast<size_t>(output_width * output_height)) {
         for (uint64_t row = 0; row < output_height; ++row) {
+            check_cancelled(cancelled);
             std::copy_n(persistent_overview_.data() +
                             static_cast<size_t>(row * output_width),
                         static_cast<size_t>(output_width),
                         output + static_cast<size_t>(row * stride));
+            if (progress) {
+                progress(static_cast<double>(row + 1) /
+                         static_cast<double>(output_height));
+            }
         }
         return persistent_overview_result_;
     }
@@ -2120,6 +2129,7 @@ dt_grid_overview_result Grid::read_overview(
             selected->values->prefetch(first, last - first + 1);
             for (uint64_t output_row = 0; output_row < output_height;
                  ++output_row) {
+                check_cancelled(cancelled);
                 const uint64_t y_begin = selected_row +
                     partition(output_row, selected_height, output_height);
                 const uint64_t y_end = selected_row +
@@ -2157,6 +2167,10 @@ dt_grid_overview_result Grid::read_overview(
                         ? output_nodata
                         : static_cast<double>(sum /
                                               static_cast<long double>(valid));
+                }
+                if (progress) {
+                    progress(static_cast<double>(output_row + 1) /
+                             static_cast<double>(output_height));
                 }
             }
             dt_grid_overview_result result{};
@@ -2216,6 +2230,7 @@ dt_grid_overview_result Grid::read_overview(
                (2U * output_extent);
     };
     const auto compute_row = [&](uint64_t output_row) {
+        check_cancelled(cancelled);
         Statistics statistics;
         double* destination = output + static_cast<size_t>(output_row * stride);
         if (method == DT_GRID_OVERVIEW_NEAREST) {
@@ -2254,6 +2269,8 @@ dt_grid_overview_result Grid::read_overview(
             double maximum = -std::numeric_limits<double>::infinity();
             for (uint64_t source_y = source_y_begin;
                  source_y < source_y_end; ++source_y) {
+                if (((source_y - source_y_begin) & 63U) == 0U)
+                    check_cancelled(cancelled);
                 size_t source_index = offset(source_x_begin, source_y);
                 for (uint64_t source_x = source_x_begin;
                      source_x < source_x_end; ++source_x, ++source_index) {
@@ -2296,8 +2313,21 @@ dt_grid_overview_result Grid::read_overview(
     }
     worker_count = static_cast<uint32_t>(std::min<uint64_t>(
         worker_count, std::max<uint64_t>(1, tile_count)));
+    std::atomic<uint64_t> completed_rows{0};
+    std::mutex progress_mutex;
+    const auto report_row = [&] {
+        const uint64_t completed = completed_rows.fetch_add(1) + 1;
+        if (progress) {
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            progress(static_cast<double>(completed) /
+                     static_cast<double>(output_height));
+        }
+    };
     if (worker_count == 1) {
-        for (uint64_t row = 0; row < output_height; ++row) compute_row(row);
+        for (uint64_t row = 0; row < output_height; ++row) {
+            compute_row(row);
+            report_row();
+        }
     } else {
         std::atomic<uint64_t> next_row{0};
         std::atomic<bool> stop_requested{false};
@@ -2316,6 +2346,7 @@ dt_grid_overview_result Grid::read_overview(
                     for (uint64_t row = begin; row < end; ++row) {
                         if (stop_requested.load()) break;
                         compute_row(row);
+                        report_row();
                     }
                 }
             } catch (...) {

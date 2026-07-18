@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.30 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.31 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -64,6 +64,54 @@ dt_status checked = dt_grid_verify_binary_file("terrain.dgridb");
 `DT_E_UNSUPPORTED`，校验不一致返回 `DT_E_CORRUPTED_DATA`。对即将进行精确窗口读取的
 映射 GRID，可先调用 `dt_grid_prefetch_window()` 发出最佳努力的操作系统预取提示；普通
 内存 GRID 上该函数成功但不执行额外操作。
+
+### 视口原始节点块校验
+
+v0.31 可只验证当前准备访问的源窗口，并把结果缓存到已加载 GRID 句柄：
+
+```cpp
+dt_grid_verify_result verification{};
+verification.struct_size = sizeof(verification);
+dt_status checked = dt_grid_verify_window(
+    mapped, column, row, width, height, &verification);
+// verification.block_count：相交校验块总数
+// verified_block_count：本次实际读取并通过的块数
+// cached_block_count：本次直接命中句柄缓存的块数
+```
+
+`dt_grid_verify_result` 固定为 64 字节。DGRIDB 原始节点段按连续字节每 4 MiB 分块；实现把
+二维窗口的逐行字节区间映射为去重块集合，所以 `checked_byte_count` 统计完整相交块，可能
+大于窗口节点本身的字节数。重复调用会设置 `DT_GRID_VERIFY_USED_CACHE`。缓存属于当前
+加载句柄且受互斥保护；并发只读校验安全，但竞争线程可能重复计算同一冷块。任一已知失败
+块会继续立即返回 `DT_E_CORRUPTED_DATA`。窗口写入会撤销持久概览、金字塔、块校验能力
+及其缓存，调用方不得与校验并发修改同一 GRID。
+
+异步入口复用统一任务的进度、等待、错误与取消协议：
+
+```cpp
+dt_task_handle task = nullptr;
+dt_grid_verify_window_async(mapped, column, row, width, height, &task);
+// ... dt_task_wait / dt_task_get_info / dt_task_request_cancel ...
+dt_grid_verify_result verification{};
+verification.struct_size = sizeof(verification);
+dt_task_get_grid_verification_result(task, &verification);
+dt_task_destroy(task);
+```
+
+该任务结果类型为 `DT_TASK_RESULT_GRID_VERIFICATION`。任务共享持有源 GRID，成功提交后
+调用方可释放公开源句柄；取消在块边界协作生效，取消或失败时 getter 不返回部分结果。
+无块校验扩展的旧 DGRIDB 和普通内存 GRID 返回 `DT_E_UNSUPPORTED`。
+
+若读取概览时必须先验证其源窗口，可设置：
+
+```cpp
+options.flags |= DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS;
+```
+
+校验占任务进度的前 20%，随后仍可直接复制持久全幅概览或读取金字塔。这个标志验证的是
+对应原始 double 节点块，不是概览/金字塔载荷本身；它适合交互式逐视口防护，不能替代
+归档后的 `dt_grid_verify_binary_file()` 全量审计。8192×4096 本机基准中，12 个相交块
+（48 MiB）冷校验约 58.56 ms，缓存复查约 6 μs，完整扫描约 384.06 ms。
 
 ## GRID 窗口概览与 LOD 读取
 
@@ -405,7 +453,9 @@ dt_task_destroy(task);
 取消并等待工作线程退出。失败信息通过 `dt_task_get_error()` 读取。
 
 `DT_TASK_RESULT_GRID_OVERVIEW` 使用 `dt_task_get_grid_overview_result()` 返回任务拥有的
-借用视图；`GRID`、`CONTOURS` 和 `EARTHWORK` 结果仍分别按原 getter 提取。异步概览特别
+借用视图；v0.31 的 `DT_TASK_RESULT_GRID_VERIFICATION` 使用
+`dt_task_get_grid_verification_result()` 返回按值复制的 64 字节校验统计；`GRID`、
+`CONTOURS` 和 `EARTHWORK` 结果仍分别按原 getter 提取。异步概览特别
 适合高频视口调度，因为提交不借用调用方输出数组，任务被取消或丢弃时也无需处理半成品。
 
 v0.21 将全幅 GRID 专题派生接入同一框架：

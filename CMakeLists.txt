@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.30.0
+    VERSION 0.31.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -226,6 +226,18 @@ if(DT_BUILD_TESTS)
         target_compile_options(dterrain_grid_binary_tests PRIVATE /UNDEBUG)
     else()
         target_compile_options(dterrain_grid_binary_tests PRIVATE -UNDEBUG)
+    endif()
+
+    add_executable(dterrain_grid_verification_tests
+        tests/test_grid_verification.cpp)
+    target_compile_features(dterrain_grid_verification_tests PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_grid_verification_tests PRIVATE dterrain)
+    add_test(NAME dterrain_grid_verification_tests
+        COMMAND dterrain_grid_verification_tests)
+    if(MSVC)
+        target_compile_options(dterrain_grid_verification_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(dterrain_grid_verification_tests PRIVATE -UNDEBUG)
     endif()
 endif()
 

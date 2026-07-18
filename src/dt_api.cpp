@@ -70,6 +70,8 @@ struct dt_task_t {
     uint64_t overview_width = 0;
     uint64_t overview_height = 0;
     bool overview_result_ready = false;
+    dt_grid_verify_result verification_result{};
+    bool verification_result_ready = false;
 };
 
 namespace {
@@ -451,6 +453,20 @@ dt_status DT_CALL dt_grid_prefetch_window(dt_grid_handle grid,
                                            uint64_t width, uint64_t height) {
     return guarded([&] {
         require_grid(grid).prefetch_window(column, row, width, height);
+    });
+}
+
+dt_status DT_CALL dt_grid_verify_window(
+    dt_grid_handle grid, uint64_t column, uint64_t row,
+    uint64_t width, uint64_t height, dt_grid_verify_result* output_result) {
+    if (output_result) *output_result = {};
+    return guarded([&] {
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        *output_result = require_grid(grid).verify_window(
+            column, row, width, height);
     });
 }
 
@@ -1073,6 +1089,27 @@ dt_status DT_CALL dt_grid_read_overview_async(
     });
 }
 
+dt_status DT_CALL dt_grid_verify_window_async(
+    dt_grid_handle grid, uint64_t column, uint64_t row,
+    uint64_t width, uint64_t height, dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        const auto source = require_grid_shared(grid);
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID_VERIFICATION,
+            [source, column, row, width, height](dt_task_t& task) {
+                task.verification_result = source->verify_window(
+                    column, row, width, height,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+                task.verification_result_ready = true;
+            });
+    });
+}
+
 dt_status DT_CALL dt_task_get_info(dt_task_handle task,
                                    dt_task_info* output_info) {
     return guarded([&] {
@@ -1209,6 +1246,26 @@ dt_status DT_CALL dt_task_get_grid_overview_result(
         view.values = required.overview_values.data();
         view.result = required.overview_result;
         *output_view = view;
+    });
+}
+
+dt_status DT_CALL dt_task_get_grid_verification_result(
+    dt_task_handle task, dt_grid_verify_result* output_result) {
+    if (output_result) *output_result = {};
+    return guarded([&] {
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        if (required.state != DT_TASK_SUCCEEDED ||
+            !required.verification_result_ready) {
+            throw dt::Exception(
+                DT_E_NOT_FOUND,
+                "task has no completed GRID verification result");
+        }
+        *output_result = required.verification_result;
     });
 }
 

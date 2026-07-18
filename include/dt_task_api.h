@@ -20,7 +20,8 @@ enum dt_task_result_kind {
     DT_TASK_RESULT_GRID = 1,
     DT_TASK_RESULT_CONTOURS = 2,
     DT_TASK_RESULT_EARTHWORK = 3,
-    DT_TASK_RESULT_GRID_OVERVIEW = 4
+    DT_TASK_RESULT_GRID_OVERVIEW = 4,
+    DT_TASK_RESULT_GRID_VERIFICATION = 5
 };
 
 typedef struct dt_task_info {
@@ -80,6 +81,10 @@ DT_API dt_status DT_CALL dt_grid_read_overview_async(
     dt_grid_handle grid, const dt_grid_overview_options* options,
     uint64_t output_width, uint64_t output_height,
     dt_task_handle* output_task);
+/* Retains the source GRID and verifies only blocks intersecting the window. */
+DT_API dt_status DT_CALL dt_grid_verify_window_async(
+    dt_grid_handle grid, uint64_t column, uint64_t row,
+    uint64_t width, uint64_t height, dt_task_handle* output_task);
 
 DT_API dt_status DT_CALL dt_task_get_info(
     dt_task_handle task, dt_task_info* output_info);
@@ -100,6 +105,8 @@ DT_API dt_status DT_CALL dt_task_get_earthwork_result(
     dt_grid_handle* output_difference_grid);
 DT_API dt_status DT_CALL dt_task_get_grid_overview_result(
     dt_task_handle task, dt_grid_overview_view* output_view);
+DT_API dt_status DT_CALL dt_task_get_grid_verification_result(
+    dt_task_handle task, dt_grid_verify_result* output_result);
 DT_API dt_status DT_CALL dt_task_get_error(
     dt_task_handle task, char* buffer, size_t buffer_size,
     size_t* required_size);

@@ -1830,6 +1830,96 @@ void Grid::prefetch_window(uint64_t column, uint64_t row, uint64_t width,
     values_.prefetch(first, last - first + 1);
 }
 
+dt_grid_verify_result Grid::verify_window(
+    uint64_t column, uint64_t row, uint64_t width, uint64_t height,
+    const ProgressCallback& progress,
+    const CancelCallback& cancelled) const {
+    validate_window(column, row, width, height, width);
+    if (binary_checksums_.empty() || binary_checksum_block_bytes_ == 0) {
+        throw Exception(DT_E_UNSUPPORTED,
+                        "GRID has no DGRIDB block checksum table");
+    }
+    check_cancelled(cancelled);
+    if (progress) progress(0.0);
+
+    std::vector<uint8_t> selected(binary_checksums_.size(), uint8_t{0});
+    uint64_t selected_count = 0;
+    for (uint64_t y = 0; y < height; ++y) {
+        const uint64_t first_value =
+            static_cast<uint64_t>(offset(column, row + y));
+        const uint64_t first_byte = first_value * sizeof(double);
+        const uint64_t last_byte = first_byte + width * sizeof(double) - 1;
+        const uint64_t first_block = first_byte / binary_checksum_block_bytes_;
+        const uint64_t last_block = last_byte / binary_checksum_block_bytes_;
+        for (uint64_t block = first_block; block <= last_block; ++block) {
+            if (selected[static_cast<size_t>(block)] == 0) {
+                selected[static_cast<size_t>(block)] = 1;
+                ++selected_count;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(binary_verification_mutex_);
+        if (binary_verification_state_.size() != binary_checksums_.size()) {
+            binary_verification_state_.assign(binary_checksums_.size(),
+                                               uint8_t{0});
+        }
+    }
+
+    dt_grid_verify_result result{};
+    result.struct_size = sizeof(result);
+    result.block_count = selected_count;
+    result.block_byte_size = binary_checksum_block_bytes_;
+    const auto* raw = reinterpret_cast<const unsigned char*>(values_.data());
+    const uint64_t raw_bytes = values_.size() * sizeof(double);
+    uint64_t completed = 0;
+    for (size_t index = 0; index < selected.size(); ++index) {
+        if (selected[index] == 0) continue;
+        check_cancelled(cancelled);
+        uint8_t cached_state = 0;
+        {
+            std::lock_guard<std::mutex> lock(binary_verification_mutex_);
+            cached_state = binary_verification_state_[index];
+        }
+        if (cached_state == 2) {
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "DGRIDB raw value block checksum mismatch");
+        }
+
+        const uint64_t begin =
+            static_cast<uint64_t>(index) * binary_checksum_block_bytes_;
+        const size_t bytes = static_cast<size_t>(std::min<uint64_t>(
+            binary_checksum_block_bytes_, raw_bytes - begin));
+        result.checked_byte_count += bytes;
+        if (cached_state == 1) {
+            ++result.cached_block_count;
+            result.flags |= DT_GRID_VERIFY_USED_CACHE;
+        } else {
+            values_.prefetch(static_cast<size_t>(begin / sizeof(double)),
+                             bytes / sizeof(double));
+            const bool valid = binary_block_hash(raw + begin, bytes) ==
+                               binary_checksums_[index];
+            {
+                std::lock_guard<std::mutex> lock(binary_verification_mutex_);
+                binary_verification_state_[index] = valid ? uint8_t{1}
+                                                          : uint8_t{2};
+            }
+            if (!valid) {
+                throw Exception(DT_E_CORRUPTED_DATA,
+                                "DGRIDB raw value block checksum mismatch");
+            }
+            ++result.verified_block_count;
+        }
+        ++completed;
+        if (progress) {
+            progress(static_cast<double>(completed) /
+                     static_cast<double>(selected_count));
+        }
+    }
+    return result;
+}
+
 dt_grid_window Grid::view_window(const dt_grid_view_options& options) const {
     if (options.flags != 0) {
         throw Exception(DT_E_INVALID_ARGUMENT, "unknown GRID view flags");
@@ -1986,8 +2076,10 @@ dt_grid_overview_result Grid::read_overview(
         throw Exception(DT_E_INVALID_ARGUMENT,
                         "unknown GRID overview method");
     }
-    constexpr uint32_t kKnownFlags = DT_GRID_OVERVIEW_STRICT_NODATA |
-                                     DT_GRID_OVERVIEW_USE_PYRAMID;
+    constexpr uint32_t kKnownFlags =
+        DT_GRID_OVERVIEW_STRICT_NODATA |
+        DT_GRID_OVERVIEW_USE_PYRAMID |
+        DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS;
     if ((options.flags & ~kKnownFlags) != 0) {
         throw Exception(DT_E_INVALID_ARGUMENT,
                         "unknown GRID overview flags");
@@ -2052,10 +2144,26 @@ dt_grid_overview_result Grid::read_overview(
                         "GRID overview output stride is too large");
     }
 
+    ProgressCallback computation_progress = progress;
+    if ((options.flags & DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS) != 0) {
+        verify_window(
+            options.source_column, options.source_row, source_width,
+            source_height,
+            [&](double value) {
+                if (progress) progress(value * 0.2);
+            },
+            cancelled);
+        computation_progress = [&](double value) {
+            if (progress) progress(0.2 + value * 0.8);
+        };
+    }
+
     const bool full_source = options.source_column == 0 &&
         options.source_row == 0 && source_width == width() &&
         source_height == height();
-    if (method == DT_GRID_OVERVIEW_AVERAGE && options.flags == 0 &&
+    const uint32_t computation_flags =
+        options.flags & ~DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS;
+    if (method == DT_GRID_OVERVIEW_AVERAGE && computation_flags == 0 &&
         full_source && output_width == persistent_overview_width_ &&
         output_height == persistent_overview_height_ &&
         persistent_overview_.size() ==
@@ -2066,9 +2174,9 @@ dt_grid_overview_result Grid::read_overview(
                             static_cast<size_t>(row * output_width),
                         static_cast<size_t>(output_width),
                         output + static_cast<size_t>(row * stride));
-            if (progress) {
-                progress(static_cast<double>(row + 1) /
-                         static_cast<double>(output_height));
+            if (computation_progress) {
+                computation_progress(static_cast<double>(row + 1) /
+                                     static_cast<double>(output_height));
             }
         }
         return persistent_overview_result_;
@@ -2168,9 +2276,10 @@ dt_grid_overview_result Grid::read_overview(
                         : static_cast<double>(sum /
                                               static_cast<long double>(valid));
                 }
-                if (progress) {
-                    progress(static_cast<double>(output_row + 1) /
-                             static_cast<double>(output_height));
+                if (computation_progress) {
+                    computation_progress(
+                        static_cast<double>(output_row + 1) /
+                        static_cast<double>(output_height));
                 }
             }
             dt_grid_overview_result result{};
@@ -2317,10 +2426,10 @@ dt_grid_overview_result Grid::read_overview(
     std::mutex progress_mutex;
     const auto report_row = [&] {
         const uint64_t completed = completed_rows.fetch_add(1) + 1;
-        if (progress) {
+        if (computation_progress) {
             std::lock_guard<std::mutex> lock(progress_mutex);
-            progress(static_cast<double>(completed) /
-                     static_cast<double>(output_height));
+            computation_progress(static_cast<double>(completed) /
+                                 static_cast<double>(output_height));
         }
     };
     if (worker_count == 1) {
@@ -2432,6 +2541,10 @@ void Grid::write_window(uint64_t column, uint64_t row, uint64_t width,
     pyramid_.clear();
     binary_checksums_.clear();
     binary_checksum_block_bytes_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(binary_verification_mutex_);
+        binary_verification_state_.clear();
+    }
     if (binary_valid_count_available_) {
         if (valid_delta < 0) {
             binary_valid_count_ -= static_cast<uint64_t>(-valid_delta);
@@ -2739,6 +2852,11 @@ void Grid::save_binary(const char* file_name) {
         }
         binary_checksums_ = std::move(checksums);
         binary_checksum_block_bytes_ = kBinaryGridChecksumBlockBytes;
+        {
+            std::lock_guard<std::mutex> lock(binary_verification_mutex_);
+            binary_verification_state_.assign(binary_checksums_.size(),
+                                               uint8_t{0});
+        }
         binary_valid_count_available_ = true;
         binary_valid_count_ = overview_result.valid_value_count;
     } catch (...) {
@@ -2969,6 +3087,7 @@ std::unique_ptr<Grid> Grid::load_binary(const char* file_name) {
                             "truncated DGRIDB checksum table");
         }
         grid->binary_checksum_block_bytes_ = checksum_block_bytes;
+        grid->binary_verification_state_.assign(checksum_count, uint8_t{0});
     }
     grid->values_.map_copy_on_write(file, static_cast<size_t>(data_offset),
                                     static_cast<size_t>(value_count));

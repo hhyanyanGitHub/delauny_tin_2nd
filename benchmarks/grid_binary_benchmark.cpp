@@ -88,8 +88,24 @@ int main(int argc, char** argv) {
                             local_height, local.data(), 0) != DT_OK)
         return 8;
     const auto local_end = std::chrono::steady_clock::now();
+    dt_grid_verify_result window_verify{};
+    window_verify.struct_size = sizeof(window_verify);
+    const auto window_verify_begin = std::chrono::steady_clock::now();
+    if (dt_grid_verify_window(grid, (width - local_width) / 2,
+                              (height - local_height) / 2, local_width,
+                              local_height, &window_verify) != DT_OK)
+        return 9;
+    const auto window_verify_end = std::chrono::steady_clock::now();
+    dt_grid_verify_result cached_verify{};
+    cached_verify.struct_size = sizeof(cached_verify);
+    const auto cached_verify_begin = std::chrono::steady_clock::now();
+    if (dt_grid_verify_window(grid, (width - local_width) / 2,
+                              (height - local_height) / 2, local_width,
+                              local_height, &cached_verify) != DT_OK)
+        return 10;
+    const auto cached_verify_end = std::chrono::steady_clock::now();
     const auto verify_begin = std::chrono::steady_clock::now();
-    if (dt_grid_verify_binary_file(file.string().c_str()) != DT_OK) return 9;
+    if (dt_grid_verify_binary_file(file.string().c_str()) != DT_OK) return 11;
     const auto verify_end = std::chrono::steady_clock::now();
 
     const auto seconds = [](auto begin, auto end) {
@@ -108,6 +124,12 @@ int main(int argc, char** argv) {
               << " pyramid_overview_seconds="
               << seconds(pyramid_begin, pyramid_end)
               << " local_read_seconds=" << seconds(local_begin, local_end)
+              << " window_verify_seconds="
+              << seconds(window_verify_begin, window_verify_end)
+              << " cached_verify_seconds="
+              << seconds(cached_verify_begin, cached_verify_end)
+              << " window_blocks=" << window_verify.block_count
+              << " cached_blocks=" << cached_verify.cached_block_count
               << " verify_seconds=" << seconds(verify_begin, verify_end)
               << " checksum=" << preview.front() + preview.back() +
                                       pyramid.front() + pyramid.back() +

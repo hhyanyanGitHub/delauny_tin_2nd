@@ -78,7 +78,10 @@ enum dt_grid_overview_flags {
     DT_GRID_OVERVIEW_STRICT_NODATA = 1u << 0,
     /* Allows average overviews to use a persisted DGRIDB pyramid level.
        Output is a display-oriented approximation; result flags identify it. */
-    DT_GRID_OVERVIEW_USE_PYRAMID = 1u << 1
+    DT_GRID_OVERVIEW_USE_PYRAMID = 1u << 1,
+    /* Verifies and caches only DGRIDB checksum blocks intersecting the source
+       window before reading. Unsupported for grids without block checksums. */
+    DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS = 1u << 2
 };
 
 enum dt_grid_overview_result_flags {
@@ -93,6 +96,12 @@ enum dt_grid_view_window_flags {
     /* The requested world rectangle extended outside the GRID footprint and
        the returned source window was clipped to available nodes. */
     DT_GRID_VIEW_WINDOW_CLIPPED = 1u << 0
+};
+
+enum dt_grid_verify_result_flags {
+    /* At least one selected block was already valid in this GRID handle's
+       verification cache and did not need to be hashed again. */
+    DT_GRID_VERIFY_USED_CACHE = 1u << 0
 };
 
 typedef struct dt_grid_create_options {
@@ -277,6 +286,19 @@ typedef struct dt_grid_window {
     uint64_t reserved[3];
 } dt_grid_window;
 
+/* Summary of a viewport-scoped DGRIDB checksum operation. The checked blocks
+   are contiguous raw-value blocks and can extend outside the exact window. */
+typedef struct dt_grid_verify_result {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t block_count;
+    uint64_t verified_block_count;
+    uint64_t cached_block_count;
+    uint64_t checked_byte_count;
+    uint64_t block_byte_size;
+    uint64_t reserved[2];
+} dt_grid_verify_result;
+
 typedef struct dt_contours_to_tin_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -350,6 +372,12 @@ DT_API dt_status DT_CALL dt_grid_read_window(
 DT_API dt_status DT_CALL dt_grid_prefetch_window(
     dt_grid_handle grid, uint64_t column, uint64_t row,
     uint64_t width, uint64_t height);
+
+/* Verifies only raw-value checksum blocks intersecting a source-node window.
+   Successfully verified blocks are cached by the loaded GRID handle. */
+DT_API dt_status DT_CALL dt_grid_verify_window(
+    dt_grid_handle grid, uint64_t column, uint64_t row,
+    uint64_t width, uint64_t height, dt_grid_verify_result* output_result);
 
 /* Reads an in-memory, caller-owned overview of a source GRID window without
    constructing another GRID handle. row_stride is measured in doubles and

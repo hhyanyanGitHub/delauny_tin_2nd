@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,6 +31,10 @@ public:
                      uint64_t height, double* output, uint64_t stride) const;
     void prefetch_window(uint64_t column, uint64_t row, uint64_t width,
                          uint64_t height) const;
+    dt_grid_verify_result verify_window(
+        uint64_t column, uint64_t row, uint64_t width, uint64_t height,
+        const ProgressCallback& progress = {},
+        const CancelCallback& cancelled = {}) const;
     dt_grid_overview_result read_overview(
         const dt_grid_overview_options& options, uint64_t output_width,
         uint64_t output_height, double* output, uint64_t stride,
@@ -90,6 +95,10 @@ private:
     std::vector<PyramidLevel> pyramid_;
     std::vector<uint64_t> binary_checksums_;
     uint64_t binary_checksum_block_bytes_ = 0;
+    /* 0 unknown, 1 verified, 2 failed. Guarded independently so concurrent
+       read-only viewport tasks may share the cache. */
+    mutable std::mutex binary_verification_mutex_;
+    mutable std::vector<uint8_t> binary_verification_state_;
     bool binary_valid_count_available_ = false;
     uint64_t binary_valid_count_ = 0;
 

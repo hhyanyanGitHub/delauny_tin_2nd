@@ -2852,6 +2852,9 @@ private:
             dt_grid_prefetch_window(source_grid, window.column, window.row,
                                     window.width, window.height);
         }
+        if ((source_info.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0) {
+            overview.flags |= DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS;
+        }
         dt_task_handle task = nullptr;
         if (dt_grid_read_overview_async(source_grid, &overview, output_width,
                                         output_height, &task) != DT_OK) {
@@ -5234,7 +5237,7 @@ private:
         if ((grid_info_.flags & DT_GRID_HAS_PYRAMID) != 0)
             text << L"；多级金字塔";
         if ((grid_info_.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0)
-            text << L"；块校验";
+            text << L"；按需块校验缓存";
         if (grid_info_.width > grid_preview_width_ ||
             grid_info_.height > grid_preview_height_)
             text << L"；LOD 预览 " << grid_preview_width_ << L"×"

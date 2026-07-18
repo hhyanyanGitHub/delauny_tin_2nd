@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.30.0"
+VERSION = "0.31.0"
 TODAY = date(2026, 7, 18).isoformat()
 
 BLUE = "2E74B5"
@@ -437,20 +437,20 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.30.0：GRID 概览新增任务自有异步结果、进度与低延迟取消；GUI 采用非阻塞视口调度。DGRIDB 仍兼容 v0.28/v0.29。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.31.0：DGRIDB 新增同步/异步视口原始节点块校验、句柄级缓存和概览前自动验证；GUI 在非阻塞视口 LOD 中按需启用。文件布局仍兼容 v0.28/v0.29。", "gold")
 
 
 def build_developer_manual():
     m = Manual(
         "dterrain 动态地形三角网 DLL\n开发与使用手册",
         "DLL 开发与使用手册",
-        "面向测绘地形建模的 TIN、GRID、等高线转换、DGRIDB 映射/金字塔存储、异步视口 LOD、动态编辑与空间查询",
+        "面向测绘地形建模的 TIN、GRID、等高线转换、DGRIDB 映射/金字塔/按需校验、异步视口 LOD、动态编辑与空间查询",
         "C/C++ 集成人员、算法研究人员、测试与运维人员",
     )
     m.cover("DEVELOPER REFERENCE")
     add_document_control(
         m,
-        "架构、构建部署、稳定 C ABI、DGRIDB 二进制映射/金字塔/块校验、世界视口 GRID 裁剪与异步 LOD、GRID 窗口概览、GRID 多边形裁剪/掩膜、GRID 显式重采样、双 GRID 精确挖填方、局部与全幅坡度/坡向/阴影分析、约束 Delaunay、GRID/等高线转换、GDAL 格式交换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
+        "架构、构建部署、稳定 C ABI、DGRIDB 二进制映射/金字塔/视口块校验缓存、世界视口 GRID 裁剪与异步 LOD、GRID 窗口概览、GRID 多边形裁剪/掩膜、GRID 显式重采样、双 GRID 精确挖填方、局部与全幅坡度/坡向/阴影分析、约束 Delaunay、GRID/等高线转换、GDAL 格式交换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
         [
             "首次集成：重点阅读第 3、4、7 章。",
             "地形转换：重点阅读第 4.6 章和第 6 章。",
@@ -464,6 +464,7 @@ def build_developer_manual():
             "视口自适应 GRID LOD：重点阅读第 4.15 节。",
             "DGRIDB 映射存储：重点阅读第 4.16 节和第 6.5 节。",
             "非阻塞 GRID 视口：重点阅读第 4.17 节。",
+            "DGRIDB 视口按需校验：重点阅读第 4.18 节。",
         ],
     )
 
@@ -1125,7 +1126,9 @@ dt_status verified = dt_grid_verify_binary_file("terrain.dgridb");""")
     m.code("""dt_task_handle task = nullptr;
 dt_status s = dt_grid_read_overview_async(
     grid, &options, 512, 512, &task);
-if (s == DT_OK && dt_task_wait(task, UINT32_MAX) == DT_OK) {
+int32_t completed = 0;
+if (s == DT_OK &&
+    dt_task_wait(task, UINT32_MAX, &completed) == DT_OK && completed) {
     dt_grid_overview_view view{};
     view.struct_size = sizeof(view);
     if (dt_task_get_grid_overview_result(task, &view) == DT_OK) {
@@ -1139,6 +1142,32 @@ dt_task_destroy(task);""")
     m.callout("进度与取消", "可用 dt_task_get_info() 轮询 0～1 进度，或用 dt_task_wait() 等待。dt_task_request_cancel() 是协作取消：精确聚合在输出行及大分箱内部检查，金字塔和持久概览逐输出行检查；并行工作线程会停止并汇合，不留下可见半成品。GUI 应取消过期视口，但仍须在完成后销毁任务。", "blue")
     m.callout("并发约束", "任务运行期间不得从其他线程修改同一 GRID。输出单轴最多 1,048,576、总值最多 10 亿；非法尺寸会形成 FAILED 任务并报告 DT_E_INVALID_ARGUMENT。可在后台保留上一帧缓存，只有当前请求成功时才原子替换，避免闪烁和过期结果覆盖新视口。", "gold")
     m.callout("本机基准", "4096×4096→512×512：单线程 111.81 ms，自动并行 14.69 ms，约 7.61×；异步提交约 112 μs、等待 15.58 ms，输出误差为 0；取消延迟约 0.36 ms。结果随硬件、缓存和数据分布变化，不是固定承诺。", "gold")
+
+    m.h2("4.18 DGRIDB 视口块校验与缓存")
+    m.para("v0.31 可只校验当前准备读取的 DGRIDB 原始节点窗口。dt_grid_verify_window() 把二维窗口逐行映射到既有 4 MiB 连续校验块，去重后读取完整相交块；dt_grid_verify_result 固定为 64 字节，分别报告块总数、本次冷校验数、缓存命中数和实际检查字节数。后者可能大于窗口本身，因为校验粒度是完整块。")
+    m.code("""dt_grid_verify_result vr{};
+vr.struct_size = sizeof(vr);
+dt_status s = dt_grid_verify_window(
+    mapped, column, row, width, height, &vr);
+
+// 也可提交到统一任务运行时
+dt_task_handle task = nullptr;
+dt_grid_verify_window_async(
+    mapped, column, row, width, height, &task);
+int32_t completed = 0;
+dt_task_wait(task, UINT32_MAX, &completed);
+dt_grid_verify_result async_vr{};
+async_vr.struct_size = sizeof(async_vr);
+dt_task_get_grid_verification_result(task, &async_vr);
+dt_task_destroy(task);""")
+    m.para("异步结果类型为 DT_TASK_RESULT_GRID_VERIFICATION。任务共享持有源 GRID，按块报告进度，在块边界响应协作取消；失败或取消不发布部分统计。无校验扩展的 v0.28 文件和普通内存 GRID 返回 DT_E_UNSUPPORTED。")
+    m.code("""// 在概览读取前自动验证同一源窗口
+options.flags |= DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS;
+options.flags |= DT_GRID_OVERVIEW_USE_PYRAMID;
+dt_grid_read_overview_async(grid, &options, 512, 512, &task);""")
+    m.callout("缓存与并发", "通过块和失败块状态都保存在当前已加载 GRID 句柄中并受互斥保护；重复窗口通常直接命中缓存。并发只读校验安全，但不得同时写入同一 GRID。任意节点写入会清除旧校验能力和缓存，重新保存 DGRIDB 时重建。", "blue")
+    m.callout("保护边界", "VERIFY_SOURCE_BLOCKS 验证的是请求窗口对应的原始 double 节点块，即使后续概览直接来自持久全幅缓存或金字塔。它不校验概览/金字塔载荷，也不能替代归档或复制后的 dt_grid_verify_binary_file() 全量审计；高保障分发还应配合外部 SHA-256。", "gold")
+    m.callout("本机基准", "8192×4096、343.19 MiB DGRIDB：12 个相交块（48 MiB）冷校验约 58.56 ms，同一窗口缓存复查约 6 μs，完整原始节点扫描约 384.06 ms；冷窗口路径约快 6.56×。", "gold")
 
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
@@ -1288,8 +1317,8 @@ dt_get_last_error(message, sizeof(message), &required);""")
         "百万级以上优先批量构建，提前验证可用内存和临时峰值。",
         "使用局部或投影坐标；避免 NaN、Inf 和重复 XY。",
         "按视口调用矩形查询，不要为显示一次性导出全部千万级三角形。",
-        "大 GRID 本机工作优先 DGRIDB；交互显示使用异步概览并可显式启用金字塔，分析计算保持精确原始节点路径。",
-        "DGRIDB 复制传输或归档后调用 dt_grid_verify_binary_file()；普通打开不做全量扫描。",
+        "大 GRID 本机工作优先 DGRIDB；交互显示使用异步概览、金字塔和 VERIFY_SOURCE_BLOCKS 按需校验，分析计算保持精确原始节点路径。",
+        "DGRIDB 视口按需校验只覆盖已访问的原始节点块；复制传输或归档后仍调用 dt_grid_verify_binary_file() 完整扫描。",
         "保存交换时，DTIN 更紧凑；DTMESH 更可读但体积更大。",
         "全量 dt_validate() 适合导入验收、调试和离线检查，不必每帧调用。",
     ):
@@ -1299,7 +1328,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
     m.h2("9.1 自动化测试")
     m.code("""cmake --build build --config Release --parallel 4
 ctest --test-dir build --output-on-failure""")
-    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。局部坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向；全幅测试覆盖坡度、坡向、阴影、CRS、旋转仿射、NoData、串并行一致和取消。土方、重采样、裁剪、窗口概览与世界视口测试分别锁定 ABI、解析结果、并行确定性、取消和非法参数；v0.30 另覆盖异步概览同步等价、任务持有源生命周期、借用结果、取消及非法尺寸失败。v0.29 二进制测试覆盖仿射、NoData、CRS、v0.28 无扩展兼容、多级金字塔选择、预取、块校验、载荷延迟损坏检测、写时复制失效、同路径原子提交、另存、损坏头和截断拒绝。剖面、多边形量测和 GDAL 构建另有数学与真实文件往返测试。")
+    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。局部坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向；全幅测试覆盖坡度、坡向、阴影、CRS、旋转仿射、NoData、串并行一致和取消。土方、重采样、裁剪、窗口概览与世界视口测试分别锁定 ABI、解析结果、并行确定性、取消和非法参数；v0.30 覆盖异步概览同步等价、任务持有源生命周期、借用结果、取消及非法尺寸失败。v0.31 新增冷块、缓存命中、跨块窗口、异步生命周期/取消、概览前校验和定点损坏失败缓存测试。v0.29 二进制测试覆盖仿射、NoData、CRS、v0.28 无扩展兼容、多级金字塔选择、预取、块校验、载荷延迟损坏检测、写时复制失效、同路径原子提交、另存、损坏头和截断拒绝。剖面、多边形量测和 GDAL 构建另有数学与真实文件往返测试。")
     m.h2("9.2 集成验收清单")
     for text in (
         "DLL、导入库、头文件和运行库均为相同架构。",
@@ -1339,7 +1368,7 @@ def build_gui_manual():
     m = Manual(
         "dterrain GUI 演示程序\n操作手册与入门教程",
         "GUI 操作入门教程",
-        "从 XYZ 散点导入到动态编辑、DGRIDB 映射/金字塔大 GRID、异步视口 LOD、任意多边形 GRID 裁剪、错位设计 GRID 显式对齐、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
+        "从 XYZ 散点导入到动态编辑、DGRIDB 映射/金字塔大 GRID、异步视口 LOD 与按需块校验、任意多边形 GRID 裁剪、错位设计 GRID 显式对齐、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
         "首次使用者、演示人员、算法验证与测绘研究人员",
     )
     m.cover("QUICK START GUIDE")
@@ -1367,7 +1396,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、大 GRID 非阻塞视口 LOD、任意多边形 GRID 裁剪/掩膜、错位设计 GRID 显式对齐、现状/设计双 GRID 挖填方、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.30 功能边界", "当前程序可导入/导出 DGRIDB，并在缩放、拉框、适屏和平移结束后异步生成当前视口 LOD；界面继续显示上一帧，状态栏报告进度，过期请求自动取消且不能覆盖新视口。完整 GRID 仍用于等高线、分析、转换与导出。程序不会隐式重投影；空间瓦片、单元解析边界裁剪和 GPU LOD 尚未接入。", "gold")
+    m.callout("0.31 功能边界", "当前程序可导入/导出 DGRIDB，并在缩放、拉框、适屏和平移结束后异步生成当前视口 LOD；带校验能力的文件会先按需验证相交原始节点块并复用句柄缓存。界面继续显示上一帧，状态栏报告进度，过期或损坏请求不能覆盖有效画面。完整 GRID 仍用于等高线、分析、转换与导出。程序不会隐式重投影；空间瓦片、单元解析边界裁剪和 GPU LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1530,8 +1559,9 @@ def build_gui_manual():
     m.callout("仿射与边缘", "视口裁剪使用完整六参数仿射逆变换，支持旋转、剪切和负像素高。程序在局部窗口四周增加 2 个源节点，减少缩放与平移后的边缘缝隙；GRID 的青色轮廓始终按完整范围绘制。", "gold")
     m.callout("数据完整性", "LOD 只服务二维着色缓存；色带使用完整源统计保持缩放前后稳定。保存 DGRID/GeoTIFF、GRID→TIN、裁剪、分析和从 GRID 生成等高线仍使用完整 GRID。即使源 GRID 有数千万节点，也不会因为屏幕预览而丢值。", "blue")
     m.callout("请求替换与退出", "新视口会请求取消旧任务，已退休任务在后台完成汇合后统一释放；队列设置小上限，快速连续操作不会无限积压。只有请求仍匹配当前 GRID、主题和视口时才能发布结果；切换图层、专题主题或关闭程序都会取消相关任务。", "blue")
+    m.callout("按需块校验缓存", "DGRIDB 声明块校验能力时，异步 LOD 会先验证当前窗口相交的 4 MiB 原始节点块；首次浏览为冷校验，再次浏览命中当前句柄缓存。损坏时不发布新位图，保留上一幅有效画面并抑制相同失败请求重复提交。此机制不校验持久概览/金字塔载荷，也不替代菜单中的全文件审计。", "gold")
     m.callout("本机参考", "8192×4096 GRID 在 1024×768 局部视口生成 512×512 概览约 0.00264 s；同尺寸输出从全幅生成约 0.0128 s，约快 4.85×。视口裁剪查询本身约 15 μs。实际速度由缩放级别、CPU 和内存带宽决定。", "gray")
-    m.callout("DGRIDB 金字塔参考", "8192×4096、343.19 MiB 文件：映射打开 5.17 ms，内置全图概览 0.107 ms；4096×2048 局部窗口到 512×256 时精确路径 11.06 ms、金字塔 2.10 ms（5.26×）；完整块校验 0.352 s。编辑后旧金字塔/校验失效，保存时自动重建。", "blue")
+    m.callout("DGRIDB 金字塔与校验参考", "8192×4096、343.19 MiB 文件：12 个视口块（48 MiB）冷校验约 58.56 ms、缓存复查约 6 μs、完整扫描约 384.06 ms；4096×2048 局部窗口到 512×256 的金字塔路径约 1.84 ms。编辑后旧金字塔/校验失效，保存时自动重建。", "blue")
     m.callout("异步参考", "4096×4096→512×512：异步提交约 112 μs、后台等待 15.58 ms；取消延迟约 0.36 ms。界面线程只提交、轮询和发布小型缓存，因此操作期间保持响应。数值受硬件和缓存状态影响。", "gray")
 
     m.h1("5 导入 XYZ 散点并自动构网")
@@ -1895,7 +1925,7 @@ def build_gui_manual():
         "使用框选放大展示局部细节，并用“全图”恢复。",
         "依次生成 GRID 和等高线，用“图层”菜单验证 T/G/C 叠加与显隐。",
         "若有大 GRID，连续滚轮缩放、拉框和拖动平移，确认状态栏出现‘异步LOD’进度且旧画面不中断；停止操作后只发布当前视口结果，并核对导出或等高线仍来自完整数据。",
-        "把当前 GRID 导出为 DGRIDB 后重新导入，确认状态栏出现写时复制映射、内置概览、多级金字塔和块校验；缩放后观察‘金字塔LOD’，再执行一次‘验证 DGRIDB 数据块’。",
+        "把当前 GRID 导出为 DGRIDB 后重新导入，确认状态栏出现写时复制映射、内置概览、多级金字塔和按需块校验缓存；缩放后观察异步进度和缓存复用，再执行一次‘验证 DGRIDB 数据块’完成全文件审计。",
         "至少导出一次 DGRID 和 DCONTOUR，并重新导入检查范围和数量。",
         "若使用 GDAL 构建，确认五个格式菜单已启用；往返一次 GeoTIFF/COG 和 GeoPackage，并检查 TIN/CDT 未被替换。",
         "从导入的等高线反向生成一次 TIN 和 GRID，确认源等高线仍可叠加显示。",
@@ -1915,9 +1945,9 @@ def build_gui_manual():
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID → 导出并重开 DGRIDB，观察映射/内置概览/金字塔/块校验 → 连续缩放并观察异步进度、旧缓存复用和最终金字塔LOD → 主动验证 DGRIDB 数据块 → 等高线 → 圈定多边形并作紧凑 GRID 裁剪/掩膜 → 打开错位设计 GRID → 双线性显式对齐 → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID → 导出并重开 DGRIDB，观察映射/内置概览/金字塔/按需块校验缓存 → 连续缩放并观察异步进度、冷块验证、缓存复用和最终金字塔LOD → 主动验证 DGRIDB 全部数据块 → 等高线 → 圈定多边形并作紧凑 GRID 裁剪/掩膜 → 打开错位设计 GRID → 双线性显式对齐 → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付 2D/3D 浏览、DGRIDB 写时复制映射、持久全幅概览、2× 多级金字塔、块校验和视口预取、可取消异步视口 GRID LOD、任意多边形节点级 GRID 裁剪/掩膜、同 CRS 错位 GRID 显式重采样、匹配现状/设计 GRID 的解析挖填方与差值图、可取消并行地形专题，以及 TIN/CDT/GRID 局部坡面、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是坐标系显式重投影、空间瓦片目录与请求优先级合并、流式金字塔构建、局部 CDT 更新、网格单元解析边界裁剪、GPU 分块渲染与贴地碰撞。")
+    m.para("当前已交付 2D/3D 浏览、DGRIDB 写时复制映射、持久全幅概览、2× 多级金字塔、视口按需块校验缓存和预取、可取消异步视口 GRID LOD、任意多边形节点级 GRID 裁剪/掩膜、同 CRS 错位 GRID 显式重采样、匹配现状/设计 GRID 的解析挖填方与差值图、可取消并行地形专题，以及 TIN/CDT/GRID 局部坡面、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是坐标系显式重投影、空间瓦片目录与请求优先级合并、流式金字塔构建、局部 CDT 更新、网格单元解析边界裁剪、GPU 分块渲染与贴地碰撞。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

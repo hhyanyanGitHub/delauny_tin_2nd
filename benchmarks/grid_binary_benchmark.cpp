@@ -13,6 +13,22 @@
 int main(int argc, char** argv) {
     const uint64_t width = argc > 1 ? std::stoull(argv[1]) : 8192;
     const uint64_t height = argc > 2 ? std::stoull(argv[2]) : 4096;
+    uint64_t previous_width = width;
+    uint64_t previous_height = height;
+    uint64_t pyramid_nodes = 0;
+    uint64_t peak_scratch_doubles = 0;
+    size_t level_index = 0;
+    while (previous_width > 512 || previous_height > 512) {
+        const uint64_t level_width = (previous_width + 1) / 2;
+        const uint64_t level_height = (previous_height + 1) / 2;
+        pyramid_nodes += level_width * level_height;
+        const uint64_t scratch = level_index == 0
+            ? level_width : previous_width * 2 + level_width;
+        peak_scratch_doubles = std::max(peak_scratch_doubles, scratch);
+        previous_width = level_width;
+        previous_height = level_height;
+        ++level_index;
+    }
     const std::filesystem::path file = "grid_binary_benchmark.dgridb";
     dt_grid_create_options options{};
     options.struct_size = sizeof(options);
@@ -114,6 +130,12 @@ int main(int argc, char** argv) {
     std::cout << std::fixed << std::setprecision(6)
               << "grid=" << width << 'x' << height
               << " file_mib=" << std::filesystem::file_size(file) /
+                     (1024.0 * 1024.0)
+              << " legacy_pyramid_scratch_mib="
+              << static_cast<double>(pyramid_nodes * sizeof(double)) /
+                     (1024.0 * 1024.0)
+              << " streaming_row_scratch_mib="
+              << static_cast<double>(peak_scratch_doubles * sizeof(double)) /
                      (1024.0 * 1024.0)
               << " save_seconds=" << seconds(save_begin, save_end)
               << " open_seconds=" << seconds(open_begin, open_end)

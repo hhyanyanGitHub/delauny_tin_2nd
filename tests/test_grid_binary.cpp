@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -165,6 +166,12 @@ int main() {
                                  &expected_result) == DT_OK);
     assert(dt_grid_save_binary(source, file.string().c_str()) == DT_OK);
     assert(std::filesystem::file_size(file) > kWidth * kHeight * sizeof(double));
+    dt_grid_info source_after_save{};
+    source_after_save.struct_size = sizeof(source_after_save);
+    assert(dt_grid_get_info(source, &source_after_save) == DT_OK);
+    assert((source_after_save.flags & DT_GRID_HAS_PERSISTENT_OVERVIEW) != 0);
+    assert((source_after_save.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0);
+    assert((source_after_save.flags & DT_GRID_HAS_PYRAMID) == 0);
 
     make_v028_compatible_copy(file, legacy_file);
     dt_grid_handle legacy = nullptr;
@@ -263,7 +270,23 @@ int main() {
 
     // Explicitly saving back to the mapped source atomically commits the
     // private copy-on-write view; the live handle remains valid afterwards.
-    assert(dt_grid_save_binary(mapped, file.string().c_str()) == DT_OK);
+    const dt_status overwrite_status =
+        dt_grid_save_binary(mapped, file.string().c_str());
+    if (overwrite_status != DT_OK) {
+        char message[1024]{};
+        dt_get_last_error(message, sizeof(message), nullptr);
+        std::cerr << "mapped overwrite failed: " << message << '\n';
+    }
+    assert(overwrite_status == DT_OK);
+    info = {};
+    info.struct_size = sizeof(info);
+    assert(dt_grid_get_info(mapped, &info) == DT_OK);
+#ifdef _WIN32
+    assert((info.flags & DT_GRID_STORAGE_MEMORY_MAPPED) != 0);
+#endif
+    assert((info.flags & DT_GRID_HAS_PERSISTENT_OVERVIEW) != 0);
+    assert((info.flags & DT_GRID_HAS_PYRAMID) != 0);
+    assert((info.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0);
     dt_grid_handle committed = nullptr;
     assert(dt_grid_load_binary(file.string().c_str(), &committed) == DT_OK);
     assert_value(committed, 321, 123, changed);

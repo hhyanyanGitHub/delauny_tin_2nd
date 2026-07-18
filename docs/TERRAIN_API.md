@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.31 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.32 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -45,7 +45,14 @@ if (opened == DT_OK) {
 Windows 加载使用私有写时复制映射，原始节点和各金字塔层按需调页，句柄仍可传给全部
 现有 GRID API；窗口写入不会修改源文件。保存采用同目录临时文件加成功后原子替换。
 保存回当前映射源时，为解除 Windows 映射锁定会在替换前实体化当前视图；另存为其他
-路径不需要完整副本。格式字段见 [DGRIDB_FORMAT.md](DGRIDB_FORMAT.md)。
+路径不需要完整副本。v0.32 保存时逐层逐行生成金字塔：第一层读取源 GRID，后续层仅从
+临时文件上一层读取两行并直接写一行，峰值临时内存与 GRID 行宽线性相关，不再与总节点
+数线性相关。文件布局和加载兼容性不变。格式字段见 [DGRIDB_FORMAT.md](DGRIDB_FORMAT.md)。
+
+普通内存 GRID 保存后保留持久概览和校验能力，但不让当前句柄映射新文件的金字塔，以免
+活动映射阻碍其他句柄原子覆盖目标；重新加载即可取得 `DT_GRID_HAS_PYRAMID`。覆盖当前
+映射源时，保存句柄在替换后重新映射原始节点和各层金字塔，因此继续报告全部 DGRIDB
+能力。若应用需要保存后立即使用金字塔 LOD，推荐销毁普通内存句柄并加载刚保存的文件。
 
 `DT_GRID_STORAGE_MEMORY_MAPPED`、`DT_GRID_HAS_PERSISTENT_OVERVIEW`、
 `DT_GRID_HAS_PYRAMID` 和 `DT_GRID_HAS_BLOCK_CHECKSUMS` 是

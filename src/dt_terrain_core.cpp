@@ -116,7 +116,7 @@ uint64_t align_binary_offset(uint64_t value) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
-void write_binary_bytes(std::ofstream& stream, const void* data,
+void write_binary_bytes(std::ostream& stream, const void* data,
                         uint64_t byte_count) {
     constexpr uint64_t chunk_size = 64ULL * 1024ULL * 1024ULL;
     const auto* source = static_cast<const char*>(data);
@@ -2665,13 +2665,11 @@ void Grid::save_binary(const char* file_name) {
         uint64_t width = 0;
         uint64_t height = 0;
         uint64_t file_offset = 0;
-        std::vector<double> values;
     };
     std::vector<SavePyramidLevel> levels;
     const double pyramid_nodata = (flags() & DT_GRID_HAS_NODATA) != 0
         ? nodata()
         : std::numeric_limits<double>::quiet_NaN();
-    const double* previous_values = values_.data();
     uint64_t previous_width = width();
     uint64_t previous_height = height();
     uint32_t scale = 1;
@@ -2685,33 +2683,7 @@ void Grid::save_binary(const char* file_name) {
         level.scale = scale;
         level.width = (previous_width + 1) / 2;
         level.height = (previous_height + 1) / 2;
-        level.values.resize(static_cast<size_t>(level.width * level.height));
-        for (uint64_t row = 0; row < level.height; ++row) {
-            for (uint64_t column = 0; column < level.width; ++column) {
-                uint64_t valid = 0;
-                long double sum = 0.0L;
-                for (uint64_t dy = 0; dy < 2; ++dy) {
-                    const uint64_t source_row = row * 2 + dy;
-                    if (source_row >= previous_height) continue;
-                    for (uint64_t dx = 0; dx < 2; ++dx) {
-                        const uint64_t source_column = column * 2 + dx;
-                        if (source_column >= previous_width) continue;
-                        const double value = previous_values[
-                            static_cast<size_t>(source_row * previous_width +
-                                                source_column)];
-                        if (is_nodata(value)) continue;
-                        ++valid;
-                        sum += static_cast<long double>(value);
-                    }
-                }
-                level.values[static_cast<size_t>(row * level.width + column)] =
-                    valid == 0 ? pyramid_nodata
-                               : static_cast<double>(
-                                     sum / static_cast<long double>(valid));
-            }
-        }
         levels.push_back(std::move(level));
-        previous_values = levels.back().values.data();
         previous_width = levels.back().width;
         previous_height = levels.back().height;
     }
@@ -2722,8 +2694,13 @@ void Grid::save_binary(const char* file_name) {
     uint64_t cursor = align_binary_offset(directory_offset + directory_bytes);
     for (auto& level : levels) {
         level.file_offset = cursor;
-        const uint64_t level_bytes =
-            level.values.size() * sizeof(double);
+        if (level.width > std::numeric_limits<uint64_t>::max() / level.height ||
+            level.width * level.height >
+                std::numeric_limits<uint64_t>::max() / sizeof(double)) {
+            throw Exception(DT_E_LIMIT_EXCEEDED,
+                            "binary GRID pyramid level is too large");
+        }
+        const uint64_t level_bytes = level.width * level.height * sizeof(double);
         cursor = align_binary_offset(cursor + level_bytes);
     }
     const uint64_t checksum_count =
@@ -2805,7 +2782,8 @@ void Grid::save_binary(const char* file_name) {
     temporary += "." + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()) + ".tmp";
     try {
-        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+        std::fstream stream(temporary, std::ios::binary | std::ios::in |
+                                           std::ios::out | std::ios::trunc);
         if (!stream) {
             throw Exception(DT_E_IO,
                             "cannot open temporary binary GRID for writing");
@@ -2814,11 +2792,104 @@ void Grid::save_binary(const char* file_name) {
         write_binary_bytes(stream, overview.data(), overview_bytes);
         if (!directory.empty())
             write_binary_bytes(stream, directory.data(), directory.size());
-        for (const auto& level : levels) {
-            stream.seekp(static_cast<std::streamoff>(level.file_offset));
-            if (!stream) throw Exception(DT_E_IO, "failed to seek DGRIDB pyramid");
-            write_binary_bytes(stream, level.values.data(),
-                               level.values.size() * sizeof(double));
+
+        // Build every pyramid level directly into the temporary DGRIDB. The
+        // first level reads the source GRID; later levels read two rows from
+        // the preceding on-disk level. Peak scratch is therefore bounded by
+        // roughly 2.5 source rows instead of one third of all GRID nodes.
+        std::vector<double> source_row_0;
+        std::vector<double> source_row_1;
+        std::vector<double> output_row;
+        for (size_t level_index = 0; level_index < levels.size(); ++level_index) {
+            const auto& level = levels[level_index];
+            const uint64_t source_width = level_index == 0
+                ? width() : levels[level_index - 1].width;
+            const uint64_t source_height = level_index == 0
+                ? height() : levels[level_index - 1].height;
+            const uint64_t source_offset = level_index == 0
+                ? 0 : levels[level_index - 1].file_offset;
+            output_row.resize(static_cast<size_t>(level.width));
+            if (level_index != 0) {
+                source_row_0.resize(static_cast<size_t>(source_width));
+                source_row_1.resize(static_cast<size_t>(source_width));
+                stream.flush();
+                if (!stream) {
+                    throw Exception(DT_E_IO,
+                                    "failed to flush DGRIDB pyramid level");
+                }
+            }
+
+            for (uint64_t row = 0; row < level.height; ++row) {
+                const uint64_t source_y0 = row * 2;
+                const uint64_t source_y1 = source_y0 + 1;
+                const double* row_0 = nullptr;
+                const double* row_1 = nullptr;
+                if (level_index == 0) {
+                    row_0 = values_.data() +
+                        static_cast<size_t>(source_y0 * source_width);
+                    if (source_y1 < source_height) {
+                        row_1 = values_.data() +
+                            static_cast<size_t>(source_y1 * source_width);
+                    }
+                } else {
+                    auto read_level_row = [&](uint64_t source_row,
+                                              std::vector<double>& buffer) {
+                        stream.clear();
+                        stream.seekg(static_cast<std::streamoff>(
+                            source_offset + source_row * source_width *
+                                                sizeof(double)));
+                        if (!stream) {
+                            throw Exception(DT_E_IO,
+                                            "failed to seek DGRIDB pyramid source");
+                        }
+                        stream.read(reinterpret_cast<char*>(buffer.data()),
+                                    static_cast<std::streamsize>(
+                                        source_width * sizeof(double)));
+                        if (!stream) {
+                            throw Exception(DT_E_IO,
+                                            "failed to read DGRIDB pyramid source");
+                        }
+                    };
+                    read_level_row(source_y0, source_row_0);
+                    row_0 = source_row_0.data();
+                    if (source_y1 < source_height) {
+                        read_level_row(source_y1, source_row_1);
+                        row_1 = source_row_1.data();
+                    }
+                }
+
+                for (uint64_t column = 0; column < level.width; ++column) {
+                    const uint64_t source_x0 = column * 2;
+                    const uint64_t source_x1 = source_x0 + 1;
+                    uint64_t valid = 0;
+                    long double sum = 0.0L;
+                    auto include = [&](const double* source_row,
+                                       uint64_t source_column) {
+                        if (!source_row || source_column >= source_width) return;
+                        const double value = source_row[source_column];
+                        if (is_nodata(value)) return;
+                        ++valid;
+                        sum += static_cast<long double>(value);
+                    };
+                    include(row_0, source_x0);
+                    include(row_0, source_x1);
+                    include(row_1, source_x0);
+                    include(row_1, source_x1);
+                    output_row[static_cast<size_t>(column)] = valid == 0
+                        ? pyramid_nodata
+                        : static_cast<double>(sum /
+                                              static_cast<long double>(valid));
+                }
+                stream.clear();
+                stream.seekp(static_cast<std::streamoff>(
+                    level.file_offset + row * level.width * sizeof(double)));
+                if (!stream) {
+                    throw Exception(DT_E_IO,
+                                    "failed to seek DGRIDB pyramid destination");
+                }
+                write_binary_bytes(stream, output_row.data(),
+                                   level.width * sizeof(double));
+            }
         }
         stream.seekp(static_cast<std::streamoff>(checksum_offset));
         if (!stream) throw Exception(DT_E_IO, "failed to seek DGRIDB checksums");
@@ -2830,25 +2901,39 @@ void Grid::save_binary(const char* file_name) {
         stream.flush();
         if (!stream) throw Exception(DT_E_IO, "failed to flush binary GRID");
         stream.close();
-        if (values_.maps_file(destination)) {
+        const bool remap_values = values_.maps_file(destination);
+        if (remap_values) {
             values_.materialize();
             pyramid_.clear();
         }
         replace_file_atomically(temporary, destination);
+        if (remap_values) {
+            values_.map_copy_on_write(destination,
+                                      static_cast<size_t>(data_offset),
+                                      static_cast<size_t>(value_count));
+        }
         persistent_overview_ = std::move(overview);
         persistent_overview_width_ = overview_width;
         persistent_overview_height_ = overview_height;
         persistent_overview_result_ = overview_result;
         pyramid_.clear();
-        pyramid_.reserve(levels.size());
-        for (auto& level : levels) {
-            PyramidLevel stored;
-            stored.scale = level.scale;
-            stored.width = level.width;
-            stored.height = level.height;
-            stored.values = std::make_unique<GridStorage>();
-            stored.values->adopt(std::move(level.values));
-            pyramid_.push_back(std::move(stored));
+        // Saving an ordinary in-memory GRID must not leave file mappings that
+        // prevent another handle from atomically replacing the destination.
+        // A handle that was itself mapped from this destination is remapped to
+        // the new file and can safely retain mapped pyramid levels.
+        if (remap_values) {
+            pyramid_.reserve(levels.size());
+            for (const auto& level : levels) {
+                PyramidLevel stored;
+                stored.scale = level.scale;
+                stored.width = level.width;
+                stored.height = level.height;
+                stored.values = std::make_unique<GridStorage>();
+                stored.values->map_copy_on_write(
+                    destination, static_cast<size_t>(level.file_offset),
+                    static_cast<size_t>(level.width * level.height));
+                pyramid_.push_back(std::move(stored));
+            }
         }
         binary_checksums_ = std::move(checksums);
         binary_checksum_block_bytes_ = kBinaryGridChecksumBlockBytes;

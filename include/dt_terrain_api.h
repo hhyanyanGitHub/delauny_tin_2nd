@@ -36,6 +36,17 @@ enum dt_grid_earthwork_flags {
     DT_GRID_EARTHWORK_ALLOW_PARTIAL_CELLS = 1u << 1
 };
 
+enum dt_grid_resample_method {
+    DT_GRID_RESAMPLE_NEAREST = 1,
+    DT_GRID_RESAMPLE_BILINEAR = 2
+};
+
+enum dt_grid_resample_flags {
+    /* Bilinear interpolation normally requires all four support nodes. This
+       flag renormalizes the weights of valid support nodes instead. */
+    DT_GRID_RESAMPLE_RENORMALIZE_NODATA = 1u << 0
+};
+
 typedef struct dt_grid_create_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -134,6 +145,22 @@ typedef struct dt_grid_earthwork_result {
     double rmse_difference;
 } dt_grid_earthwork_result;
 
+typedef struct dt_grid_resample_options {
+    uint32_t struct_size;
+    /* Zero selects bilinear interpolation. */
+    uint32_t method;
+    uint32_t flags;
+    /* Zero selects an implementation-defined automatic count. One forces
+       single-thread execution. Values above 64 are rejected. */
+    uint32_t worker_count;
+    /* Output rows claimed by one worker at a time. Zero selects 64 rows. */
+    uint32_t tile_row_count;
+    uint32_t reserved0;
+    /* Zero selects NaN. Otherwise this may be finite or NaN. */
+    double output_nodata_value;
+    uint64_t reserved[4];
+} dt_grid_resample_options;
+
 typedef struct dt_contours_to_tin_options {
     uint32_t struct_size;
     uint32_t flags;
@@ -230,6 +257,14 @@ DT_API dt_status DT_CALL dt_grid_compare_earthwork(
     const dt_grid_earthwork_options* options,
     dt_grid_earthwork_result* output_result,
     dt_grid_handle* output_difference_grid);
+
+/* Resamples source_grid onto the dimensions and complete affine geometry of
+   reference_grid. CRS WKT must match exactly; this function never performs a
+   hidden coordinate reprojection. The output CRS is copied from reference. */
+DT_API dt_status DT_CALL dt_grid_resample_like(
+    dt_grid_handle source_grid, dt_grid_handle reference_grid,
+    const dt_grid_resample_options* options,
+    dt_grid_handle* output_grid);
 
 /* DGRID 1 is a portable UTF-8 text format intended for tests and exchange. */
 DT_API dt_status DT_CALL dt_grid_save_text(

@@ -707,6 +707,296 @@ std::unique_ptr<Grid> grid_derive_terrain(
     return output;
 }
 
+std::unique_ptr<Grid> grid_resample_like(
+    const Grid& source, const Grid& reference,
+    const dt_grid_resample_options& options,
+    const ProgressCallback& progress, const CancelCallback& cancelled) {
+    const uint32_t method = options.method == 0
+                                ? static_cast<uint32_t>(
+                                      DT_GRID_RESAMPLE_BILINEAR)
+                                : options.method;
+    if (method != DT_GRID_RESAMPLE_NEAREST &&
+        method != DT_GRID_RESAMPLE_BILINEAR) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown GRID resampling method");
+    }
+    if (method == DT_GRID_RESAMPLE_BILINEAR &&
+        (source.width() < 2 || source.height() < 2)) {
+        throw Exception(DT_E_EMPTY,
+                        "bilinear resampling needs two rows and columns");
+    }
+    constexpr uint32_t kKnownFlags =
+        DT_GRID_RESAMPLE_RENORMALIZE_NODATA;
+    if ((options.flags & ~kKnownFlags) != 0) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unknown GRID resampling flags");
+    }
+    if (source.crs_wkt() != reference.crs_wkt()) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "resampling GRID coordinate systems do not match");
+    }
+    if (options.worker_count > 64) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "resampling worker_count exceeds 64");
+    }
+    constexpr uint32_t kDefaultTileRows = 64;
+    constexpr uint32_t kMaximumTileRows = 1024U * 1024U;
+    const uint32_t tile_rows = options.tile_row_count == 0
+                                   ? kDefaultTileRows
+                                   : options.tile_row_count;
+    if (tile_rows > kMaximumTileRows) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "resampling tile_row_count is too large");
+    }
+    const double output_nodata = options.output_nodata_value == 0.0
+                                     ? std::numeric_limits<double>::quiet_NaN()
+                                     : options.output_nodata_value;
+    if (!(finite(output_nodata) || std::isnan(output_nodata))) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "resampling output NoData must be finite or NaN");
+    }
+
+    dt_grid_create_options create{};
+    create.struct_size = sizeof(create);
+    create.flags = DT_GRID_HAS_NODATA;
+    create.width = reference.width();
+    create.height = reference.height();
+    std::copy(reference.transform(), reference.transform() + 6,
+              create.geo_transform);
+    create.nodata_value = output_nodata;
+    auto output = std::make_unique<Grid>(create);
+    output->set_crs_wkt(reference.crs_wkt());
+
+    const double* source_gt = source.transform();
+    const double* target_gt = reference.transform();
+    const double determinant =
+        source_gt[1] * source_gt[5] - source_gt[2] * source_gt[4];
+    const auto inverse_column = [&](double x, double y) {
+        const double dx = x - source_gt[0];
+        const double dy = y - source_gt[3];
+        return (dx * source_gt[5] - dy * source_gt[2]) / determinant;
+    };
+    const auto inverse_row = [&](double x, double y) {
+        const double dx = x - source_gt[0];
+        const double dy = y - source_gt[3];
+        return (dy * source_gt[1] - dx * source_gt[4]) / determinant;
+    };
+    const double source_column_origin =
+        inverse_column(target_gt[0], target_gt[3]);
+    const double source_row_origin =
+        inverse_row(target_gt[0], target_gt[3]);
+    const double source_column_step_column =
+        (target_gt[1] * source_gt[5] -
+         target_gt[4] * source_gt[2]) / determinant;
+    const double source_row_step_column =
+        (target_gt[4] * source_gt[1] -
+         target_gt[1] * source_gt[4]) / determinant;
+    const double source_column_step_row =
+        (target_gt[2] * source_gt[5] -
+         target_gt[5] * source_gt[2]) / determinant;
+    const double source_row_step_row =
+        (target_gt[5] * source_gt[1] -
+         target_gt[2] * source_gt[4]) / determinant;
+    const double maximum_column = static_cast<double>(source.width() - 1);
+    const double maximum_row = static_cast<double>(source.height() - 1);
+    const double coordinate_scale = std::max({
+        1.0, maximum_column, maximum_row,
+        std::abs(source_column_origin), std::abs(source_row_origin),
+        std::abs(source_column_step_column) *
+            static_cast<double>(reference.width()),
+        std::abs(source_row_step_column) *
+            static_cast<double>(reference.width()),
+        std::abs(source_column_step_row) *
+            static_cast<double>(reference.height()),
+        std::abs(source_row_step_row) *
+            static_cast<double>(reference.height())});
+    const double tolerance = std::numeric_limits<double>::epsilon() *
+                             coordinate_scale * 128.0;
+    const auto& values = source.values();
+    const auto source_value = [&](uint64_t column, uint64_t row) {
+        return values[static_cast<size_t>(row * source.width() + column)];
+    };
+    const auto valid = [&](double value) {
+        return finite(value) && !source.is_nodata(value);
+    };
+    const bool renormalize =
+        (options.flags & DT_GRID_RESAMPLE_RENORMALIZE_NODATA) != 0;
+    const auto sample = [&](double column, double row, double& value) {
+        if (!finite(column) || !finite(row) ||
+            column < -tolerance || column > maximum_column + tolerance ||
+            row < -tolerance || row > maximum_row + tolerance) {
+            return false;
+        }
+        column = std::clamp(column, 0.0, maximum_column);
+        row = std::clamp(row, 0.0, maximum_row);
+        if (method == DT_GRID_RESAMPLE_NEAREST) {
+            const uint64_t nearest_column = static_cast<uint64_t>(
+                std::floor(column + 0.5));
+            const uint64_t nearest_row = static_cast<uint64_t>(
+                std::floor(row + 0.5));
+            value = source_value(nearest_column, nearest_row);
+            return valid(value);
+        }
+        uint64_t cell_column = static_cast<uint64_t>(std::floor(column));
+        uint64_t cell_row = static_cast<uint64_t>(std::floor(row));
+        if (cell_column + 1 >= source.width())
+            cell_column = source.width() - 2;
+        if (cell_row + 1 >= source.height())
+            cell_row = source.height() - 2;
+        const double u = column - static_cast<double>(cell_column);
+        const double v = row - static_cast<double>(cell_row);
+        const std::array<double, 4> support{
+            source_value(cell_column, cell_row),
+            source_value(cell_column + 1, cell_row),
+            source_value(cell_column, cell_row + 1),
+            source_value(cell_column + 1, cell_row + 1)};
+        const std::array<double, 4> weights{
+            (1.0 - u) * (1.0 - v), u * (1.0 - v),
+            (1.0 - u) * v, u * v};
+        double sum = 0.0;
+        double weight_sum = 0.0;
+        for (size_t i = 0; i < support.size(); ++i) {
+            if (!valid(support[i])) {
+                if (!renormalize) return false;
+                continue;
+            }
+            sum += weights[i] * support[i];
+            weight_sum += weights[i];
+        }
+        if (weight_sum <= std::numeric_limits<double>::epsilon() * 16.0)
+            return false;
+        value = sum / weight_sum;
+        return finite(value);
+    };
+
+    const uint64_t width = reference.width();
+    const uint64_t height = reference.height();
+    const auto compute_row = [&](uint64_t target_row,
+                                  const std::atomic<bool>* stop_requested) {
+        const double start_column = source_column_origin +
+            static_cast<double>(target_row) * source_column_step_row;
+        const double start_row = source_row_origin +
+            static_cast<double>(target_row) * source_row_step_row;
+        double* row_output = output->values_.data() +
+                             static_cast<size_t>(target_row * width);
+        for (uint64_t target_column = 0; target_column < width;
+             ++target_column) {
+            if (stop_requested && (target_column & 4095U) == 0U &&
+                stop_requested->load()) {
+                return false;
+            }
+            const double source_column = start_column +
+                static_cast<double>(target_column) *
+                    source_column_step_column;
+            const double source_row_coordinate = start_row +
+                static_cast<double>(target_column) * source_row_step_column;
+            double sampled = output_nodata;
+            row_output[static_cast<size_t>(target_column)] =
+                sample(source_column, source_row_coordinate, sampled)
+                    ? sampled
+                    : output_nodata;
+        }
+        return true;
+    };
+
+    const uint64_t tile_count =
+        (height + static_cast<uint64_t>(tile_rows) - 1U) / tile_rows;
+    uint32_t worker_count = options.worker_count;
+    if (worker_count == 0) {
+        worker_count = std::thread::hardware_concurrency();
+        if (worker_count == 0) worker_count = 4;
+        worker_count = std::min(worker_count, 32U);
+    }
+    worker_count = static_cast<uint32_t>(std::min<uint64_t>(
+        worker_count, std::max<uint64_t>(1, tile_count)));
+    report_progress(progress, 0.0);
+    if (worker_count == 1) {
+        for (uint64_t row = 0; row < height; ++row) {
+            check_cancelled(cancelled);
+            compute_row(row, nullptr);
+            report_progress(progress,
+                            static_cast<double>(row + 1) /
+                                static_cast<double>(height));
+        }
+    } else {
+        std::atomic<uint64_t> next_row{0};
+        std::atomic<uint64_t> completed_rows{0};
+        std::atomic<uint32_t> active_workers{worker_count};
+        std::atomic<bool> stop_requested{false};
+        std::mutex event_mutex;
+        std::condition_variable event;
+        std::mutex error_mutex;
+        std::exception_ptr worker_error;
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        const auto worker = [&] {
+            try {
+                while (!stop_requested.load()) {
+                    const uint64_t begin = next_row.fetch_add(tile_rows);
+                    if (begin >= height) break;
+                    const uint64_t end = std::min<uint64_t>(
+                        height, begin + static_cast<uint64_t>(tile_rows));
+                    for (uint64_t row = begin; row < end; ++row) {
+                        if (stop_requested.load() ||
+                            !compute_row(row, &stop_requested)) break;
+                        completed_rows.fetch_add(1);
+                    }
+                    event.notify_one();
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!worker_error) worker_error = std::current_exception();
+                }
+                stop_requested.store(true);
+            }
+            active_workers.fetch_sub(1);
+            event.notify_one();
+        };
+        try {
+            for (uint32_t i = 0; i < worker_count; ++i)
+                workers.emplace_back(worker);
+        } catch (...) {
+            stop_requested.store(true);
+            for (auto& thread : workers)
+                if (thread.joinable()) thread.join();
+            throw;
+        }
+        bool cancellation_seen = false;
+        std::exception_ptr coordinator_error;
+        try {
+            while (active_workers.load() != 0) {
+                if (cancelled && cancelled()) {
+                    cancellation_seen = true;
+                    stop_requested.store(true);
+                }
+                report_progress(
+                    progress,
+                    static_cast<double>(completed_rows.load()) /
+                        static_cast<double>(height));
+                std::unique_lock<std::mutex> lock(event_mutex);
+                event.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                    return active_workers.load() == 0;
+                });
+            }
+        } catch (...) {
+            coordinator_error = std::current_exception();
+            stop_requested.store(true);
+        }
+        for (auto& thread : workers)
+            if (thread.joinable()) thread.join();
+        if (coordinator_error) std::rethrow_exception(coordinator_error);
+        if (worker_error) std::rethrow_exception(worker_error);
+        if (cancellation_seen || (cancelled && cancelled())) {
+            throw Exception(DT_E_CANCELLED,
+                            "GRID resampling was cancelled");
+        }
+    }
+    ++output->generation_;
+    report_progress(progress, 1.0);
+    return output;
+}
+
 GridEarthworkComputation grid_compare_earthwork(
     const Grid& existing, const Grid& design,
     const dt_grid_earthwork_options& options,

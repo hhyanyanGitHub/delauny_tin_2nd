@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.23.0"
+VERSION = "0.24.0"
 TODAY = date(2026, 7, 18).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.23.0：新增匹配现状/设计 GRID 的解析挖填方、差值 GRID、分块并行、进度与安全取消；全幅坡度/坡向/阴影、剖面、水平基准面量测、GDAL 与约束事务保持兼容。局部 CDT、流式超大 GRID 和 GPU LOD 属于后续阶段。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.24.0：新增同 CRS GRID 的最近邻/双线性显式重采样，可把错位设计面严格对齐到现状 GRID 后再作解析挖填方；全幅地形专题、剖面、GDAL 与约束事务保持兼容。坐标重投影、流式超大 GRID、局部 CDT 和 GPU LOD 属于后续阶段。", "gold")
 
 
 def build_developer_manual():
@@ -450,7 +450,7 @@ def build_developer_manual():
     m.cover("DEVELOPER REFERENCE")
     add_document_control(
         m,
-        "架构、构建部署、稳定 C ABI、双 GRID 精确挖填方、局部与全幅坡度/坡向/阴影分析、约束 Delaunay、GRID/等高线转换、GDAL 格式交换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
+        "架构、构建部署、稳定 C ABI、GRID 显式重采样、双 GRID 精确挖填方、局部与全幅坡度/坡向/阴影分析、约束 Delaunay、GRID/等高线转换、GDAL 格式交换、异步任务、12 个兼容接口、文件格式、性能、线程安全、故障排查。",
         [
             "首次集成：重点阅读第 3、4、7 章。",
             "地形转换：重点阅读第 4.6 章和第 6 章。",
@@ -458,6 +458,7 @@ def build_developer_manual():
             "大数据量使用：重点阅读第 8 章的内存与查询策略。",
             "文件交换：重点阅读第 4.7 章和第 6 章。",
             "现状/设计面土方：重点阅读第 4.11 节。",
+            "错位 GRID 对齐：重点阅读第 4.12 节。",
         ],
     )
 
@@ -474,6 +475,7 @@ def build_developer_manual():
         "普通 TIN、约束 CDT 和仿射 GRID 统一返回局部高程梯度、坡度、下坡坡向、单位法向与支撑单元。",
         "从任意仿射 GRID 派生全幅坡度角、下坡坡向角或 0～255 分析阴影，并继承 CRS/NoData。",
         "匹配现状/设计 GRID 逐单元解析积分挖填方，支持差值 GRID、并行、进度和取消。",
+        "同 CRS GRID 按完整六参数仿射显式对齐，支持最近邻、双线性、NoData 策略、并行与取消。",
         "DTIN 二进制保存加载，以及 DTMESH 可读文本三角网交换。",
         "双精度 GRID、仿射节点坐标、NoData、窗口读写和 DGRID 文本往返。",
         "TIN→GRID、GRID→TIN、TIN/GRID→等高线，以及等高线→TIN/GRID 近似重建。",
@@ -501,7 +503,7 @@ def build_developer_manual():
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.23 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。GUI 多边形土方针对水平基准面并使用固定预算数值积分；双 GRID 接口则对节点匹配的现状/设计面作分片线性解析积分。二者均需结合项目规范复核后用于工程结算。", "gold")
+    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.24 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。GUI 多边形土方针对水平基准面并使用固定预算数值积分；双 GRID 接口要求节点对齐，错位表面可先显式重采样。所有土方结果均需结合项目规范复核后用于工程结算。", "gold")
 
     m.h1("2 架构与数据模型")
     m.h2("2.1 分层结构")
@@ -814,7 +816,7 @@ dt_cdt_destroy(cdt);""")
     m.para("dt_cdt_get_constraint_vertex_usage() 报告指定点被多少条约束、多少个点序列位置引用，以及是否也是基础地形点。dt_cdt_remove_constraint_vertex() 默认拒绝共享顶点；显式传 DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH 时只从目标约束脱离，其他约束和基础点保持不变。删除后仍统一校验最小点数和拓扑，失败时 generation 不变。")
     m.para("dt_cdt_apply_constraint_edits() 按数组顺序组合 ADD、UPDATE 和 REMOVE。ADD 分配新稳定 ID，UPDATE 保留原类型，REMOVE 不携带几何。任一参数、ID 或最终拓扑失败时整批回滚且不消耗 ID；成功时 generation 只增加一次。output_constraint_ids 和整批 output_effect 均可为空。")
     m.para("dt_cdt_sample_height_xy() 只在有效域内插值；外边界以外和孔洞内部返回 DT_E_NOT_FOUND。dt_grid_from_cdt() 将这些位置写为 NoData，dt_contours_from_cdt() 只遍历域内三角形并继承 CRS。更新和顶点删除的 output_effect 均可为 nullptr。")
-    m.callout("性能与交叉", "v0.23 单项约束编辑仍完整重建候选 CDT；批量事务只重建一次。100,000 基础点添加 12 条断裂线的本机对比为逐条 3.259 s、批量 0.528 s，约 6.17 倍。请求 output_effect 还会计算完整域差异。未分段交叉仍须先加入共享顶点。", "gold")
+    m.callout("性能与交叉", "v0.24 单项约束编辑仍完整重建候选 CDT；批量事务只重建一次。100,000 基础点添加 12 条断裂线的本机对比为逐条 3.259 s、批量 0.528 s，约 6.17 倍。请求 output_effect 还会计算完整域差异。未分段交叉仍须先加入共享顶点。", "gold")
 
     m.h2("4.9 坡度、坡向与地形法向")
     m.para("v0.16 由普通 TIN、约束 CDT 和仿射 GRID 共用 dt_surface_analysis 结果结构。三个入口分别是 dt_analyze_tin_surface_xy()、dt_cdt_analyze_surface_xy() 和 dt_grid_analyze_surface_xy()；查询 Z 被忽略，成功结果给出插值 Z、世界 XY 梯度、坡度角、下坡坡向、向上单位法向和实际支撑点。接口只写调用方结构，不分配跨 DLL 内存。")
@@ -904,7 +906,7 @@ dterrain_terrain_benchmark.exe 4096 4096 0 64
     m.code("""dt_grid_earthwork_options o{};
 o.struct_size = sizeof(o);
 o.flags = DT_GRID_EARTHWORK_OUTPUT_DIFFERENCE_GRID;
-o.worker_count = 0;   // 自动线程，最多 64
+o.worker_count = 0;   // 自动最多 32；显式最多 64
 o.tile_row_count = 0; // 默认 64 个单元行
 o.existing_z_factor = 1.0;
 o.design_z_factor = 1.0;
@@ -946,6 +948,46 @@ if (dt_task_get_earthwork_result(task, &r, &difference) == DT_OK) {
 dt_task_destroy(task);""")
     m.callout("校验与所有权", "两幅 GRID 的行列数、六参数仿射和 CRS WKT 必须匹配；源句柄在计算期间不得由其他线程修改。同步/异步取消或失败均不发布半成品。options/result 的 ABI 大小分别为 64/112 字节；返回的差值 GRID 由调用方 dt_grid_destroy()。", "blue")
     m.callout("本机基准", "4096×4096 双 GRID：单线程 0.439 s，自动并行 0.0381 s，约 11.50×；串并行体积差为 0。结果受 CPU、内存带宽、数据分布和块高影响，不是固定承诺。", "gold")
+
+    m.h2("4.12 GRID 显式重采样与设计面对齐")
+    m.para("dt_grid_resample_like() 把 source_grid 显式采样到 reference_grid 的行列数和完整六参数仿射几何上，输出继承参考 GRID 的 CRS。两者 CRS WKT 必须完全一致；接口绝不隐式重投影。该设计把坐标变换、插值和土方积分拆成可检查的步骤：先对齐设计面，再调用 dt_grid_compare_earthwork()。")
+    m.code("""dt_grid_resample_options o{};
+o.struct_size = sizeof(o);
+o.method = DT_GRID_RESAMPLE_BILINEAR; // 0 也表示双线性
+o.flags = 0;                          // 严格 NoData
+o.worker_count = 0;                   // 自动最多 32；显式最多 64
+o.tile_row_count = 64;
+o.output_nodata_value = -9999.0;
+
+dt_grid_handle aligned = nullptr;
+dt_status s = dt_grid_resample_like(design, existing, &o, &aligned);
+if (s == DT_OK) {
+    // aligned 与 existing 节点严格对齐，可继续作双 GRID 土方
+    dt_grid_destroy(aligned);
+}""")
+    m.table(
+        ["方法/标志", "行为", "适用场景"],
+        [
+            ("NEAREST", "按源 GRID 最近节点取值", "分类值、快速预览或不希望平滑"),
+            ("BILINEAR", "在源 GRID 的 2×2 节点上双线性插值", "连续高程设计面，GUI 默认推荐"),
+            ("严格 NoData", "四个支撑点任一无效即输出 NoData", "避免跨越空洞插值；默认"),
+            ("RENORMALIZE_NODATA", "忽略无效支撑点并归一化剩余权重", "明确接受空洞边缘外推时使用"),
+        ],
+        [2600, 3740, 3020],
+        [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    m.para("实现先把参考节点的世界 XY 仿射映射与源 GRID 逆仿射组合成列、行增量，因此旋转、剪切和负像元高均可正确处理。落在源节点包络以外的位置写输出 NoData。双线性模式要求源 GRID 至少 2×2；最近邻可处理单行或单列。output_nodata_value 为零时选择 NaN。")
+    m.code("""dt_task_handle task = nullptr;
+dt_grid_resample_like_async(design, existing, &o, &task);
+// dt_task_get_info() 读取进度；Esc 等 UI 动作可请求协作取消
+dt_grid_handle aligned = nullptr;
+if (dt_task_get_grid_result(task, &aligned) == DT_OK) {
+    // aligned 是调用方拥有的新句柄
+    dt_grid_destroy(aligned);
+}
+dt_task_destroy(task);""")
+    m.callout("并行、取消与所有权", "options 固定为 64 字节。工作线程按输出行块写互不重叠的区域，只有协调线程调用进度/取消回调；同步或异步失败、取消均不发布半成品。计算期间不得修改源和参考句柄，成功结果由调用方 dt_grid_destroy()。", "blue")
+    m.callout("本机基准", "4096×4096 双线性重采样：单线程 0.243 s，自动并行 0.0538 s，约 4.53×，串并行抽样校验和误差为 0。收益受 CPU、内存带宽、仿射关系和块高影响，不是固定承诺。", "gold")
 
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
@@ -1102,7 +1144,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
     m.h2("9.1 自动化测试")
     m.code("""cmake --build build --config Release --parallel 4
 ctest --test-dir build --output-on-failure""")
-    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。局部坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向；全幅测试覆盖坡度、坡向、阴影、CRS、旋转仿射、NoData、串并行一致和取消。v0.23 独立土方测试锁定 64/112 字节 ABI、常量与零线穿越解析体积、旋转面积、严格/半单元 NoData、差值 GRID、异步结果、参数拒绝及大 GRID 取消。剖面、多边形量测和 GDAL 构建另有数学与真实文件往返测试。")
+    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。局部坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向；全幅测试覆盖坡度、坡向、阴影、CRS、旋转仿射、NoData、串并行一致和取消。土方测试锁定 64/112 字节 ABI、零线穿越解析体积、旋转面积、NoData、差值 GRID、异步结果和取消。v0.24 重采样测试另锁定 64 字节 ABI、旋转/剪切解析平面、最近邻与双线性、严格/归一化 NoData、串并行一致、异步结果、CRS 拒绝及大 GRID 取消。剖面、多边形量测和 GDAL 构建另有数学与真实文件往返测试。")
     m.h2("9.2 集成验收清单")
     for text in (
         "DLL、导入库、头文件和运行库均为相同架构。",
@@ -1142,13 +1184,13 @@ def build_gui_manual():
     m = Manual(
         "dterrain GUI 演示程序\n操作手册与入门教程",
         "GUI 操作入门教程",
-        "从 XYZ 散点导入到动态编辑、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
+        "从 XYZ 散点导入到动态编辑、错位设计 GRID 显式对齐、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
         "首次使用者、演示人员、算法验证与测绘研究人员",
     )
     m.cover("QUICK START GUIDE")
     add_document_control(
         m,
-        "便携运行、五分钟上手、控件与菜单、XYZ 导入、TIN/GRID/等高线/CDT 图层、现状/设计双 GRID 土方、全幅坡度/坡向/阴影专题图、局部坡面、任意剖面、多边形面积/土方、2D/3D 浏览、查询编辑和数据保存。",
+        "便携运行、五分钟上手、控件与菜单、XYZ 导入、TIN/GRID/等高线/CDT 图层、错位 GRID 最近邻/双线性对齐、现状/设计双 GRID 土方、全幅坡度/坡向/阴影专题图、局部坡面、任意剖面、多边形面积/土方、2D/3D 浏览、查询编辑和数据保存。",
         [
             "第一次体验：直接完成第 2 章的五分钟教程。",
             "已有 XYZ 数据：重点阅读第 5 章。",
@@ -1156,6 +1198,7 @@ def build_gui_manual():
             "任意剖面分析：重点阅读第 6.3 节。",
             "面积与土方量测：重点阅读第 6.4 节。",
             "现状/设计双表面土方：重点阅读第 6.5 节。",
+            "错位设计 GRID 对齐：重点阅读第 6.5 节。",
             "坡度、坡向与法向：重点阅读第 6.6 节。",
             "全幅地形专题图：重点阅读第 6.7 节。",
             "TIN/GRID/等高线转换与交换：重点阅读第 4.3 节和第 8 章。",
@@ -1165,8 +1208,8 @@ def build_gui_manual():
     )
 
     m.h1("1 程序概览")
-    m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、现状/设计双 GRID 挖填方、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.23 功能边界", "当前程序已提供节点匹配现状/设计 GRID 的解析挖填方、异步进度/取消、蓝—白—红差值图和 CSV 导出；二维/三维浏览、全幅地形专题、剖面、水平基准面多边形量测、转换、GDAL 交换和约束编辑继续可用。流式超大 GRID、任意错位表面重采样和 GPU/LOD 尚未接入。", "gold")
+    m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、错位设计 GRID 显式对齐、现状/设计双 GRID 挖填方、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
+    m.callout("0.24 功能边界", "当前程序已提供同 CRS 错位设计 GRID 的最近邻/双线性异步对齐，并可继续作解析挖填方、显示蓝—白—红差值图和导出 CSV；二维/三维浏览、全幅地形专题、剖面、转换、GDAL 交换和约束编辑继续可用。程序不会隐式重投影；流式超大 GRID 和 GPU/LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1212,7 +1255,7 @@ def build_gui_manual():
         "先用‘分析→设置专题分析与性能参数’检查 z-factor、光照角、线程数和块高，再生成全幅坡度、坡向和阴影地形；观察进度、固定色带和右上图例，并用‘恢复显示高程 GRID’返回高程着色。",
         "选择‘分析→任意剖面（两次单击）’，在画布选取 A、B；观察青色定位线、底部曲线和统计，再导出 CSV。",
         "选择‘分析→面积/土方量测（逐点）’，输入基准高程，逐点圈定区域并按 Enter；核对顶部结果面板，再修改基准高程和导出 CSV。",
-        "选择‘分析→按高程偏移创建设计 GRID’，输入 2；再执行‘现状/设计 GRID 挖填方’，观察差值图和结果，最后导出土方 CSV。",
+        "选择‘分析→按高程偏移创建设计 GRID’，输入 2；可直接执行‘计算现状面—设计面挖填方’，观察差值图和结果，最后导出土方 CSV。若另行打开同 CRS 但错位的设计 GRID，先执行‘双线性对齐设计面到现状 GRID’。",
         "单击“插入模式”，在网格中单击；观察红色旧面、黄色边界和绿色新增面/边。",
         "单击“删除模式”，在目标附近单击；程序删除 XY 最近顶点并显示局部变化。",
         "单击“保存网格”，保存为 terrain.dtmesh；然后单击“清空”和“打开网格”验证加载。",
@@ -1409,9 +1452,10 @@ def build_gui_manual():
     m.h2("6.5 现状/设计双 GRID 挖填方")
     for step in (
         "准备现状高程 GRID：可打开 DGRID，GDAL 构建也可打开 GeoTIFF；当前高程 GRID 就是现状面。",
-        "准备设计面：选择‘分析→打开设计 GRID（DGRID）’或‘打开设计 GRID（GDAL）’。两幅 GRID 必须具有相同行列、六参数仿射和 CRS。",
+        "准备设计面：选择‘分析→打开设计 GRID（DGRID）’或‘打开设计 GRID（GDAL）’。CRS WKT 必须与现状面一致；行列数或六参数仿射不同也可先加载。",
         "快速演示时可选择‘按高程偏移创建设计 GRID…’，输入设计面相对现状面的统一高程偏移；NoData 会原样保留。",
-        "选择‘现状/设计 GRID 挖填方’。计算期间状态栏显示进度；按 Esc 可安全取消，旧结果不会被半成品替换。",
+        "若状态栏提示节点未对齐，连续高程面选择‘双线性对齐设计面到现状 GRID’，分类值或快速预览可选择‘最近邻对齐设计面到现状 GRID’。计算期间可按 Esc 取消；旧设计面会保留。",
+        "选择‘计算现状面—设计面挖填方’。计算期间状态栏显示进度；按 Esc 可安全取消，旧结果不会被半成品替换。",
         "完成后查看状态栏中的挖方、填方、净方、覆盖率和耗时。画布自动显示差值 GRID：红色为现状高于设计，蓝色为现状低于设计，白色接近零。",
         "选择‘导出双表面土方 CSV…’保存汇总统计；需要更换设计时重新打开或创建，选择‘清除设计面及土方结果’可释放设计与差值图层。",
     ):
@@ -1428,8 +1472,17 @@ def build_gui_manual():
         [2200, 3580, 3580],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
     )
+    m.table(
+        ["对齐方法", "特点", "建议"],
+        [
+            ("双线性", "由源 GRID 的 2×2 节点连续插值；严格 NoData", "通常用于连续地形高程和设计面"),
+            ("最近邻", "直接取最近源节点；不产生中间高程", "分类栅格、阶梯面或快速核查"),
+        ],
+        [2200, 3880, 3260],
+        [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
     m.callout("符号约定", "差值 = 现状高程 − 设计高程。正值/红色计挖方，负值/蓝色的绝对体积计填方；净方 = 挖方 − 填方。若设计面统一比现状高 2 个高程单位，结果应主要为填方。", "blue")
-    m.callout("坐标与精度", "两幅 GRID 必须节点对齐，程序不会隐式重投影或重采样。计算采用仿射行列式得到世界 XY 面积，并解析处理三角形内部的零高差线。结果适合复核算法和方案比较；用于工程结算前仍应验证 CRS、单位、NoData、设计版本和行业规范。", "gold")
+    m.callout("坐标与精度", "程序不会隐式重投影。两幅 GRID 的 CRS WKT 不一致时直接拒绝加载设计面，应先在专业 GIS 软件中显式转换坐标系；同 CRS 错位表面则由用户明确选择最近邻或双线性对齐。土方计算采用仿射行列式得到世界 XY 面积，并解析处理三角形内部的零高差线。用于工程结算前仍应验证 CRS、单位、NoData、设计版本和行业规范。", "gold")
 
     m.h2("6.6 坡度、坡向与地形法向")
     for step in (
@@ -1562,7 +1615,7 @@ def build_gui_manual():
         "约束改变后重新生成 GRID/等高线；程序会自动释放旧派生图层。",
     ):
         m.number(step)
-    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.23 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
+    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。v0.24 单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
     m.h2("8.7 往返验证")
     for step in (
         "保存当前网格。",
@@ -1649,16 +1702,16 @@ def build_gui_manual():
         "由 CDT 生成 GRID 和等高线，确认孔洞/域外没有有效 GRID 节点或跨越等高线。",
         "生成一条跨越地形的 A—B 剖面，核对曲线、统计并导出 CSV；若有孔洞，再验证断点不被其他图层补齐。",
         "圈定一块多边形，分别用两个基准高程重算并导出 CSV；若跨孔洞，再核对有效覆盖率小于 100%。",
-        "打开或按高程偏移创建设计 GRID，运行双表面挖填方；核对红挖蓝填、覆盖率和 CSV，再按 Esc 验证取消。",
+        "打开或按高程偏移创建设计 GRID；若节点错位先执行双线性/最近邻显式对齐，再运行双表面挖填方；核对红挖蓝填、覆盖率和 CSV，并按 Esc 验证取消时旧设计仍保留。",
         "分别在 TIN/CDT 和 GRID 坡面执行单点坡度/坡向分析，核对支撑单元、下坡箭头、八方位与法向；按 Esc 清除。",
         "设置 z-factor、光照角、线程 0 和块高 0，依次生成全幅坡度、坡向和阴影专题图，检查进度与完成状态中的并行配置；再按 Esc 验证取消，导出 DGRID/专题 GeoTIFF，最后恢复高程显示。",
         "切换 3D，验证环视、滚轮缩放、WASD 漫游和垂直夸张，再返回 2D。",
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → 打开/偏移创建设计 GRID → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID→等高线 → 打开错位设计 GRID → 双线性显式对齐 → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付 2D/3D 浏览、匹配现状/设计 GRID 的解析挖填方与差值图、可取消并行地形专题，以及 TIN/CDT/GRID 局部坡面、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是 GRID 映射文件与流式瓦片输出、局部 CDT 更新、错位或异 CRS 表面的显式重采样、区域掩膜、误差控制、可配置图层样式、GPU 分块 LOD 与贴地碰撞。")
+    m.para("当前已交付 2D/3D 浏览、同 CRS 错位 GRID 显式重采样、匹配现状/设计 GRID 的解析挖填方与差值图、可取消并行地形专题，以及 TIN/CDT/GRID 局部坡面、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是坐标系显式重投影、GRID 映射文件与流式瓦片输出、局部 CDT 更新、区域掩膜、误差控制、可配置图层样式、GPU 分块 LOD 与贴地碰撞。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.23.0
+    VERSION 0.24.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -176,6 +176,16 @@ if(DT_BUILD_TESTS)
     else()
         target_compile_options(dterrain_earthwork_tests PRIVATE -UNDEBUG)
     endif()
+
+    add_executable(dterrain_resample_tests tests/test_resample.cpp)
+    target_compile_features(dterrain_resample_tests PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_resample_tests PRIVATE dterrain)
+    add_test(NAME dterrain_resample_tests COMMAND dterrain_resample_tests)
+    if(MSVC)
+        target_compile_options(dterrain_resample_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(dterrain_resample_tests PRIVATE -UNDEBUG)
+    endif()
 endif()
 
 if(DT_BUILD_EXAMPLES)
@@ -206,6 +216,10 @@ if(DT_BUILD_BENCHMARKS)
         benchmarks/earthwork_benchmark.cpp)
     target_compile_features(dterrain_earthwork_benchmark PRIVATE cxx_std_17)
     target_link_libraries(dterrain_earthwork_benchmark PRIVATE dterrain)
+    add_executable(dterrain_resample_benchmark
+        benchmarks/resample_benchmark.cpp)
+    target_compile_features(dterrain_resample_benchmark PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_resample_benchmark PRIVATE dterrain)
 endif()
 
 if(DT_BUILD_GUI AND WIN32)

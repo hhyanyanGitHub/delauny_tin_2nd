@@ -43,6 +43,9 @@ DT_API dt_status DT_CALL dt_grid_derive_terrain_async(
 DT_API dt_status DT_CALL dt_grid_compare_earthwork_async(
     dt_grid_handle existing_grid, dt_grid_handle design_grid,
     const dt_grid_earthwork_options* options, dt_task_handle* output_task);
+DT_API dt_status DT_CALL dt_grid_resample_like_async(
+    dt_grid_handle source_grid, dt_grid_handle reference_grid,
+    const dt_grid_resample_options* options, dt_task_handle* output_task);
 DT_API dt_status DT_CALL dt_tin_from_grid_async(
     dt_grid_handle grid, const dt_grid_to_tin_options* options,
     dt_handle output_tin, dt_task_handle* output_task);

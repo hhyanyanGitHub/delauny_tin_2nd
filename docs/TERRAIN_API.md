@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.23 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.24 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -22,6 +22,46 @@ TIN、GRID 和等高线句柄都可保存可选 CRS WKT。使用 `dt_set_crs_wkt
 
 `dt_grid_read_window()`、`dt_grid_write_window()` 支持局部窗口；`row_stride`
 以 `double` 个数计，零表示紧密排列。GRID 句柄由 `dt_grid_destroy()` 释放。
+
+## GRID 显式重采样与节点对齐
+
+`dt_grid_resample_like()` 使用 `reference_grid` 定义输出行列数、六参数仿射和 CRS，
+从 `source_grid` 取得高程：
+
+```cpp
+dt_grid_resample_options options{};
+options.struct_size = sizeof(options);
+options.method = DT_GRID_RESAMPLE_BILINEAR; // 0 也表示双线性
+options.worker_count = 0;   // 自动，最多 32
+options.tile_row_count = 0; // 默认 64 行
+options.output_nodata_value = -9999.0;
+
+dt_grid_handle aligned = nullptr;
+dt_status status = dt_grid_resample_like(
+    source, reference, &options, &aligned);
+if (status == DT_OK) dt_grid_destroy(aligned);
+```
+
+对每个目标节点，库先用参考 GRID 变换计算世界 XY，再用源 GRID 变换的逆矩阵求连续
+列/行坐标。该过程支持缩放、平移、旋转、剪切和负像元高，不把 GRID 限制为北向上。
+源与参考 CRS WKT 必须完全一致；不一致返回 `DT_E_INVALID_ARGUMENT`，不会隐式调用
+坐标重投影。目标落在源节点包络外时写输出 NoData。
+
+| 方法/标志 | 行为 | 典型用途 |
+|---|---|---|
+| `DT_GRID_RESAMPLE_NEAREST` | 四舍五入到最近源节点 | 分类、编码或不允许平滑的数据 |
+| `DT_GRID_RESAMPLE_BILINEAR` | 2×2 支撑节点加权；默认方法 | 连续高程、设计面和专题值 |
+| `DT_GRID_RESAMPLE_RENORMALIZE_NODATA` | 忽略无效支撑并按有效权重重归一 | 明确接受 NoData 边缘外推时 |
+
+双线性默认四个支撑节点任一无效即输出 NoData。归一化标志只在有效权重和大于零时
+产生值；所有有效权重均为零仍写 NoData。输出总是带 NoData，零值
+`output_nodata_value` 选择 NaN。`worker_count=0` 自动、`1` 串行、显式最大 64；
+`tile_row_count=0` 表示 64 行，最大 1048576。
+
+异步入口 `dt_grid_resample_like_async()` 的结果类型为 `DT_TASK_RESULT_GRID`。任务持有
+源和参考 GRID 生命周期；用 `dt_task_get_info()` 查询进度、
+`dt_task_request_cancel()` 请求取消，成功后以 `dt_task_get_grid_result()` 取得调用方
+拥有的新句柄。失败或取消不发布半成品。
 
 ## TIN 与 GRID
 
@@ -58,8 +98,8 @@ if (status == DT_OK) {
 输入约束：
 
 - `width/height` 必须相同且至少为 2×2；
-- 六参数仿射变换按相对 `1e-12` 容差一致，CRS WKT 必须完全一致；库不在分析时
-  重采样或重投影；
+- 六参数仿射变换按相对 `1e-12` 容差一致，CRS WKT 必须完全一致；需要节点对齐时
+  先显式调用 `dt_grid_resample_like()`，CRS 不一致仍须在外部重投影；
 - `existing_z_factor/design_z_factor` 的零值均表示 1.0，非零值必须有限且大于零；
 - `worker_count=0` 自动、`1` 串行、显式最大 64；`tile_row_count=0` 表示 64 行；
 - 未知标志、过大块高、几何或 CRS 不兼容返回 `DT_E_INVALID_ARGUMENT`。

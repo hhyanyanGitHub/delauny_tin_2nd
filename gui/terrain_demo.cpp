@@ -103,6 +103,8 @@ enum CommandId {
     ID_TERRAIN_EXPORT_GEOTIFF,
     ID_EARTHWORK_LOAD_DESIGN,
     ID_EARTHWORK_LOAD_DESIGN_GDAL,
+    ID_EARTHWORK_RESAMPLE_BILINEAR,
+    ID_EARTHWORK_RESAMPLE_NEAREST,
     ID_EARTHWORK_OFFSET_DESIGN,
     ID_EARTHWORK_RUN,
     ID_EARTHWORK_EXPORT,
@@ -742,6 +744,10 @@ private:
                     MF_STRING | (gdal_gtiff_available_ ? MF_ENABLED : MF_GRAYED),
                     ID_EARTHWORK_LOAD_DESIGN_GDAL,
                     L"加载设计面 GeoTIFF/COG…");
+        AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_RESAMPLE_BILINEAR,
+                    L"双线性对齐设计面到现状 GRID");
+        AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_RESAMPLE_NEAREST,
+                    L"最近邻对齐设计面到现状 GRID");
         AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_OFFSET_DESIGN,
                     L"从现状 GRID 创建偏移设计面…");
         AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_RUN,
@@ -4160,10 +4166,9 @@ private:
             action_text_ = L"设计面加载失败：" + last_error_text();
             return;
         }
-        std::wstring reason;
-        if (!earthwork_grids_compatible(output, reason)) {
+        if (grid_crs_wkt(grid_) != grid_crs_wkt(output)) {
             dt_grid_destroy(output);
-            action_text_ = L"设计面与现状面不兼容：" + reason;
+            action_text_ = L"设计面与现状面不兼容：坐标参考系不一致；本程序不会隐式重投影";
             return;
         }
         clear_earthwork_output(true);
@@ -4173,9 +4178,133 @@ private:
         dt_grid_get_info(design_grid_, &info);
         std::wostringstream text;
         text << L"已加载设计面：" << info.width << L"×" << info.height
-             << L"，有效节点 " << info.valid_value_count
-             << L"；可执行双表面挖填方分析";
+             << L"，有效节点 " << info.valid_value_count;
+        std::wstring reason;
+        if (earthwork_grids_compatible(design_grid_, reason)) {
+            text << L"；已与现状面节点对齐，可直接计算挖填方";
+        } else {
+            text << L"；" << reason
+                 << L"，请显式选择双线性或最近邻对齐";
+        }
         action_text_ = text.str();
+    }
+
+    void resample_earthwork_design(uint32_t method) {
+        if (!grid_ || !design_grid_) {
+            action_text_ = L"设计面对齐失败：需要现状 GRID 和已加载设计面";
+            return;
+        }
+        if (grid_crs_wkt(grid_) != grid_crs_wkt(design_grid_)) {
+            action_text_ = L"设计面对齐失败：坐标参考系不一致，本程序不执行隐式重投影";
+            return;
+        }
+        std::wstring compatibility_reason;
+        if (earthwork_grids_compatible(design_grid_, compatibility_reason)) {
+            action_text_ = L"设计面已经与现状 GRID 节点对齐，无需重采样";
+            return;
+        }
+        dt_grid_resample_options options{};
+        options.struct_size = sizeof(options);
+        options.method = method;
+        options.worker_count = terrain_worker_count_;
+        options.tile_row_count = terrain_tile_rows_;
+        options.output_nodata_value = -9999.0;
+        dt_task_handle task = nullptr;
+        const dt_status start_status = dt_grid_resample_like_async(
+            design_grid_, grid_, &options, &task);
+        if (start_status != DT_OK) {
+            action_text_ = L"设计面对齐启动失败：" + last_error_text();
+            return;
+        }
+        clear_earthwork_output(false);
+        terrain_task_ = task;
+        terrain_task_running_ = true;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        int32_t completed = 0;
+        int quit_code = 0;
+        bool saw_quit = false;
+        dt_task_info task_info{};
+        while (!completed) {
+            if (dt_task_wait(task, 25, &completed) != DT_OK) {
+                dt_task_request_cancel(task);
+                break;
+            }
+            if (dt_task_get_info(task, &task_info) == DT_OK) {
+                const int percent = static_cast<int>(std::clamp(
+                    task_info.progress * 100.0, 0.0, 100.0));
+                std::wostringstream status;
+                status << L"正在"
+                       << (method == DT_GRID_RESAMPLE_NEAREST
+                               ? L"最近邻"
+                               : L"双线性")
+                       << L"对齐设计面：" << percent << L"%（Esc 可取消）";
+                if (task_info.cancellation_requested) status << L"，正在取消…";
+                action_text_ = status.str();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                UpdateWindow(hwnd_);
+            }
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) {
+                    saw_quit = true;
+                    quit_code = static_cast<int>(message.wParam);
+                    dt_task_request_cancel(task);
+                    continue;
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if (!completed) dt_task_wait(task, UINT32_MAX, &completed);
+        dt_task_get_info(task, &task_info);
+        dt_grid_handle aligned = nullptr;
+        dt_status result_status = task_info.result_status;
+        if (task_info.state == DT_TASK_SUCCEEDED)
+            result_status = dt_task_get_grid_result(task, &aligned);
+        std::wstring task_error;
+        if (task_info.state == DT_TASK_FAILED) {
+            char buffer[1024]{};
+            if (dt_task_get_error(task, buffer, sizeof(buffer), nullptr) == DT_OK)
+                task_error = utf8_to_wide(buffer);
+        }
+        terrain_task_running_ = false;
+        terrain_task_ = nullptr;
+        dt_task_destroy(task);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (task_info.state == DT_TASK_CANCELLED) {
+            action_text_ = L"设计面对齐已取消；原设计面保持不变";
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
+            return;
+        }
+        if (result_status != DT_OK || !aligned) {
+            dt_grid_destroy(aligned);
+            action_text_ = L"设计面对齐失败：" +
+                           (task_error.empty() ? last_error_text() : task_error);
+            if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            if (saw_quit) PostQuitMessage(quit_code);
+            return;
+        }
+        dt_grid_destroy(design_grid_);
+        design_grid_ = aligned;
+        dt_grid_info info{};
+        info.struct_size = sizeof(info);
+        dt_grid_get_info(design_grid_, &info);
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream text;
+        text << (method == DT_GRID_RESAMPLE_NEAREST ? L"最近邻" : L"双线性")
+             << L"设计面对齐完成：" << info.width << L"×" << info.height
+             << L"，有效节点 " << info.valid_value_count
+             << L"，耗时 " << std::fixed << std::setprecision(1) << ms
+             << L" ms；现在可计算双表面挖填方";
+        action_text_ = text.str();
+        update_layer_menu();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (close_after_terrain_task_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+        if (saw_quit) PostQuitMessage(quit_code);
     }
 
     void create_offset_design_grid() {
@@ -4242,7 +4371,8 @@ private:
         }
         std::wstring reason;
         if (!earthwork_grids_compatible(design_grid_, reason)) {
-            action_text_ = L"双表面分析失败：" + reason;
+            action_text_ = L"双表面分析失败：" + reason +
+                           L"；请先显式对齐设计面";
             return;
         }
         dt_grid_earthwork_options options{};
@@ -5034,6 +5164,12 @@ private:
             break;
         case ID_EARTHWORK_LOAD_DESIGN: load_earthwork_design(false); break;
         case ID_EARTHWORK_LOAD_DESIGN_GDAL: load_earthwork_design(true); break;
+        case ID_EARTHWORK_RESAMPLE_BILINEAR:
+            resample_earthwork_design(DT_GRID_RESAMPLE_BILINEAR);
+            break;
+        case ID_EARTHWORK_RESAMPLE_NEAREST:
+            resample_earthwork_design(DT_GRID_RESAMPLE_NEAREST);
+            break;
         case ID_EARTHWORK_OFFSET_DESIGN: create_offset_design_grid(); break;
         case ID_EARTHWORK_RUN: run_earthwork_analysis(); break;
         case ID_EARTHWORK_EXPORT: export_earthwork_csv(); break;

@@ -60,6 +60,9 @@ public:
     bool is_nodata(double value) const noexcept;
     dt_point3 point(uint64_t column, uint64_t row, double z) const noexcept;
     dt_surface_analysis analyze_surface_xy(const dt_point3& query) const;
+    double sample_height_xy(const dt_point3& query) const {
+        return analyze_surface_xy(query).point.z;
+    }
 
 private:
     friend std::unique_ptr<Grid> grid_derive_terrain(

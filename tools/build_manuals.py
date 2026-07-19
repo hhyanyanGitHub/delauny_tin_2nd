@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.70.0"
+VERSION = "0.85.0"
 TODAY = date(2026, 7, 19).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.70.0：新增 CDT 无交叉断裂线局部拓扑插入、可配置交叉自动节点化，以及带范围目录和校验的 DCDTB 二进制交换；v0.55 CRS 重投影、v0.40 Direct3D 三维显示及全部旧 DLL 接口保持兼容。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.85.0：新增 TIN/CDT 多环精确边界裁剪、双 GRID 2.5D 平移配准、配准后重采样和带 RMSE 标准误差停止条件的自适应误差评估；v0.70 CDT/DCDTB、v0.55 CRS 重投影及全部旧 DLL 接口保持兼容。", "gold")
 
 
 def build_developer_manual():
@@ -1059,6 +1059,28 @@ dt_task_destroy(task);""")
     m.callout("节点级边界", "本接口裁剪的是 GRID 节点值，不会沿多边形切开栅格单元；紧凑范围也按入选节点包络确定。若工程流程要求像元覆盖率或单元解析边界，应在后续矢量/栅格叠加模块中处理。", "gold")
     m.callout("本机基准", "4096×4096、8 顶点多边形保持范围掩膜：单线程 0.378 s，自动并行 0.0755 s，约 5.01×；串并行校验和误差为 0。收益受多边形复杂度、CPU、内存带宽和块高影响，不是固定承诺。", "gold")
 
+    m.h2("4.13A 精确三角面裁剪、曲面配准与自适应误差")
+    m.para("dt_tin_clip_polygon_exact() 与 dt_cdt_clip_polygon_exact() 接收一个外环和零个或多个孔洞。实现先用多边形包围盒查询 TIN/CDT 范围索引，再逐候选三角形求解析交集。结果保留 piece→ring→XYZ 层级；孔洞不会被三角扇填满，交点 Z 来自源三角面平面插值，exact_plan_area 是外环减孔洞后的面积和。")
+    m.code("""uint64_t offsets[] = {0, outer_count, outer_count + hole_count};
+dt_polygon_rings polygon{sizeof(dt_polygon_rings), 0,
+                         points, point_count, offsets, 2, {0, 0}};
+dt_surface_clip_result clipped = nullptr;
+dt_tin_clip_polygon_exact(tin, &polygon, &clipped);
+dt_surface_clip_result_view view{};
+dt_surface_clip_result_get_view(clipped, &view);
+dt_surface_clip_result_destroy(clipped);""")
+    m.para("dt_grid_register_surface() 使用共同的确定性 Halton 样本，由粗到细估计施加到移动面的 XY 平移；ESTIMATE_Z_OFFSET 为每个候选拟合常量 DZ。约定是 (x+dx,y+dy,z+dz)，因此参考位置从原移动面的 (x-dx,y-dy) 采样。dt_grid_apply_registration() 将结果双线性重采样到参考 GRID 的完整六参数仿射。")
+    m.code("""dt_surface_registration_options ro{};
+ro.struct_size = sizeof(ro);
+ro.flags = DT_SURFACE_REGISTRATION_ESTIMATE_Z_OFFSET;
+ro.sample_budget = 4096;
+dt_surface_registration_result rr{};
+dt_grid_register_surface(reference, moving, &ro, &rr);
+dt_grid_handle aligned = nullptr;
+dt_grid_apply_registration(moving, reference, &rr, &aligned);""")
+    m.para("dt_grid_compare_surface_adaptive() 累积误差极值、均值、MAE、RMSE、最大绝对误差和覆盖率，并由平方误差的二阶/四阶矩估计 RMSE 标准误差。达到 target_rmse_standard_error 后设置 DT_SURFACE_ERROR_CONVERGED 并提前停止，否则使用到 maximum_samples。")
+    m.callout("模型边界", "配准只估计 XYZ 平移，不估计旋转、尺度或非刚性形变，也不隐式重投影 CRS。强空间自相关下的 RMSE 标准误差不能替代项目控制点和行业统计规范。精确裁剪结果保留多边形环；若调用方需要 GPU 三角形，应使用支持孔洞的三角化器。", "gold")
+
     m.h2("4.14 GRID 窗口概览与 LOD 读取")
     m.para("dt_grid_read_overview() 从任意源窗口直接生成较小的概览矩阵，避免 GUI 或集成系统先读取整幅超大 GRID。输出数组由调用方分配，接口同步填充，不创建第二个 GRID 句柄；因此热路径只有小型输出和每输出行统计的临时开销。source_width/source_height 为 0 时表示从起点延伸到源 GRID 剩余范围。")
     m.code("""dt_grid_overview_options o{};
@@ -1647,7 +1669,7 @@ def build_gui_manual():
             ("地形转换", "TIN/GRID/等高线双向派生，CDT 域内转换，并自动生成等高线。"),
             ("数据交换", "交换 DGRID、DCONTOUR、DCDT；GDAL 构建支持常见栅格/线矢量、GeoTIFF/COG/GPKG 导出，以及 TIN/GRID/等高线 EPSG 重投影。"),
             ("约束编辑", "绘制或批量添加断裂线；移动/安全删除顶点，或删除整条约束。"),
-            ("分析", "生成全幅坡度/坡向/阴影专题图并导出；单击分析局部坡面；生成任意 A—B 剖面；逐点圈定多边形并估算面积/土方。"),
+            ("分析", "生成专题图、局部坡面与剖面；多边形量测/精确 TIN/CDT 裁剪；设计 GRID 平移配准、自适应误差及双表面土方。"),
             ("图层", "分别显示或隐藏 TIN、GRID、等高线和约束 Delaunay。"),
         ],
         [2600, 6760],
@@ -1851,6 +1873,17 @@ def build_gui_manual():
     )
     m.callout("边界与坐标", "边界节点按内部处理；多边形顺、逆时针均可。程序使用 GRID 完整六参数逆仿射，旋转、剪切和负像元高同样适用。裁剪只改变节点有效性，不沿多边形切开 GRID 单元。", "blue")
     m.callout("替换与恢复", "成功结果会原子替换当前 GRID，且 GUI 暂无撤销栈；请先保存重要原始数据，需要恢复时重新打开原 GRID。取消、非法多边形或无入选节点时旧图层保持不变。", "gold")
+
+    m.h2("6.5A 精确裁剪、设计面配准与误差评估")
+    for step in (
+        "完成量测多边形；固定源为 TIN 或 CDT 时选择‘精确裁剪量测范围（TIN / CDT）’，状态栏显示解析交集片段、环和精确投影面积，源图层不变。",
+        "准备当前 GRID 和设计 GRID。选择‘配准设计 GRID 到当前 GRID’，程序估计 ΔX/ΔY/ΔZ，并把设计面重采样到当前 GRID 的行列和完整仿射。",
+        "核对状态栏的配准前后 RMSE、有效样本和位移量；旋转、比例或非刚性差异不属于当前模型。",
+        "选择‘自适应评估双 GRID 误差’，查看 RMSE±标准误、平均/最大绝对误差、覆盖率及有效/尝试样本数。",
+        "达到 0.001 当前高程单位的 RMSE 标准误阈值时会提前停止；工程验收仍应使用规定控制点和统计流程。",
+    ):
+        m.number(step)
+    m.callout("数据关系", "配准操作替换设计 GRID，不改变当前高程 GRID；输出设计面已经与当前 GRID 节点对齐，可继续执行双表面土方。CRS 不一致会明确拒绝，需先使用显式重投影功能。", "blue")
 
     m.h2("6.6 现状/设计双 GRID 挖填方")
     for step in (

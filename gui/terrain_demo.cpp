@@ -106,6 +106,9 @@ enum CommandId {
     ID_GRID_MASK_MEASUREMENT,
     ID_GRID_CLIP_MEASUREMENT,
     ID_GRID_INVERT_MEASUREMENT,
+    ID_SURFACE_EXACT_CLIP,
+    ID_SURFACE_REGISTER_DESIGN,
+    ID_SURFACE_ADAPTIVE_ERROR,
     ID_SLOPE_MODE,
     ID_SLOPE_CLEAR,
     ID_TERRAIN_SLOPE_GRID,
@@ -887,6 +890,13 @@ private:
                     L"按量测多边形裁剪当前 GRID（紧凑适屏）");
         AppendMenuW(analysis_menu, MF_STRING, ID_GRID_INVERT_MEASUREMENT,
                     L"按量测多边形反向掩膜当前 GRID");
+        AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(analysis_menu, MF_STRING, ID_SURFACE_EXACT_CLIP,
+                    L"精确裁剪量测范围（TIN / CDT）");
+        AppendMenuW(analysis_menu, MF_STRING, ID_SURFACE_REGISTER_DESIGN,
+                    L"配准设计 GRID 到当前 GRID");
+        AppendMenuW(analysis_menu, MF_STRING, ID_SURFACE_ADAPTIVE_ERROR,
+                    L"自适应评估双 GRID 误差");
         AppendMenuW(analysis_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(analysis_menu, MF_STRING, ID_EARTHWORK_LOAD_DESIGN,
                     L"加载设计面 DGRID…");
@@ -5002,6 +5012,125 @@ private:
         if (saw_quit) PostQuitMessage(quit_code);
     }
 
+    void exact_clip_measurement_surface() {
+        if (!measurement_complete_ || measurement_polygon_.size() < 3) {
+            action_text_ = L"精确裁剪失败：请先完成一个面积/土方量测多边形";
+            return;
+        }
+        if (measurement_source_ != ProfileSource::Tin &&
+            measurement_source_ != ProfileSource::Cdt) {
+            action_text_ = L"精确裁剪当前支持 TIN/CDT；GRID 请使用掩膜或紧凑裁剪";
+            return;
+        }
+        const uint64_t offsets[] = {0, measurement_polygon_.size()};
+        dt_polygon_rings polygon{};
+        polygon.struct_size = sizeof(polygon);
+        polygon.points = measurement_polygon_.data();
+        polygon.point_count = measurement_polygon_.size();
+        polygon.ring_offsets = offsets;
+        polygon.ring_count = 1;
+        dt_surface_clip_result result = nullptr;
+        set_wait_cursor(true);
+        const dt_status status = measurement_source_ == ProfileSource::Cdt
+            ? dt_cdt_clip_polygon_exact(cdt_, &polygon, &result)
+            : dt_tin_clip_polygon_exact(mesh_, &polygon, &result);
+        set_wait_cursor(false);
+        if (status != DT_OK || !result) {
+            dt_surface_clip_result_destroy(result);
+            action_text_ = L"精确裁剪失败：" + last_error_text();
+            return;
+        }
+        dt_surface_clip_result_view view{};
+        const dt_status view_status =
+            dt_surface_clip_result_get_view(result, &view);
+        if (view_status != DT_OK) {
+            dt_surface_clip_result_destroy(result);
+            action_text_ = L"读取精确裁剪结果失败：" + last_error_text();
+            return;
+        }
+        std::wostringstream text;
+        text << L"精确裁剪（" << surface_source_name(measurement_source_)
+             << L"）：" << view.piece_count << L" 个片段，"
+             << view.ring_count << L" 个环，投影面积 " << std::fixed
+             << std::setprecision(3) << view.exact_plan_area
+             << L"；结果由 DLL 逐源三角形解析裁剪";
+        action_text_ = text.str();
+        dt_surface_clip_result_destroy(result);
+    }
+
+    void register_design_surface() {
+        if (!grid_ || !design_grid_) {
+            action_text_ = L"曲面配准失败：请先准备当前 GRID 和设计 GRID";
+            return;
+        }
+        dt_surface_registration_options options{};
+        options.struct_size = sizeof(options);
+        options.flags = DT_SURFACE_REGISTRATION_ESTIMATE_Z_OFFSET;
+        options.sample_budget = 4096;
+        options.minimum_valid_samples = 128;
+        dt_surface_registration_result registration{};
+        set_wait_cursor(true);
+        const dt_status status = dt_grid_register_surface(
+            grid_, design_grid_, &options, &registration);
+        if (status != DT_OK) {
+            set_wait_cursor(false);
+            action_text_ = L"曲面配准失败：" + last_error_text();
+            return;
+        }
+        dt_grid_handle aligned = nullptr;
+        const dt_status apply_status = dt_grid_apply_registration(
+            design_grid_, grid_, &registration, &aligned);
+        set_wait_cursor(false);
+        if (apply_status != DT_OK || !aligned) {
+            dt_grid_destroy(aligned);
+            action_text_ = L"应用曲面配准失败：" + last_error_text();
+            return;
+        }
+        clear_earthwork_output(false);
+        dt_grid_destroy(design_grid_);
+        design_grid_ = aligned;
+        std::wostringstream text;
+        text << L"设计面已配准并重采样：ΔX/ΔY/ΔZ=" << std::fixed
+             << std::setprecision(4) << registration.dx << L"/"
+             << registration.dy << L"/" << registration.dz
+             << L"，RMSE " << registration.rmse_before << L" → "
+             << registration.rmse_after << L"，有效样本 "
+             << registration.valid_sample_count;
+        action_text_ = text.str();
+    }
+
+    void evaluate_surface_error() {
+        if (!grid_ || !design_grid_) {
+            action_text_ = L"误差评估失败：请先准备当前 GRID 和设计 GRID";
+            return;
+        }
+        dt_surface_error_options options{};
+        options.struct_size = sizeof(options);
+        options.minimum_samples = 2048;
+        options.maximum_samples = 65536;
+        options.target_rmse_standard_error = 0.001;
+        dt_surface_error_result result{};
+        set_wait_cursor(true);
+        const dt_status status = dt_grid_compare_surface_adaptive(
+            grid_, design_grid_, &options, &result);
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"误差评估失败：" + last_error_text();
+            return;
+        }
+        std::wostringstream text;
+        text << L"双 GRID 自适应误差：RMSE " << std::fixed
+             << std::setprecision(4) << result.rmse << L" ± "
+             << result.rmse_standard_error << L"，平均/最大绝对误差 "
+             << result.mean_absolute_error << L"/"
+             << result.maximum_absolute_error << L"，有效/尝试样本 "
+             << result.valid_sample_count << L"/"
+             << result.attempted_sample_count;
+        if ((result.flags & DT_SURFACE_ERROR_CONVERGED) != 0)
+            text << L"（已达到停止阈值）";
+        action_text_ = text.str();
+    }
+
     void clear_earthwork_output(bool clear_design) {
         if (grid_theme_ == GridTheme::Difference) {
             dt_grid_destroy(terrain_grid_);
@@ -6334,6 +6463,9 @@ private:
         case ID_GRID_INVERT_MEASUREMENT:
             clip_grid_with_measurement(DT_GRID_CLIP_INVERT);
             break;
+        case ID_SURFACE_EXACT_CLIP: exact_clip_measurement_surface(); break;
+        case ID_SURFACE_REGISTER_DESIGN: register_design_surface(); break;
+        case ID_SURFACE_ADAPTIVE_ERROR: evaluate_surface_error(); break;
         case ID_EARTHWORK_LOAD_DESIGN: load_earthwork_design(false); break;
         case ID_EARTHWORK_LOAD_DESIGN_GDAL: load_earthwork_design(true); break;
         case ID_EARTHWORK_RESAMPLE_BILINEAR:

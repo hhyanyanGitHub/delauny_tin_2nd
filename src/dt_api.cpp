@@ -4,6 +4,7 @@
 #include "dt_gdal_api.h"
 #include "dt_task_api.h"
 #include "dt_terrain_core.hpp"
+#include "dt_surface_ops.hpp"
 #include "dt_view_cache.hpp"
 #if DT_WITH_GDAL
 #include "dt_gdal_io.hpp"
@@ -45,6 +46,10 @@ struct dt_grid_view_cache_t {
 
 struct dt_contour_set_t {
     std::shared_ptr<dt::ContourSet> contours;
+};
+
+struct dt_surface_clip_result_t {
+    dt::SurfaceClipData data;
 };
 
 struct dt_cdt_t {
@@ -780,6 +785,104 @@ dt_status DT_CALL dt_grid_clip_polygon(
         auto result = std::make_unique<dt_grid_t>();
         result->grid = dt::grid_clip_polygon(
             require_grid(source_grid), polygon, *options);
+        *output_grid = result.release();
+    });
+}
+
+dt_status DT_CALL dt_tin_clip_polygon_exact(
+    dt_handle tin, const dt_polygon_rings* polygon,
+    dt_surface_clip_result* output_result) {
+    if (output_result) *output_result = nullptr;
+    return guarded([&] {
+        if (!polygon || !output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "polygon or output_result is null");
+        }
+        auto data = dt::clip_tin_polygon_exact(require_context(tin), *polygon);
+        auto result = std::make_unique<dt_surface_clip_result_t>();
+        result->data = std::move(*data);
+        *output_result = result.release();
+    });
+}
+
+dt_status DT_CALL dt_surface_clip_result_get_view(
+    dt_surface_clip_result result, dt_surface_clip_result_view* output_view) {
+    if (output_view) *output_view = {};
+    return guarded([&] {
+        if (!result || !output_view) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "result or output_view is null");
+        }
+        dt_surface_clip_result_view view{};
+        view.struct_size = sizeof(view);
+        view.points = result->data.points.data();
+        view.point_count = result->data.points.size();
+        view.rings = result->data.rings.data();
+        view.ring_count = result->data.rings.size();
+        view.pieces = result->data.pieces.data();
+        view.piece_count = result->data.pieces.size();
+        view.source_triangle_count = result->data.source_triangle_count;
+        view.generation = result->data.generation;
+        view.exact_plan_area = result->data.exact_plan_area;
+        *output_view = view;
+    });
+}
+
+void DT_CALL dt_surface_clip_result_destroy(dt_surface_clip_result result) {
+    delete result;
+}
+
+dt_status DT_CALL dt_grid_register_surface(
+    dt_grid_handle reference_grid, dt_grid_handle moving_grid,
+    const dt_surface_registration_options* options,
+    dt_surface_registration_result* output_result) {
+    if (output_result) *output_result = {};
+    return guarded([&] {
+        validate_options(options, "dt_surface_registration_options");
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        *output_result = dt::register_grid_surfaces(
+            require_grid(reference_grid), require_grid(moving_grid), *options);
+    });
+}
+
+dt_status DT_CALL dt_grid_compare_surface_adaptive(
+    dt_grid_handle reference_grid, dt_grid_handle moving_grid,
+    const dt_surface_error_options* options,
+    dt_surface_error_result* output_result) {
+    if (output_result) *output_result = {};
+    return guarded([&] {
+        validate_options(options, "dt_surface_error_options");
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        *output_result = dt::compare_grid_surfaces_adaptive(
+            require_grid(reference_grid), require_grid(moving_grid), *options);
+    });
+}
+
+dt_status DT_CALL dt_grid_apply_registration(
+    dt_grid_handle moving_grid, dt_grid_handle reference_grid,
+    const dt_surface_registration_result* registration,
+    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        if (!registration || !output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "registration or output_grid is null");
+        }
+        if (registration->struct_size != 0 &&
+            registration->struct_size < sizeof(*registration)) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "registration struct_size is invalid");
+        }
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::apply_grid_registration(
+            require_grid(moving_grid), require_grid(reference_grid),
+            *registration);
         *output_grid = result.release();
     });
 }
@@ -2547,6 +2650,22 @@ dt_status DT_CALL dt_contours_from_cdt(
         auto result = std::make_unique<dt_contour_set_t>();
         result->contours = dt::contours_from_cdt(require_cdt(cdt), *options);
         *output_contours = result.release();
+    });
+}
+
+dt_status DT_CALL dt_cdt_clip_polygon_exact(
+    dt_cdt_handle cdt, const dt_polygon_rings* polygon,
+    dt_surface_clip_result* output_result) {
+    if (output_result) *output_result = nullptr;
+    return guarded([&] {
+        if (!polygon || !output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "polygon or output_result is null");
+        }
+        auto data = dt::clip_cdt_polygon_exact(require_cdt(cdt), *polygon);
+        auto result = std::make_unique<dt_surface_clip_result_t>();
+        result->data = std::move(*data);
+        *output_result = result.release();
     });
 }
 

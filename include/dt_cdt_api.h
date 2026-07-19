@@ -220,6 +220,9 @@ DT_API dt_status DT_CALL dt_grid_from_cdt(
 DT_API dt_status DT_CALL dt_contours_from_cdt(
     dt_cdt_handle cdt, const dt_contour_options* options,
     dt_contour_handle* output_contours);
+DT_API dt_status DT_CALL dt_cdt_clip_polygon_exact(
+    dt_cdt_handle cdt, const dt_polygon_rings* polygon,
+    dt_surface_clip_result* output_result);
 
 DT_API dt_status DT_CALL dt_cdt_validate(dt_cdt_handle cdt, int32_t verbose);
 DT_API dt_status DT_CALL dt_cdt_set_crs_wkt(

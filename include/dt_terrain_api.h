@@ -62,6 +62,18 @@ enum dt_grid_clip_flags {
     DT_GRID_CLIP_INVERT = 1u << 1
 };
 
+enum dt_surface_registration_flags {
+    /* Fits a constant vertical offset after every XY candidate shift. */
+    DT_SURFACE_REGISTRATION_ESTIMATE_Z_OFFSET = 1u << 0
+};
+
+enum dt_surface_error_flags {
+    DT_SURFACE_ERROR_APPLY_REGISTRATION = 1u << 0,
+    /* Output-only: the requested RMSE standard-error target stopped sampling
+       before maximum_samples was exhausted. */
+    DT_SURFACE_ERROR_CONVERGED = 1u << 16
+};
+
 enum dt_grid_overview_method {
     /* Zero also selects arithmetic mean. Aggregate methods require output
        dimensions no larger than the selected source window. */
@@ -235,6 +247,107 @@ typedef struct dt_grid_clip_options {
     uint64_t reserved[5];
 } dt_grid_clip_options;
 
+/* The first ring is the outer boundary; later rings are holes. ring_offsets
+   has ring_count+1 entries, starts at zero and ends at point_count. Rings are
+   implicitly closed and must not repeat their first point. Z is ignored. */
+typedef struct dt_polygon_rings {
+    uint32_t struct_size;
+    uint32_t reserved;
+    const dt_point3* points;
+    uint64_t point_count;
+    const uint64_t* ring_offsets;
+    uint64_t ring_count;
+    uint64_t reserved2[2];
+} dt_polygon_rings;
+
+typedef struct dt_surface_clip_piece {
+    uint64_t source_triangle_index;
+    uint64_t first_ring;
+    uint64_t ring_count;
+    uint64_t reserved;
+} dt_surface_clip_piece;
+
+typedef struct dt_surface_clip_ring {
+    uint64_t first_point;
+    uint64_t point_count;
+    uint32_t is_hole;
+    uint32_t reserved;
+} dt_surface_clip_ring;
+
+typedef struct dt_surface_clip_result_view {
+    uint32_t struct_size;
+    uint32_t reserved;
+    const dt_point3* points;
+    uint64_t point_count;
+    const dt_surface_clip_ring* rings;
+    uint64_t ring_count;
+    const dt_surface_clip_piece* pieces;
+    uint64_t piece_count;
+    uint64_t source_triangle_count;
+    uint64_t generation;
+    double exact_plan_area;
+} dt_surface_clip_result_view;
+
+typedef struct dt_surface_registration_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Search radius in world XY. Zero selects five reference pixel scales. */
+    double maximum_xy_shift;
+    /* Final XY step. Zero selects 1/32 of a reference pixel scale. */
+    double minimum_xy_step;
+    /* Deterministic Halton samples. Zero selects 4096. */
+    uint64_t sample_budget;
+    /* A candidate needs at least this many jointly valid samples. Zero is 64. */
+    uint64_t minimum_valid_samples;
+    uint64_t reserved[3];
+} dt_surface_registration_options;
+
+typedef struct dt_surface_registration_result {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Apply to moving coordinates/elevations: (x+dx,y+dy,z+dz). */
+    double dx;
+    double dy;
+    double dz;
+    double rmse_before;
+    double rmse_after;
+    double overlap_ratio;
+    uint64_t valid_sample_count;
+    uint64_t candidate_count;
+    uint64_t iteration_count;
+    uint64_t reserved[2];
+} dt_surface_registration_result;
+
+typedef struct dt_surface_error_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t minimum_samples;
+    uint64_t maximum_samples;
+    /* Stop when estimated RMSE standard error is at or below this value.
+       Zero disables early stopping. */
+    double target_rmse_standard_error;
+    double dx;
+    double dy;
+    double dz;
+    uint64_t reserved[3];
+} dt_surface_error_options;
+
+typedef struct dt_surface_error_result {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t attempted_sample_count;
+    uint64_t valid_sample_count;
+    double overlap_ratio;
+    double minimum_error;
+    double maximum_error;
+    double mean_error;
+    double mean_absolute_error;
+    double rmse;
+    double maximum_absolute_error;
+    double rmse_standard_error;
+    uint64_t reserved[2];
+} dt_surface_error_result;
+
 typedef struct dt_grid_overview_options {
     uint32_t struct_size;
     /* Zero selects DT_GRID_OVERVIEW_AVERAGE. */
@@ -352,6 +465,7 @@ typedef struct dt_contour_line_view {
 
 typedef struct dt_grid_t* dt_grid_handle;
 typedef struct dt_contour_set_t* dt_contour_handle;
+typedef struct dt_surface_clip_result_t* dt_surface_clip_result;
 
 DT_API dt_status DT_CALL dt_grid_create(
     const dt_grid_create_options* options, dt_grid_handle* output_grid);
@@ -442,6 +556,33 @@ DT_API dt_status DT_CALL dt_grid_resample_like(
 DT_API dt_status DT_CALL dt_grid_clip_polygon(
     dt_grid_handle source_grid, const dt_point3* polygon_points,
     uint64_t point_count, const dt_grid_clip_options* options,
+    dt_grid_handle* output_grid);
+
+/* Clips every finite TIN triangle against an outer ring and optional holes.
+   Output pieces retain polygon rings exactly; point Z is interpolated on the
+   source triangle plane. */
+DT_API dt_status DT_CALL dt_tin_clip_polygon_exact(
+    dt_handle tin, const dt_polygon_rings* polygon,
+    dt_surface_clip_result* output_result);
+DT_API dt_status DT_CALL dt_surface_clip_result_get_view(
+    dt_surface_clip_result result, dt_surface_clip_result_view* output_view);
+DT_API void DT_CALL dt_surface_clip_result_destroy(
+    dt_surface_clip_result result);
+
+/* Estimates the rigid 2.5D translation applied to moving_grid. No rotation,
+   scale or CRS reprojection is implicit. Both grids must share CRS metadata. */
+DT_API dt_status DT_CALL dt_grid_register_surface(
+    dt_grid_handle reference_grid, dt_grid_handle moving_grid,
+    const dt_surface_registration_options* options,
+    dt_surface_registration_result* output_result);
+DT_API dt_status DT_CALL dt_grid_compare_surface_adaptive(
+    dt_grid_handle reference_grid, dt_grid_handle moving_grid,
+    const dt_surface_error_options* options,
+    dt_surface_error_result* output_result);
+/* Resamples the translated moving surface onto reference_grid geometry. */
+DT_API dt_status DT_CALL dt_grid_apply_registration(
+    dt_grid_handle moving_grid, dt_grid_handle reference_grid,
+    const dt_surface_registration_result* registration,
     dt_grid_handle* output_grid);
 
 /* DGRID 1 is a portable UTF-8 text format intended for tests and exchange. */

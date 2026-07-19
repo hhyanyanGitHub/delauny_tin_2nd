@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.70.0
+    VERSION 0.85.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -36,6 +36,7 @@ add_library(dterrain SHARED
     src/dt_core.cpp
     src/dt_grid_storage.cpp
     src/dt_terrain_core.cpp
+    src/dt_surface_ops.cpp
     src/dt_tile_package.cpp
     src/dt_view_cache.cpp
     src/dt_legacy.cpp)
@@ -166,6 +167,16 @@ if(DT_BUILD_TESTS)
         target_compile_options(dterrain_cdt_v070_tests PRIVATE /UNDEBUG)
     else()
         target_compile_options(dterrain_cdt_v070_tests PRIVATE -UNDEBUG)
+    endif()
+
+    add_executable(dterrain_surface_ops_tests tests/test_surface_ops.cpp)
+    target_compile_features(dterrain_surface_ops_tests PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_surface_ops_tests PRIVATE dterrain)
+    add_test(NAME dterrain_surface_ops_tests COMMAND dterrain_surface_ops_tests)
+    if(MSVC)
+        target_compile_options(dterrain_surface_ops_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(dterrain_surface_ops_tests PRIVATE -UNDEBUG)
     endif()
 
     add_executable(dterrain_viewer3d_tests tests/test_viewer3d.cpp)

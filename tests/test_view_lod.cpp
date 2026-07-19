@@ -1,4 +1,4 @@
-#include "dt_terrain_api.h"
+#include "dt_task_api.h"
 
 #include <algorithm>
 #include <cassert>
@@ -128,13 +128,81 @@ void test_rotated_sheared_and_validation() {
     dt_grid_destroy(grid);
 }
 
+void test_unified_async_view_request() {
+    const double transform[6]{100.0, 2.0, 0.0, 200.0, 0.0, -3.0};
+    dt_grid_handle grid = create_grid(transform);
+    dt_grid_view_request_options options{};
+    options.struct_size = sizeof(options);
+    options.flags = DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE;
+    options.world_bounds = {104.2, 187.1, 111.8, 196.9};
+    options.output_width = 3;
+    options.output_height = 2;
+    options.overview_method = DT_GRID_OVERVIEW_AVERAGE;
+    options.tile_row_count = 1;
+
+    dt_task_handle task = nullptr;
+    require_ok(dt_grid_read_view_async(grid, &options, &task));
+    int32_t completed = 0;
+    require_ok(dt_task_wait(task, UINT32_MAX, &completed));
+    assert(completed == 1);
+    dt_task_info info{};
+    info.struct_size = sizeof(info);
+    require_ok(dt_task_get_info(task, &info));
+    assert(info.state == DT_TASK_SUCCEEDED);
+    assert(info.result_kind == DT_TASK_RESULT_GRID_VIEW);
+    assert(info.progress == 1.0);
+
+    dt_grid_view_result result{};
+    result.struct_size = sizeof(result);
+    require_ok(dt_task_get_grid_view_result(task, &result));
+    assert((result.flags & DT_GRID_VIEW_RESULT_PREFETCH_REQUESTED) != 0);
+    assert((result.flags & DT_GRID_VIEW_RESULT_SOURCE_VERIFIED) == 0);
+    assert(result.source_window.column == 2 && result.source_window.row == 1);
+    assert(result.source_window.width == 5 && result.source_window.height == 5);
+    assert(result.width == 3 && result.height == 2 && result.row_stride == 3);
+    assert(std::abs(result.values[0] - 17.0) < 1e-12);
+    assert(std::abs(result.values[5] - 45.5) < 1e-12);
+    assert((result.overview.flags &
+            DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS) != 0);
+    assert(result.verification.struct_size == sizeof(dt_grid_verify_result));
+    dt_grid_overview_view wrong_result{};
+    wrong_result.struct_size = sizeof(wrong_result);
+    assert(dt_task_get_grid_overview_result(task, &wrong_result) ==
+           DT_E_NOT_FOUND);
+    dt_task_destroy(task);
+
+    options.flags = 1u << 31;
+    task = reinterpret_cast<dt_task_handle>(1);
+    assert(dt_grid_read_view_async(grid, &options, &task) ==
+           DT_E_INVALID_ARGUMENT);
+    assert(task == nullptr);
+
+    options.flags = 0;
+    options.world_bounds = {0.0, 0.0, 1.0, 1.0};
+    require_ok(dt_grid_read_view_async(grid, &options, &task));
+    completed = 0;
+    require_ok(dt_task_wait(task, UINT32_MAX, &completed));
+    info = {};
+    info.struct_size = sizeof(info);
+    require_ok(dt_task_get_info(task, &info));
+    assert(info.state == DT_TASK_FAILED);
+    assert(info.result_status == DT_E_NOT_FOUND);
+    result = {};
+    result.struct_size = sizeof(result);
+    assert(dt_task_get_grid_view_result(task, &result) == DT_E_NOT_FOUND);
+    dt_task_destroy(task);
+    dt_grid_destroy(grid);
+}
+
 } // namespace
 
 int main() {
     static_assert(sizeof(dt_grid_view_options) == 64);
     static_assert(sizeof(dt_grid_window) == 64);
+    static_assert(sizeof(dt_grid_view_request_options) == 96);
     test_identity_and_overview_composition();
     test_rotated_sheared_and_validation();
+    test_unified_async_view_request();
     std::cout << "All GRID view LOD tests passed.\n";
     return 0;
 }

@@ -119,6 +119,39 @@ int main() {
            DT_E_INVALID_ARGUMENT);
     dt_task_destroy(task);
 
+    dt_grid_view_request_options view_request{};
+    view_request.struct_size = sizeof(view_request);
+    view_request.flags = DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE |
+                         DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS |
+                         DT_GRID_VIEW_REQUEST_USE_PYRAMID;
+    view_request.world_bounds = {100.0, -2050.0, 900.0, -2000.0};
+    view_request.output_width = 64;
+    view_request.output_height = 16;
+    view_request.overview_method = DT_GRID_OVERVIEW_AVERAGE;
+    view_request.tile_row_count = 1;
+    task = nullptr;
+    assert(dt_grid_read_view_async(mapped, &view_request, &task) == DT_OK);
+    wait_finished(task, info);
+    assert(info.state == DT_TASK_SUCCEEDED);
+    assert(info.result_kind == DT_TASK_RESULT_GRID_VIEW);
+    assert(info.progress == 1.0);
+    dt_grid_view_result view_result{};
+    view_result.struct_size = sizeof(view_result);
+    assert(dt_task_get_grid_view_result(task, &view_result) == DT_OK);
+    assert((view_result.flags & DT_GRID_VIEW_RESULT_PREFETCH_REQUESTED) != 0);
+    assert((view_result.flags & DT_GRID_VIEW_RESULT_SOURCE_VERIFIED) != 0);
+    assert(view_result.width == 64 && view_result.height == 16);
+    assert(view_result.values != nullptr);
+    assert(view_result.source_window.column == 100);
+    assert(view_result.source_window.row == 2000);
+    assert(view_result.source_window.width == 801);
+    assert(view_result.source_window.height == 51);
+    assert(view_result.verification.block_count >= 1);
+    assert((view_result.overview.flags & DT_GRID_OVERVIEW_USED_PYRAMID) != 0);
+    assert(dt_task_get_grid_view_result(task, nullptr) ==
+           DT_E_INVALID_ARGUMENT);
+    dt_task_destroy(task);
+
     dt_grid_handle retained = nullptr;
     assert(dt_grid_load_binary(file.string().c_str(), &retained) == DT_OK);
     task = nullptr;
@@ -192,6 +225,19 @@ int main() {
     dt_grid_overview_view missing{};
     missing.struct_size = sizeof(missing);
     assert(dt_task_get_grid_overview_result(task, &missing) == DT_E_NOT_FOUND);
+    dt_task_destroy(task);
+
+    view_request.world_bounds = {100.0, -3132.0, 900.0, -3100.0};
+    view_request.output_width = 64;
+    view_request.output_height = 16;
+    task = nullptr;
+    assert(dt_grid_read_view_async(damaged, &view_request, &task) == DT_OK);
+    wait_finished(task, info);
+    assert(info.state == DT_TASK_FAILED);
+    assert(info.result_status == DT_E_CORRUPTED_DATA);
+    view_result = {};
+    view_result.struct_size = sizeof(view_result);
+    assert(dt_task_get_grid_view_result(task, &view_result) == DT_E_NOT_FOUND);
     dt_task_destroy(task);
     dt_grid_destroy(damaged);
 

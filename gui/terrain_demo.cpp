@@ -2592,12 +2592,16 @@ private:
                 if (info.state == DT_TASK_SUCCEEDED &&
                     request.source == (terrain_grid_ ? terrain_grid_ : grid_) &&
                     request.theme == grid_theme_) {
-                    dt_grid_overview_view view{};
+                    dt_grid_view_result view{};
                     view.struct_size = sizeof(view);
-                    if (dt_task_get_grid_overview_result(request.task, &view) ==
+                    if (dt_task_get_grid_view_result(request.task, &view) ==
                             DT_OK &&
                         view.width == request.output_width &&
-                        view.height == request.output_height) {
+                        view.height == request.output_height &&
+                        view.source_window.column == request.window.column &&
+                        view.source_window.row == request.window.row &&
+                        view.source_window.width == request.window.width &&
+                        view.source_window.height == request.window.height) {
                         grid_preview_.resize(static_cast<size_t>(
                             view.width * view.height));
                         for (uint64_t row = 0; row < view.height; ++row) {
@@ -2624,7 +2628,7 @@ private:
                         grid_preview_source_ = request.source;
                         grid_preview_view_valid_ = true;
                         grid_preview_used_pyramid_ =
-                            (view.result.flags &
+                            (view.overview.flags &
                              DT_GRID_OVERVIEW_USED_PYRAMID) != 0;
                         grid_preview_theme_ = request.theme;
                         failed_grid_preview_request_ = {};
@@ -2834,30 +2838,28 @@ private:
             return true;
         }
 
-        dt_grid_overview_options overview{};
-        overview.struct_size = sizeof(overview);
-        overview.method = grid_theme_ == GridTheme::Aspect
+        dt_grid_view_request_options request{};
+        request.struct_size = sizeof(request);
+        request.world_bounds = view_;
+        request.output_width = output_width;
+        request.output_height = output_height;
+        request.padding_nodes = 2;
+        request.overview_method = grid_theme_ == GridTheme::Aspect
             ? DT_GRID_OVERVIEW_NEAREST
             : DT_GRID_OVERVIEW_AVERAGE;
-        overview.worker_count = terrain_worker_count_;
-        overview.tile_row_count = terrain_tile_rows_;
-        overview.source_column = window.column;
-        overview.source_row = window.row;
-        overview.source_width = window.width;
-        overview.source_height = window.height;
-        if (overview.method == DT_GRID_OVERVIEW_AVERAGE &&
+        request.worker_count = terrain_worker_count_;
+        request.tile_row_count = terrain_tile_rows_;
+        if (request.overview_method == DT_GRID_OVERVIEW_AVERAGE &&
             (source_info.flags & DT_GRID_HAS_PYRAMID) != 0) {
-            overview.flags |= DT_GRID_OVERVIEW_USE_PYRAMID;
+            request.flags |= DT_GRID_VIEW_REQUEST_USE_PYRAMID;
         } else {
-            dt_grid_prefetch_window(source_grid, window.column, window.row,
-                                    window.width, window.height);
+            request.flags |= DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE;
         }
         if ((source_info.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0) {
-            overview.flags |= DT_GRID_OVERVIEW_VERIFY_SOURCE_BLOCKS;
+            request.flags |= DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS;
         }
         dt_task_handle task = nullptr;
-        if (dt_grid_read_overview_async(source_grid, &overview, output_width,
-                                        output_height, &task) != DT_OK) {
+        if (dt_grid_read_view_async(source_grid, &request, &task) != DT_OK) {
             return false;
         }
         grid_preview_request_.task = task;

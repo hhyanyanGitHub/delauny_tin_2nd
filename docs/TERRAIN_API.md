@@ -1,6 +1,6 @@
 # GRID、等高线与转换 API
 
-本文说明 dterrain 0.32 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
+本文说明 dterrain 0.33 的 `dt_terrain_api.h` 和 `dt_task_api.h`。原
 `dt_api.h`、旧 12 接口和 `.dtin/.dtmesh` 语义保持兼容。
 
 ## GRID 坐标模型
@@ -202,6 +202,41 @@ dt_task_destroy(task);
 `DT_TASK_RESULT_GRID_OVERVIEW`。精确和金字塔路径均按输出行报告进度和检查取消，超大
 精确分箱还在源行内部检查；取消状态不发布部分数组。GUI 连续视口请求可取消旧任务并
 立即提交新任务，旧任务完成后只需销毁而不提取结果。
+
+v0.33 为交互显示新增统一世界视口任务，避免调用方手工串联窗口映射、预取、校验和 LOD：
+
+```cpp
+dt_grid_view_request_options request{};
+request.struct_size = sizeof(request);
+request.flags = DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE |
+                DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS |
+                DT_GRID_VIEW_REQUEST_USE_PYRAMID;
+request.world_bounds = {xmin, ymin, xmax, ymax};
+request.output_width = 512;
+request.output_height = 384;
+request.padding_nodes = 2;
+request.overview_method = DT_GRID_OVERVIEW_AVERAGE;
+
+dt_task_handle task = nullptr;
+dt_grid_read_view_async(grid, &request, &task);
+int32_t completed = 0;
+dt_task_wait(task, UINT32_MAX, &completed);
+
+dt_grid_view_result result{};
+result.struct_size = sizeof(result);
+if (dt_task_get_grid_view_result(task, &result) == DT_OK) {
+    // result.source_window：实际源节点窗口
+    // result.values：result.width × result.height，只读借用像素
+    // result.overview / result.verification：LOD 统计与块校验摘要
+}
+dt_task_destroy(task);
+```
+
+请求选项为固定 96 字节。平均、最小和最大概览的输出尺寸仍不得超过实际源窗口；最近邻
+允许上采样。预取是最佳努力提示；请求块校验但句柄没有 `DT_GRID_HAS_BLOCK_CHECKSUMS`
+时，任务以 `DT_E_UNSUPPORTED` 失败。校验阶段映射到进度 0～0.3，LOD 映射到 0.3～1；
+未请求校验时 LOD 使用全部进度范围。任务持有源 GRID，失败或取消不发布结果；成功结果
+类型为 `DT_TASK_RESULT_GRID_VIEW`，其中所有指针在 `dt_task_destroy()` 后失效。
 
 ## 世界视口到 GRID 行列窗口
 

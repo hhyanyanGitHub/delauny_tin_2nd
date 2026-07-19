@@ -72,6 +72,9 @@ struct dt_task_t {
     bool overview_result_ready = false;
     dt_grid_verify_result verification_result{};
     bool verification_result_ready = false;
+    dt_grid_window view_window{};
+    uint32_t view_result_flags = 0;
+    bool view_result_ready = false;
 };
 
 namespace {
@@ -1110,6 +1113,129 @@ dt_status DT_CALL dt_grid_verify_window_async(
     });
 }
 
+dt_status DT_CALL dt_grid_read_view_async(
+    dt_grid_handle grid, const dt_grid_view_request_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_view_request_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        constexpr uint32_t kKnownFlags =
+            DT_GRID_VIEW_REQUEST_STRICT_NODATA |
+            DT_GRID_VIEW_REQUEST_USE_PYRAMID |
+            DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE |
+            DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS;
+        if ((options->flags & ~kKnownFlags) != 0) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "unknown GRID view request flags");
+        }
+        const auto source = require_grid_shared(grid);
+        const auto copied_options = *options;
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID_VIEW,
+            [source, copied_options](dt_task_t& task) {
+                constexpr uint64_t kMaximumOverviewDimension =
+                    1024ULL * 1024ULL;
+                constexpr uint64_t kMaximumOverviewValues = 1000000000ULL;
+                if (copied_options.output_width == 0 ||
+                    copied_options.output_height == 0) {
+                    throw dt::Exception(
+                        DT_E_INVALID_ARGUMENT,
+                        "GRID view output dimensions must be positive");
+                }
+                if (copied_options.output_width > kMaximumOverviewDimension ||
+                    copied_options.output_height > kMaximumOverviewDimension ||
+                    copied_options.output_width >
+                        kMaximumOverviewValues / copied_options.output_height) {
+                    throw dt::Exception(
+                        DT_E_LIMIT_EXCEEDED,
+                        "GRID view output size is invalid or too large");
+                }
+
+                dt_grid_view_options view{};
+                view.struct_size = sizeof(view);
+                view.world_bounds = copied_options.world_bounds;
+                view.padding_nodes = copied_options.padding_nodes;
+                task.progress.store(0.0);
+                task.view_window = source->view_window(view);
+                const auto cancelled = [&] {
+                    return task.cancellation_requested.load();
+                };
+                if (cancelled()) {
+                    throw dt::Exception(DT_E_CANCELLED,
+                                        "terrain operation was cancelled");
+                }
+
+                if ((copied_options.flags &
+                     DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE) != 0) {
+                    source->prefetch_window(
+                        task.view_window.column, task.view_window.row,
+                        task.view_window.width, task.view_window.height);
+                    task.view_result_flags |=
+                        DT_GRID_VIEW_RESULT_PREFETCH_REQUESTED;
+                }
+
+                const bool verify =
+                    (copied_options.flags &
+                     DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS) != 0;
+                const double overview_progress_begin = verify ? 0.3 : 0.0;
+                if (verify) {
+                    task.verification_result = source->verify_window(
+                        task.view_window.column, task.view_window.row,
+                        task.view_window.width, task.view_window.height,
+                        [&](double value) {
+                            task.progress.store(value *
+                                                overview_progress_begin);
+                        },
+                        cancelled);
+                    task.view_result_flags |=
+                        DT_GRID_VIEW_RESULT_SOURCE_VERIFIED;
+                } else {
+                    task.verification_result = {};
+                    task.verification_result.struct_size =
+                        sizeof(task.verification_result);
+                }
+
+                dt_grid_overview_options overview{};
+                overview.struct_size = sizeof(overview);
+                overview.method = copied_options.overview_method;
+                overview.worker_count = copied_options.worker_count;
+                overview.tile_row_count = copied_options.tile_row_count;
+                overview.source_column = task.view_window.column;
+                overview.source_row = task.view_window.row;
+                overview.source_width = task.view_window.width;
+                overview.source_height = task.view_window.height;
+                if ((copied_options.flags &
+                     DT_GRID_VIEW_REQUEST_STRICT_NODATA) != 0) {
+                    overview.flags |= DT_GRID_OVERVIEW_STRICT_NODATA;
+                }
+                if ((copied_options.flags &
+                     DT_GRID_VIEW_REQUEST_USE_PYRAMID) != 0) {
+                    overview.flags |= DT_GRID_OVERVIEW_USE_PYRAMID;
+                }
+
+                task.overview_width = copied_options.output_width;
+                task.overview_height = copied_options.output_height;
+                task.overview_values.resize(static_cast<size_t>(
+                    copied_options.output_width *
+                    copied_options.output_height));
+                task.overview_result = source->read_overview(
+                    overview, copied_options.output_width,
+                    copied_options.output_height,
+                    task.overview_values.data(), copied_options.output_width,
+                    [&](double value) {
+                        task.progress.store(
+                            overview_progress_begin +
+                            (1.0 - overview_progress_begin) * value);
+                    },
+                    cancelled);
+                task.view_result_ready = true;
+            });
+    });
+}
+
 dt_status DT_CALL dt_task_get_info(dt_task_handle task,
                                    dt_task_info* output_info) {
     return guarded([&] {
@@ -1266,6 +1392,36 @@ dt_status DT_CALL dt_task_get_grid_verification_result(
                 "task has no completed GRID verification result");
         }
         *output_result = required.verification_result;
+    });
+}
+
+dt_status DT_CALL dt_task_get_grid_view_result(
+    dt_task_handle task, dt_grid_view_result* output_result) {
+    if (output_result) *output_result = {};
+    return guarded([&] {
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        if (required.state != DT_TASK_SUCCEEDED ||
+            !required.view_result_ready) {
+            throw dt::Exception(
+                DT_E_NOT_FOUND,
+                "task has no completed GRID view result");
+        }
+        dt_grid_view_result result{};
+        result.struct_size = sizeof(result);
+        result.flags = required.view_result_flags;
+        result.source_window = required.view_window;
+        result.width = required.overview_width;
+        result.height = required.overview_height;
+        result.row_stride = required.overview_width;
+        result.values = required.overview_values.data();
+        result.overview = required.overview_result;
+        result.verification = required.verification_result;
+        *output_result = result;
     });
 }
 

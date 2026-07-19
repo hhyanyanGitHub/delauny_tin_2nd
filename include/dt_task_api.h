@@ -21,7 +21,24 @@ enum dt_task_result_kind {
     DT_TASK_RESULT_CONTOURS = 2,
     DT_TASK_RESULT_EARTHWORK = 3,
     DT_TASK_RESULT_GRID_OVERVIEW = 4,
-    DT_TASK_RESULT_GRID_VERIFICATION = 5
+    DT_TASK_RESULT_GRID_VERIFICATION = 5,
+    DT_TASK_RESULT_GRID_VIEW = 6
+};
+
+enum dt_grid_view_request_flags {
+    /* Aggregate bins become NoData if any contributing source node is NoData. */
+    DT_GRID_VIEW_REQUEST_STRICT_NODATA = 1u << 0,
+    /* Allows average display requests to use persisted DGRIDB pyramid levels. */
+    DT_GRID_VIEW_REQUEST_USE_PYRAMID = 1u << 1,
+    /* Issues a best-effort operating-system prefetch before reading. */
+    DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE = 1u << 2,
+    /* Verifies and caches intersecting DGRIDB raw-value blocks first. */
+    DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS = 1u << 3
+};
+
+enum dt_grid_view_result_flags {
+    DT_GRID_VIEW_RESULT_PREFETCH_REQUESTED = 1u << 0,
+    DT_GRID_VIEW_RESULT_SOURCE_VERIFIED = 1u << 1
 };
 
 typedef struct dt_task_info {
@@ -48,6 +65,39 @@ typedef struct dt_grid_overview_view {
     dt_grid_overview_result result;
     uint64_t reserved[2];
 } dt_grid_overview_view;
+
+/* One cancellable world-viewport request. The worker maps world_bounds to a
+   source window, optionally prefetches and verifies it, then produces an LOD
+   image. output dimensions must be positive and no larger than the selected
+   source window for aggregate methods. */
+typedef struct dt_grid_view_request_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    dt_bounds2 world_bounds;
+    uint64_t output_width;
+    uint64_t output_height;
+    uint32_t padding_nodes;
+    int32_t overview_method;
+    uint32_t worker_count;
+    uint32_t tile_row_count;
+    uint64_t reserved[3];
+} dt_grid_view_request_options;
+
+/* Borrowed completed viewport result. values remain valid until
+   dt_task_destroy(task). verification is populated only when
+   DT_GRID_VIEW_RESULT_SOURCE_VERIFIED is present. */
+typedef struct dt_grid_view_result {
+    uint32_t struct_size;
+    uint32_t flags;
+    dt_grid_window source_window;
+    uint64_t width;
+    uint64_t height;
+    uint64_t row_stride;
+    const double* values;
+    dt_grid_overview_result overview;
+    dt_grid_verify_result verification;
+    uint64_t reserved[3];
+} dt_grid_view_result;
 
 DT_API dt_status DT_CALL dt_grid_from_tin_async(
     dt_handle tin, const dt_tin_to_grid_options* options,
@@ -85,6 +135,11 @@ DT_API dt_status DT_CALL dt_grid_read_overview_async(
 DT_API dt_status DT_CALL dt_grid_verify_window_async(
     dt_grid_handle grid, uint64_t column, uint64_t row,
     uint64_t width, uint64_t height, dt_task_handle* output_task);
+/* Combines world-window mapping, prefetch, optional integrity verification,
+   and LOD generation in one cancellable worker task. */
+DT_API dt_status DT_CALL dt_grid_read_view_async(
+    dt_grid_handle grid, const dt_grid_view_request_options* options,
+    dt_task_handle* output_task);
 
 DT_API dt_status DT_CALL dt_task_get_info(
     dt_task_handle task, dt_task_info* output_info);
@@ -107,6 +162,8 @@ DT_API dt_status DT_CALL dt_task_get_grid_overview_result(
     dt_task_handle task, dt_grid_overview_view* output_view);
 DT_API dt_status DT_CALL dt_task_get_grid_verification_result(
     dt_task_handle task, dt_grid_verify_result* output_result);
+DT_API dt_status DT_CALL dt_task_get_grid_view_result(
+    dt_task_handle task, dt_grid_view_result* output_result);
 DT_API dt_status DT_CALL dt_task_get_error(
     dt_task_handle task, char* buffer, size_t buffer_size,
     size_t* required_size);

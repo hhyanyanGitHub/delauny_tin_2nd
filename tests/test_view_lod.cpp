@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -9,7 +10,15 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -564,6 +573,21 @@ void test_persistent_tile_package_corruption_and_capacity() {
     assert(recovered_info.state == DT_TASK_SUCCEEDED);
     assert(recovered.size() == 16 * 16);
     assert((view.flags & DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) == 0);
+    statistics = {};
+    statistics.struct_size = sizeof(statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(cache, &statistics));
+    assert(statistics.stored_record_count == 2);
+    assert(statistics.indexed_tile_count == 1);
+    assert(statistics.reclaimable_bytes != 0);
+    dt_grid_view_cache_compact_result compact{};
+    compact.struct_size = sizeof(compact);
+    require_ok(dt_grid_view_cache_compact(cache, &compact));
+    assert(compact.input_record_count == 2);
+    assert(compact.output_record_count == 1);
+    assert(compact.retained_tile_count == 1);
+    assert(compact.dropped_duplicate_record_count == 1);
+    assert(compact.reclaimed_bytes != 0);
+    assert((compact.flags & DT_GRID_VIEW_COMPACT_SHRANK) != 0);
     dt_grid_view_cache_destroy(cache);
     {
         std::fstream stream(path, std::ios::binary | std::ios::in |
@@ -595,6 +619,9 @@ void test_persistent_tile_package_corruption_and_capacity() {
     require_ok(dt_grid_view_cache_get_disk_statistics(cache, &statistics));
     assert((statistics.flags &
             DT_GRID_VIEW_DISK_CACHE_READ_ONLY_ACTIVE) != 0);
+    compact = {};
+    compact.struct_size = sizeof(compact);
+    assert(dt_grid_view_cache_compact(cache, &compact) == DT_E_UNSUPPORTED);
     dt_grid_view_cache_destroy(cache);
     dt_grid_destroy(grid);
     std::filesystem::remove(path, ignored);
@@ -604,9 +631,173 @@ void test_persistent_tile_package_corruption_and_capacity() {
     assert(cache == nullptr);
 }
 
+void test_persistent_tile_package_compaction_drops_corrupt_latest_tile() {
+    const auto path = temporary_tile_package("compact-corrupt");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    dt_grid_handle grid = create_identity_grid(32, 16);
+    dt_grid_view_cache_options memory{};
+    memory.struct_size = sizeof(memory);
+    memory.tile_width = 16;
+    memory.tile_height = 16;
+    memory.worker_count = 1;
+    memory.maximum_bytes = 1024ULL * 1024ULL;
+    memory.maximum_tiles = 16;
+    const std::string utf8_path = path.u8string();
+    dt_grid_view_disk_cache_options disk{};
+    disk.struct_size = sizeof(disk);
+    disk.utf8_file_name = utf8_path.c_str();
+    disk.maximum_file_bytes = 1024ULL * 1024ULL;
+    dt_grid_view_cache_handle cache = nullptr;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    dt_grid_view_request_options request{};
+    request.struct_size = sizeof(request);
+    request.world_bounds = {0.0, 0.0, 31.0, 15.0};
+    request.output_width = 32;
+    request.output_height = 16;
+    request.overview_method = DT_GRID_OVERVIEW_NEAREST;
+    dt_grid_view_result view{};
+    read_cached_view(cache, request, view);
+    dt_grid_view_cache_destroy(cache);
+
+    {
+        std::fstream stream(path, std::ios::binary | std::ios::in |
+                                  std::ios::out);
+        assert(stream);
+        const std::streamoff second_payload = 4096 + 128 + 16 * 16 * 8 + 128;
+        stream.seekg(second_payload);
+        char byte = 0;
+        stream.read(&byte, 1);
+        byte ^= static_cast<char>(0x3d);
+        stream.seekp(second_payload);
+        stream.write(&byte, 1);
+    }
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    dt_grid_view_cache_compact_result compact{};
+    compact.struct_size = sizeof(compact);
+    require_ok(dt_grid_view_cache_compact(cache, &compact));
+    assert(compact.input_record_count == 2);
+    assert(compact.output_record_count == 1);
+    assert(compact.dropped_corrupt_tile_count == 1);
+    assert((compact.flags & DT_GRID_VIEW_COMPACT_DROPPED_CORRUPTION) != 0);
+    const auto values = read_cached_view(cache, request, view);
+    assert(values.size() == 32 * 16);
+    dt_grid_view_disk_cache_statistics statistics{};
+    statistics.struct_size = sizeof(statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(cache, &statistics));
+    assert(statistics.indexed_tile_count == 2);
+    dt_grid_view_cache_destroy(cache);
+
+    dt_grid_view_cache_handle volatile_cache = nullptr;
+    require_ok(dt_grid_view_cache_create(grid, &memory, &volatile_cache));
+    compact = {};
+    compact.struct_size = sizeof(compact);
+    assert(dt_grid_view_cache_compact(volatile_cache, &compact) ==
+           DT_E_NOT_FOUND);
+    assert(dt_grid_view_cache_compact(volatile_cache, nullptr) ==
+           DT_E_INVALID_ARGUMENT);
+    dt_grid_view_cache_destroy(volatile_cache);
+    dt_grid_destroy(grid);
+    std::filesystem::remove(path, ignored);
+}
+
+#ifdef _WIN32
+int hold_dgtile_writer(const char* path_text, const char* ready_text,
+                       const char* release_text) {
+    dt_grid_handle grid = create_identity_grid(16, 16);
+    dt_grid_view_cache_options memory{};
+    memory.struct_size = sizeof(memory);
+    memory.tile_width = 16;
+    memory.tile_height = 16;
+    memory.maximum_bytes = 1024ULL * 1024ULL;
+    memory.maximum_tiles = 4;
+    dt_grid_view_disk_cache_options disk{};
+    disk.struct_size = sizeof(disk);
+    disk.utf8_file_name = path_text;
+    disk.source_revision = 991;
+    disk.maximum_file_bytes = 1024ULL * 1024ULL;
+    dt_grid_view_cache_handle cache = nullptr;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    std::ofstream(ready_text) << "ready";
+    for (int attempt = 0; attempt < 1500; ++attempt) {
+        if (std::filesystem::exists(release_text)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    dt_grid_view_cache_destroy(cache);
+    dt_grid_destroy(grid);
+    return 0;
+}
+
+void test_cross_process_single_writer() {
+    const auto path = temporary_tile_package("process-lock");
+    auto ready = path;
+    ready += ".ready";
+    auto release = path;
+    release += ".release";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(ready, ignored);
+    std::filesystem::remove(release, ignored);
+    char executable[MAX_PATH]{};
+    assert(GetModuleFileNameA(nullptr, executable, MAX_PATH) != 0);
+    std::string command = std::string("\"") + executable +
+        "\" --hold-dgtile \"" + path.string() + "\" \"" +
+        ready.string() + "\" \"" + release.string() + "\"";
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    assert(CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                          FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                          &process));
+    for (int attempt = 0; attempt < 500 && !std::filesystem::exists(ready);
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(std::filesystem::exists(ready));
+
+    dt_grid_handle grid = create_identity_grid(16, 16);
+    dt_grid_view_cache_options memory{};
+    memory.struct_size = sizeof(memory);
+    memory.tile_width = 16;
+    memory.tile_height = 16;
+    memory.maximum_bytes = 1024ULL * 1024ULL;
+    memory.maximum_tiles = 4;
+    const std::string utf8_path = path.u8string();
+    dt_grid_view_disk_cache_options disk{};
+    disk.struct_size = sizeof(disk);
+    disk.utf8_file_name = utf8_path.c_str();
+    disk.source_revision = 991;
+    disk.maximum_file_bytes = 1024ULL * 1024ULL;
+    dt_grid_view_cache_handle cache = reinterpret_cast<dt_grid_view_cache_handle>(1);
+    assert(dt_grid_view_cache_create_persistent(
+               grid, &memory, &disk, &cache) == DT_E_IO);
+    assert(cache == nullptr);
+    dt_grid_destroy(grid);
+    std::ofstream(release) << "release";
+    assert(WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    assert(exit_code == 0);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(ready, ignored);
+    std::filesystem::remove(release, ignored);
+}
+#endif
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#ifdef _WIN32
+    if (argc == 5 && std::string(argv[1]) == "--hold-dgtile")
+        return hold_dgtile_writer(argv[2], argv[3], argv[4]);
+#endif
     static_assert(sizeof(dt_grid_view_options) == 64);
     static_assert(sizeof(dt_grid_window) == 64);
     static_assert(sizeof(dt_grid_view_request_options) == 96);
@@ -614,6 +805,7 @@ int main() {
     static_assert(sizeof(dt_grid_view_cache_statistics) == 96);
     static_assert(sizeof(dt_grid_view_disk_cache_options) == 64);
     static_assert(sizeof(dt_grid_view_disk_cache_statistics) == 96);
+    static_assert(sizeof(dt_grid_view_cache_compact_result) == 96);
     test_identity_and_overview_composition();
     test_rotated_sheared_and_validation();
     test_unified_async_view_request();
@@ -621,6 +813,10 @@ int main() {
     test_spatial_tile_cache_inflight_coalescing();
     test_persistent_tile_package_roundtrip_and_validation();
     test_persistent_tile_package_corruption_and_capacity();
+    test_persistent_tile_package_compaction_drops_corrupt_latest_tile();
+#ifdef _WIN32
+    test_cross_process_single_writer();
+#endif
     std::cout << "All GRID view LOD tests passed.\n";
     return 0;
 }

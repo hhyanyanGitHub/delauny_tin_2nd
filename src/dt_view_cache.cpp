@@ -735,6 +735,14 @@ struct GridViewCache::Impl {
         return disk_package->statistics();
     }
 
+    dt_grid_view_cache_compact_result compact() {
+        if (!disk_package) {
+            throw Exception(DT_E_NOT_FOUND,
+                            "GRID view cache has no DGTILE package");
+        }
+        return disk_package->compact();
+    }
+
     void clear() {
         std::lock_guard<std::mutex> lock(mutex);
         for (auto it = entries.begin(); it != entries.end();) {
@@ -776,6 +784,10 @@ dt_grid_view_cache_statistics GridViewCache::statistics() const {
 
 dt_grid_view_disk_cache_statistics GridViewCache::disk_statistics() const {
     return impl_->disk_statistics();
+}
+
+dt_grid_view_cache_compact_result GridViewCache::compact() {
+    return impl_->compact();
 }
 
 void GridViewCache::clear() { impl_->clear(); }

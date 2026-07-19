@@ -39,6 +39,7 @@ public:
                              const CancelCallback& cancelled);
     dt_grid_view_cache_statistics statistics() const;
     dt_grid_view_disk_cache_statistics disk_statistics() const;
+    dt_grid_view_cache_compact_result compact();
     void clear();
 
 private:

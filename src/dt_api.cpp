@@ -1361,6 +1361,19 @@ dt_status DT_CALL dt_grid_view_cache_get_disk_statistics(
     });
 }
 
+dt_status DT_CALL dt_grid_view_cache_compact(
+    dt_grid_view_cache_handle cache,
+    dt_grid_view_cache_compact_result* output_result) {
+    if (output_result) *output_result = {};
+    return guarded([&] {
+        if (!output_result) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_result is null");
+        }
+        *output_result = require_grid_view_cache_shared(cache)->compact();
+    });
+}
+
 dt_status DT_CALL dt_grid_view_cache_clear(dt_grid_view_cache_handle cache) {
     return guarded([&] { require_grid_view_cache_shared(cache)->clear(); });
 }

@@ -217,6 +217,13 @@ int main(int argc, char** argv) {
     require_ok(dt_grid_view_cache_get_disk_statistics(
                    cache, &package_disk_statistics),
                "get reopened package statistics");
+    dt_grid_view_cache_compact_result package_compact{};
+    package_compact.struct_size = sizeof(package_compact);
+    const auto compact_begin = std::chrono::steady_clock::now();
+    require_ok(dt_grid_view_cache_compact(cache, &package_compact),
+               "compact persistent view cache");
+    const double package_compact_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - compact_begin).count();
     const double source_fraction =
         static_cast<double>(window.width * window.height) /
         static_cast<double>(width * height);
@@ -256,6 +263,10 @@ int main(int argc, char** argv) {
               << package_disk_statistics.disk_hit_tile_count
               << " package_file_mib="
               << static_cast<double>(package_seed_statistics.file_bytes) /
+                     (1024.0 * 1024.0)
+              << " package_compact_seconds=" << package_compact_seconds
+              << " package_reclaimed_mib="
+              << static_cast<double>(package_compact.reclaimed_bytes) /
                      (1024.0 * 1024.0)
               << " package_repeat_error="
               << std::abs(package_seed_checksum - package_disk_checksum)

@@ -64,6 +64,11 @@ enum dt_grid_view_disk_cache_statistics_flags {
     DT_GRID_VIEW_DISK_CACHE_WRITE_DISABLED = 1u << 2
 };
 
+enum dt_grid_view_cache_compact_flags {
+    DT_GRID_VIEW_COMPACT_SHRANK = 1u << 0,
+    DT_GRID_VIEW_COMPACT_DROPPED_CORRUPTION = 1u << 1
+};
+
 typedef struct dt_task_info {
     uint32_t struct_size;
     int32_t state;
@@ -182,8 +187,30 @@ typedef struct dt_grid_view_disk_cache_statistics {
     uint64_t written_tile_count;
     uint64_t skipped_write_count;
     uint64_t source_fingerprint;
-    uint64_t reserved[4];
+    /* Includes superseded records; indexed_tile_count counts latest keys. */
+    uint64_t stored_record_count;
+    /* Space occupied by superseded records. Lazy corruption is only known
+       after load or compact verification and is not included here. */
+    uint64_t reclaimable_bytes;
+    uint64_t reserved[2];
 } dt_grid_view_disk_cache_statistics;
+
+/* Result of rewriting a writable DGTILE package with only its latest valid
+   tile records. A corrupt lazy payload is omitted because it can be rebuilt
+   from the source GRID on demand. */
+typedef struct dt_grid_view_cache_compact_result {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t input_file_bytes;
+    uint64_t output_file_bytes;
+    uint64_t reclaimed_bytes;
+    uint64_t input_record_count;
+    uint64_t output_record_count;
+    uint64_t retained_tile_count;
+    uint64_t dropped_duplicate_record_count;
+    uint64_t dropped_corrupt_tile_count;
+    uint64_t reserved[3];
+} dt_grid_view_cache_compact_result;
 
 typedef struct dt_grid_view_cache_t* dt_grid_view_cache_handle;
 
@@ -249,6 +276,9 @@ DT_API dt_status DT_CALL dt_grid_view_cache_get_statistics(
 DT_API dt_status DT_CALL dt_grid_view_cache_get_disk_statistics(
     dt_grid_view_cache_handle cache,
     dt_grid_view_disk_cache_statistics* output_statistics);
+DT_API dt_status DT_CALL dt_grid_view_cache_compact(
+    dt_grid_view_cache_handle cache,
+    dt_grid_view_cache_compact_result* output_result);
 DT_API dt_status DT_CALL dt_grid_view_cache_clear(
     dt_grid_view_cache_handle cache);
 DT_API void DT_CALL dt_grid_view_cache_destroy(

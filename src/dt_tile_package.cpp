@@ -8,12 +8,22 @@
 #include <cwctype>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
+#include <sstream>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace dt {
 namespace {
@@ -142,20 +152,57 @@ class PackageWriterLease final {
 public:
     explicit PackageWriterLease(std::filesystem::path package_path)
         : path_(normalized_registry_path(package_path)) {
-        std::lock_guard<std::mutex> lock(g_writer_registry_mutex);
-        if (!g_writer_registry.emplace(path_).second) {
+#ifdef _WIN32
+        const auto native = path_.native();
+        const uint64_t path_hash = hash_bytes(
+            native.data(), native.size() * sizeof(wchar_t));
+        std::wostringstream name;
+        name << L"Local\\dterrain_dgtile_" << std::hex << std::setw(16)
+             << std::setfill(L'0') << path_hash;
+        named_mutex_ = CreateMutexW(nullptr, FALSE, name.str().c_str());
+        if (!named_mutex_) {
             throw Exception(DT_E_IO,
-                            "DGTILE package already has a writable handle");
+                            "cannot create DGTILE writer mutex");
+        }
+        const DWORD wait = WaitForSingleObject(named_mutex_, 0);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+            CloseHandle(named_mutex_);
+            named_mutex_ = nullptr;
+            throw Exception(DT_E_IO,
+                            "DGTILE package is writable in another process");
+        }
+#endif
+        try {
+            std::lock_guard<std::mutex> lock(g_writer_registry_mutex);
+            if (!g_writer_registry.emplace(path_).second) {
+                throw Exception(
+                    DT_E_IO,
+                    "DGTILE package already has a writable handle");
+            }
+        } catch (...) {
+#ifdef _WIN32
+            ReleaseMutex(named_mutex_);
+            CloseHandle(named_mutex_);
+            named_mutex_ = nullptr;
+#endif
+            throw;
         }
     }
 
     ~PackageWriterLease() {
         std::lock_guard<std::mutex> lock(g_writer_registry_mutex);
         g_writer_registry.erase(path_);
+#ifdef _WIN32
+        ReleaseMutex(named_mutex_);
+        CloseHandle(named_mutex_);
+#endif
     }
 
 private:
     std::filesystem::path path_;
+#ifdef _WIN32
+    HANDLE named_mutex_ = nullptr;
+#endif
 };
 
 } // namespace
@@ -215,6 +262,7 @@ struct GridTilePackage::Impl {
     std::unique_ptr<PackageWriterLease> writer_lease;
     std::unordered_map<PersistentTileKey, PersistentTileDescriptor,
                        PersistentTileKeyHash> index;
+    mutable std::shared_mutex file_mutex;
     mutable std::mutex mutex;
 
     Impl(const Grid& source, uint32_t tile_width_value,
@@ -275,6 +323,7 @@ struct GridTilePackage::Impl {
 
     void open_writer() {
         if (read_only) return;
+        writer.clear();
         writer.open(path, std::ios::binary | std::ios::in | std::ios::out);
         if (!writer) {
             throw Exception(DT_E_IO, "cannot open DGTILE file for updates");
@@ -301,6 +350,36 @@ struct GridTilePackage::Impl {
         store(result.data(), result.size(), kHeaderChecksumOffset,
               hash_bytes(result.data(), result.size()));
         return result;
+    }
+
+    std::array<unsigned char, kRecordHeaderSize> make_record(
+        const PersistentTileKey& key, uint64_t width, uint64_t height,
+        const dt_grid_overview_result& overview,
+        uint64_t payload_hash) const {
+        std::array<unsigned char, kRecordHeaderSize> record{};
+        std::memcpy(record.data(), kRecordMagic, sizeof(kRecordMagic));
+        store(record.data(), record.size(), 8,
+              static_cast<uint32_t>(kRecordHeaderSize));
+        store(record.data(), record.size(), 12, uint32_t{0});
+        store(record.data(), record.size(), 16, key.scale);
+        store(record.data(), record.size(), 24, key.x);
+        store(record.data(), record.size(), 32, key.y);
+        store(record.data(), record.size(), 40, key.method);
+        store(record.data(), record.size(), 44, key.flags);
+        store(record.data(), record.size(), 48, width);
+        store(record.data(), record.size(), 56, height);
+        store(record.data(), record.size(), 64, overview.flags);
+        store(record.data(), record.size(), 68, uint32_t{0});
+        store(record.data(), record.size(), 72, overview.valid_value_count);
+        store(record.data(), record.size(), 80, overview.nodata_value_count);
+        store(record.data(), record.size(), 88, overview.minimum_value);
+        store(record.data(), record.size(), 96, overview.maximum_value);
+        store(record.data(), record.size(), 104, overview.mean_value);
+        store(record.data(), record.size(), 112, payload_hash);
+        store(record.data(), record.size(), kRecordChecksumOffset, uint64_t{0});
+        store(record.data(), record.size(), kRecordChecksumOffset,
+              hash_bytes(record.data(), record.size()));
+        return record;
     }
 
     void create_empty() {
@@ -465,9 +544,17 @@ struct GridTilePackage::Impl {
         return found->second;
     }
 
-    void load_tile(const PersistentTileDescriptor& descriptor,
+    bool load_tile(const PersistentTileDescriptor& requested_descriptor,
                    std::vector<double>& values,
                    dt_grid_overview_result& overview) const {
+        std::shared_lock<std::shared_mutex> file_lock(file_mutex);
+        PersistentTileDescriptor descriptor{};
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto found = index.find(requested_descriptor.key);
+            if (found == index.end()) return false;
+            descriptor = found->second;
+        }
         if (descriptor.width > std::numeric_limits<size_t>::max() /
                                    descriptor.height) {
             throw Exception(DT_E_LIMIT_EXCEEDED,
@@ -488,9 +575,11 @@ struct GridTilePackage::Impl {
                             "DGTILE tile payload checksum mismatch");
         }
         overview = descriptor.overview;
+        return true;
     }
 
     bool discard_corrupt_payload(const PersistentTileKey& key) {
+        std::unique_lock<std::shared_mutex> file_lock(file_mutex);
         std::lock_guard<std::mutex> lock(mutex);
         if (!reset_corrupted || read_only) return false;
         index.erase(key);
@@ -500,6 +589,7 @@ struct GridTilePackage::Impl {
     bool append_tile(const PersistentTileKey& key, uint64_t width,
                      uint64_t height, const std::vector<double>& values,
                      const dt_grid_overview_result& overview) {
+        std::unique_lock<std::shared_mutex> file_lock(file_mutex);
         std::lock_guard<std::mutex> lock(mutex);
         if (index.find(key) != index.end()) return true;
         if (read_only || write_disabled) {
@@ -521,31 +611,10 @@ struct GridTilePackage::Impl {
             return false;
         }
 
-        std::array<unsigned char, kRecordHeaderSize> record{};
-        std::memcpy(record.data(), kRecordMagic, sizeof(kRecordMagic));
-        store(record.data(), record.size(), 8,
-              static_cast<uint32_t>(kRecordHeaderSize));
-        store(record.data(), record.size(), 12, uint32_t{0});
-        store(record.data(), record.size(), 16, key.scale);
-        store(record.data(), record.size(), 24, key.x);
-        store(record.data(), record.size(), 32, key.y);
-        store(record.data(), record.size(), 40, key.method);
-        store(record.data(), record.size(), 44, key.flags);
-        store(record.data(), record.size(), 48, width);
-        store(record.data(), record.size(), 56, height);
-        store(record.data(), record.size(), 64, overview.flags);
-        store(record.data(), record.size(), 68, uint32_t{0});
-        store(record.data(), record.size(), 72, overview.valid_value_count);
-        store(record.data(), record.size(), 80, overview.nodata_value_count);
-        store(record.data(), record.size(), 88, overview.minimum_value);
-        store(record.data(), record.size(), 96, overview.maximum_value);
-        store(record.data(), record.size(), 104, overview.mean_value);
         const uint64_t payload_hash = hash_bytes(
             values.data(), static_cast<size_t>(payload_bytes));
-        store(record.data(), record.size(), 112, payload_hash);
-        store(record.data(), record.size(), kRecordChecksumOffset, uint64_t{0});
-        store(record.data(), record.size(), kRecordChecksumOffset,
-              hash_bytes(record.data(), record.size()));
+        const auto record = make_record(key, width, height, overview,
+                                        payload_hash);
 
         const uint64_t old_file_bytes = file_bytes;
         const uint64_t new_file_bytes = file_bytes + kRecordHeaderSize +
@@ -587,6 +656,134 @@ struct GridTilePackage::Impl {
         return true;
     }
 
+    dt_grid_view_cache_compact_result compact_package() {
+        std::unique_lock<std::shared_mutex> file_lock(file_mutex);
+        std::lock_guard<std::mutex> lock(mutex);
+        if (read_only) {
+            throw Exception(DT_E_UNSUPPORTED,
+                            "read-only DGTILE package cannot be compacted");
+        }
+
+        dt_grid_view_cache_compact_result result{};
+        result.struct_size = sizeof(result);
+        result.input_file_bytes = file_bytes;
+        result.input_record_count = record_count;
+        result.dropped_duplicate_record_count = record_count > index.size()
+            ? record_count - static_cast<uint64_t>(index.size()) : 0;
+
+        std::vector<PersistentTileDescriptor> descriptors;
+        descriptors.reserve(index.size());
+        for (const auto& item : index) descriptors.push_back(item.second);
+        std::sort(descriptors.begin(), descriptors.end(),
+                  [](const auto& left, const auto& right) {
+            if (left.key.scale != right.key.scale)
+                return left.key.scale < right.key.scale;
+            if (left.key.y != right.key.y) return left.key.y < right.key.y;
+            if (left.key.x != right.key.x) return left.key.x < right.key.x;
+            if (left.key.method != right.key.method)
+                return left.key.method < right.key.method;
+            return left.key.flags < right.key.flags;
+        });
+
+        auto temporary = path;
+        temporary += ".compact." + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) +
+            ".tmp";
+        writer.close();
+        std::unordered_map<PersistentTileKey, PersistentTileDescriptor,
+                           PersistentTileKeyHash> compacted_index;
+        uint64_t compacted_bytes = kHeaderSize;
+        try {
+            std::ifstream input(path, std::ios::binary);
+            if (!input) throw Exception(DT_E_IO, "cannot read DGTILE package");
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                throw Exception(DT_E_IO,
+                                "cannot create compacted DGTILE package");
+            }
+            auto compacted_header = make_header(0, kHeaderSize);
+            write_exact(output, compacted_header.data(), compacted_header.size(),
+                        "cannot write compacted DGTILE header");
+            for (const auto& descriptor : descriptors) {
+                const uint64_t value_count = descriptor.width * descriptor.height;
+                std::vector<double> values(static_cast<size_t>(value_count));
+                const uint64_t payload_bytes = value_count * sizeof(double);
+                bool valid = true;
+                try {
+                    input.clear();
+                    input.seekg(static_cast<std::streamoff>(
+                        descriptor.payload_offset));
+                    if (!input) {
+                        throw Exception(DT_E_CORRUPTED_DATA,
+                                        "DGTILE payload offset is invalid");
+                    }
+                    read_exact(input, values.data(), payload_bytes,
+                               "cannot read DGTILE tile payload");
+                    valid = hash_bytes(values.data(),
+                                       static_cast<size_t>(payload_bytes)) ==
+                            descriptor.payload_hash;
+                } catch (const Exception& exception) {
+                    if (exception.status() != DT_E_CORRUPTED_DATA) throw;
+                    valid = false;
+                }
+                if (!valid) {
+                    ++result.dropped_corrupt_tile_count;
+                    continue;
+                }
+                const auto record = make_record(
+                    descriptor.key, descriptor.width, descriptor.height,
+                    descriptor.overview, descriptor.payload_hash);
+                write_exact(output, record.data(), record.size(),
+                            "cannot write compacted DGTILE record");
+                write_exact(output, values.data(), payload_bytes,
+                            "cannot write compacted DGTILE payload");
+                auto compacted = descriptor;
+                compacted.payload_offset = compacted_bytes + kRecordHeaderSize;
+                compacted_index.emplace(compacted.key, compacted);
+                compacted_bytes += kRecordHeaderSize + payload_bytes;
+            }
+            compacted_header = make_header(compacted_index.size(),
+                                           compacted_bytes);
+            output.seekp(0);
+            write_exact(output, compacted_header.data(), compacted_header.size(),
+                        "cannot finish compacted DGTILE header");
+            output.flush();
+            if (!output) {
+                throw Exception(DT_E_IO,
+                                "cannot flush compacted DGTILE package");
+            }
+            output.close();
+            input.close();
+            replace_file_atomically(temporary, path);
+            header = compacted_header;
+            index = std::move(compacted_index);
+            file_bytes = compacted_bytes;
+            record_count = index.size();
+            write_disabled = file_bytes >= maximum_file_bytes;
+            open_writer();
+        } catch (...) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            try {
+                if (!writer.is_open()) open_writer();
+            } catch (...) {
+                write_disabled = true;
+            }
+            throw;
+        }
+
+        result.output_file_bytes = file_bytes;
+        result.reclaimed_bytes = result.input_file_bytes > file_bytes
+            ? result.input_file_bytes - file_bytes : 0;
+        result.output_record_count = record_count;
+        result.retained_tile_count = index.size();
+        if (result.reclaimed_bytes != 0)
+            result.flags |= DT_GRID_VIEW_COMPACT_SHRANK;
+        if (result.dropped_corrupt_tile_count != 0)
+            result.flags |= DT_GRID_VIEW_COMPACT_DROPPED_CORRUPTION;
+        return result;
+    }
+
     dt_grid_view_disk_cache_statistics statistics() const {
         std::lock_guard<std::mutex> lock(mutex);
         dt_grid_view_disk_cache_statistics result{};
@@ -603,6 +800,15 @@ struct GridTilePackage::Impl {
         result.written_tile_count = written_count;
         result.skipped_write_count = skipped_write_count;
         result.source_fingerprint = source_fingerprint;
+        result.stored_record_count = record_count;
+        uint64_t indexed_bytes = kHeaderSize;
+        for (const auto& item : index) {
+            const auto& descriptor = item.second;
+            indexed_bytes += kRecordHeaderSize + descriptor.width *
+                descriptor.height * sizeof(double);
+        }
+        result.reclaimable_bytes = file_bytes > indexed_bytes
+            ? file_bytes - indexed_bytes : 0;
         return result;
     }
 };
@@ -623,8 +829,7 @@ bool GridTilePackage::load(const PersistentTileDescriptor& descriptor,
                            std::vector<double>& values,
                            dt_grid_overview_result& overview) const {
     try {
-        impl_->load_tile(descriptor, values, overview);
-        return true;
+        return impl_->load_tile(descriptor, values, overview);
     } catch (const Exception& exception) {
         if (exception.status() == DT_E_CORRUPTED_DATA &&
             impl_->discard_corrupt_payload(descriptor.key)) {
@@ -649,6 +854,10 @@ bool GridTilePackage::append(const PersistentTileKey& key, uint64_t width,
 
 dt_grid_view_disk_cache_statistics GridTilePackage::statistics() const {
     return impl_->statistics();
+}
+
+dt_grid_view_cache_compact_result GridTilePackage::compact() {
+    return impl_->compact_package();
 }
 
 } // namespace dt

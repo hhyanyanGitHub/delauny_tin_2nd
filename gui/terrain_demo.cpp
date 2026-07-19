@@ -64,6 +64,7 @@ enum CommandId {
     ID_IMPORT_GRID,
     ID_EXPORT_GRID,
     ID_VERIFY_DGRIDB,
+    ID_COMPACT_DGTILE,
     ID_IMPORT_CONTOURS,
     ID_EXPORT_CONTOURS,
     ID_IMPORT_GDAL_RASTER,
@@ -711,6 +712,8 @@ private:
                     L"导出 GRID（DGRIDB / 文本）…");
         AppendMenuW(exchange_menu, MF_STRING, ID_VERIFY_DGRIDB,
                     L"验证 DGRIDB 数据块…");
+        AppendMenuW(exchange_menu, MF_STRING, ID_COMPACT_DGTILE,
+                    L"压缩当前 DGTILE 显示缓存…");
         AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CONTOURS,
                     L"导入等高线文本…");
@@ -5439,6 +5442,48 @@ private:
         }
     }
 
+    void compact_current_dgtile() {
+        if (!grid_ || grid_disk_cache_file_.empty()) {
+            action_text_ = L"当前 GRID 没有可维护的 DGTILE 显示缓存";
+            return;
+        }
+        cancel_grid_preview_tasks(true);
+        destroy_grid_view_cache();
+        if (!ensure_grid_view_cache(grid_)) {
+            action_text_ = L"无法打开当前 DGTILE 显示缓存：" +
+                           last_error_text();
+            return;
+        }
+        dt_grid_view_cache_compact_result result{};
+        result.struct_size = sizeof(result);
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_grid_view_cache_compact(
+            grid_view_cache_, &result);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"DGTILE 压缩失败：" + last_error_text();
+            return;
+        }
+        const double mib = 1024.0 * 1024.0;
+        std::wostringstream text;
+        text << L"DGTILE 压缩完成："
+             << std::fixed << std::setprecision(2)
+             << static_cast<double>(result.input_file_bytes) / mib << L" → "
+             << static_cast<double>(result.output_file_bytes) / mib << L" MiB，回收 "
+             << static_cast<double>(result.reclaimed_bytes) / mib << L" MiB；保留 "
+             << result.retained_tile_count << L" 块，移除重复记录 "
+             << result.dropped_duplicate_record_count << L" 条、损坏块 "
+             << result.dropped_corrupt_tile_count << L" 块；耗时 "
+             << std::setprecision(1)
+             << std::chrono::duration<double, std::milli>(end - begin).count()
+             << L" ms";
+        action_text_ = text.str();
+        invalidate_grid_view_cache();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
     void import_contour_file() {
         const auto file = choose_file(false, L"terrain.dcontour",
             L"DCONTOUR 等高线 (*.dcontour;*.txt)\0*.dcontour;*.txt\0所有文件 (*.*)\0*.*\0",
@@ -5891,6 +5936,7 @@ private:
         case ID_IMPORT_GRID: import_grid_file(); break;
         case ID_EXPORT_GRID: export_grid_file(); break;
         case ID_VERIFY_DGRIDB: verify_dgridb_file(); break;
+        case ID_COMPACT_DGTILE: compact_current_dgtile(); break;
         case ID_IMPORT_CONTOURS: import_contour_file(); break;
         case ID_EXPORT_CONTOURS: export_contour_file(); break;
         case ID_IMPORT_GDAL_RASTER: import_gdal_raster(); break;

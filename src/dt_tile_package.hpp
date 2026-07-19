@@ -55,6 +55,7 @@ public:
                 const std::vector<double>& values,
                 const dt_grid_overview_result& overview) noexcept;
     dt_grid_view_disk_cache_statistics statistics() const;
+    dt_grid_view_cache_compact_result compact();
 
 private:
     struct Impl;

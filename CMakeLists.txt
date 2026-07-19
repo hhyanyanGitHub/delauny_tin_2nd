@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.37.0
+    VERSION 0.40.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -155,7 +155,33 @@ if(DT_BUILD_TESTS)
     target_compile_features(dterrain_viewer3d_tests PRIVATE cxx_std_17)
     target_include_directories(dterrain_viewer3d_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/gui)
+    if(MSVC)
+        target_compile_options(dterrain_viewer3d_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(dterrain_viewer3d_tests PRIVATE -UNDEBUG)
+    endif()
     add_test(NAME dterrain_viewer3d_tests COMMAND dterrain_viewer3d_tests)
+
+    if(WIN32 AND DT_BUILD_GUI)
+        add_executable(dterrain_gpu_renderer_tests
+            tests/test_gpu_renderer.cpp
+            gui/terrain_gpu.cpp)
+        target_compile_features(dterrain_gpu_renderer_tests PRIVATE cxx_std_17)
+        target_compile_definitions(dterrain_gpu_renderer_tests PRIVATE
+            UNICODE _UNICODE NOMINMAX)
+        target_include_directories(dterrain_gpu_renderer_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/gui
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(dterrain_gpu_renderer_tests PRIVATE
+            d3d11 dxgi user32)
+        if(MSVC)
+            target_compile_options(dterrain_gpu_renderer_tests PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(dterrain_gpu_renderer_tests PRIVATE -UNDEBUG)
+        endif()
+        add_test(NAME dterrain_gpu_renderer_tests
+                 COMMAND dterrain_gpu_renderer_tests)
+    endif()
 
     add_executable(dterrain_profile_tests tests/test_profile.cpp)
     target_compile_features(dterrain_profile_tests PRIVATE cxx_std_17)
@@ -294,10 +320,13 @@ if(DT_BUILD_BENCHMARKS)
 endif()
 
 if(DT_BUILD_GUI AND WIN32)
-    add_executable(dterrain_demo WIN32 gui/terrain_demo.cpp)
+    add_executable(dterrain_demo WIN32
+        gui/terrain_demo.cpp
+        gui/terrain_gpu.cpp)
     target_compile_features(dterrain_demo PRIVATE cxx_std_17)
     target_compile_definitions(dterrain_demo PRIVATE UNICODE _UNICODE NOMINMAX)
-    target_link_libraries(dterrain_demo PRIVATE dterrain comdlg32 gdi32 user32)
+    target_link_libraries(dterrain_demo PRIVATE dterrain comdlg32 d3d11
+        dxgi gdi32 user32)
     if(MINGW)
         target_link_options(dterrain_demo PRIVATE -municode)
         target_link_options(dterrain_demo PRIVATE -static-libgcc -static-libstdc++)

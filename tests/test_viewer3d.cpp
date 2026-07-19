@@ -57,6 +57,36 @@ void test_navigation() {
     assert(close(camera.distance, 0.18));
 }
 
+void test_ray_triangle_and_chunking() {
+    Camera camera{};
+    const Ray ray = screen_ray(camera, 0.0, 0.0, 16.0 / 9.0);
+    assert(close(length(ray.direction), 1.0));
+    double distance = 0.0;
+    Vec3 barycentric{};
+    assert(intersect_triangle(
+        ray, {-1.0, -1.0, 0.0}, {1.0, -1.0, 0.0}, {0.0, 1.0, 0.0},
+        distance, &barycentric));
+    assert(distance > 0.0);
+    assert(close(barycentric.x + barycentric.y + barycentric.z, 1.0));
+
+    const auto ranges = make_chunk_ranges(1001, 256);
+    assert(ranges.size() == 4);
+    assert(ranges.front().first_triangle == 0);
+    assert(ranges.front().triangle_count == 256);
+    assert(ranges.back().first_triangle == 768);
+    assert(ranges.back().triangle_count == 233);
+    assert(make_chunk_ranges(12, 0).empty());
+}
+
+void test_culling_and_terrain_follow() {
+    Camera camera{};
+    assert(sphere_in_view({camera.target, 0.1}, camera, 16.0 / 9.0));
+    assert(!sphere_in_view({{100.0, 100.0, 100.0}, 0.1}, camera,
+                           16.0 / 9.0));
+    assert(close(terrain_follow_height(0.0, 0.4, 0.1, 1.0), 0.5));
+    assert(close(terrain_follow_height(0.0, 0.4, 0.1, 0.5), 0.25));
+}
+
 } // namespace
 
 int main() {
@@ -64,6 +94,8 @@ int main() {
     test_center_projection();
     test_orbit_and_limits();
     test_navigation();
+    test_ray_triangle_and_chunking();
+    test_culling_and_terrain_follow();
     std::cout << "viewer3d tests passed\n";
     return 0;
 }

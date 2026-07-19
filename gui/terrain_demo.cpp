@@ -9,6 +9,7 @@
 #include "dt_task_api.h"
 #include "dt_terrain_api.h"
 #include "terrain_3d.hpp"
+#include "terrain_gpu.hpp"
 #include "terrain_measurement.hpp"
 #include "terrain_profile.hpp"
 
@@ -37,6 +38,10 @@ constexpr size_t kMaxDrawTriangles3d = 18000;
 constexpr uint64_t kMaxContourDrawVertices = 200000;
 constexpr UINT_PTR kGridPreviewTimer = 1;
 constexpr UINT kGridPreviewPollMilliseconds = 25;
+constexpr UINT WM_DT_GPU_RENDER = WM_APP + 101;
+constexpr UINT WM_DT_GPU_RESIZE = WM_APP + 102;
+constexpr UINT WM_DT_GPU_PICK = WM_APP + 103;
+constexpr const wchar_t* kGpuCanvasClass = L"DterrainGpuCanvas";
 
 enum CommandId {
     ID_GENERATE_100K = 100,
@@ -224,6 +229,48 @@ LRESULT CALLBACK double_prompt_proc(HWND window, UINT message,
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK gpu_canvas_proc(HWND window, UINT message,
+                                 WPARAM wparam, LPARAM lparam) {
+    HWND parent = GetParent(window);
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        BeginPaint(window, &paint);
+        EndPaint(window, &paint);
+        if (parent) SendMessageW(parent, WM_DT_GPU_RENDER, 0, 0);
+        return 0;
+    }
+    case WM_SIZE:
+        if (parent) SendMessageW(parent, WM_DT_GPU_RESIZE, wparam, lparam);
+        return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_LBUTTONDOWN:
+        SetFocus(window);
+        if ((GET_KEYSTATE_WPARAM(wparam) & MK_CONTROL) != 0) {
+            if (parent) SendMessageW(parent, WM_DT_GPU_PICK, wparam, lparam);
+            return 0;
+        }
+        [[fallthrough]];
+    case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_MOUSEMOVE: {
+        if (!parent) return 0;
+        POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        MapWindowPoints(window, parent, &point, 1);
+        return SendMessageW(parent, message, wparam,
+                            MAKELPARAM(point.x, point.y));
+    }
+    case WM_MOUSEWHEEL:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+        return parent ? SendMessageW(parent, message, wparam, lparam) : 0;
+    default: return DefWindowProcW(window, message, wparam, lparam);
+    }
+}
+
 bool prompt_double(HWND owner, const wchar_t* title, const wchar_t* label,
                    double& value) {
     static const wchar_t* class_name = L"dterrain_double_prompt";
@@ -379,6 +426,15 @@ public:
             layout_controls();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
+        case WM_DT_GPU_RENDER:
+            render_gpu_canvas();
+            return 0;
+        case WM_DT_GPU_RESIZE:
+            resize_gpu_canvas(LOWORD(lparam), HIWORD(lparam));
+            return 0;
+        case WM_DT_GPU_PICK:
+            pick_gpu_triangle(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+            return 0;
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
@@ -511,6 +567,7 @@ public:
             }
             return 0;
         case WM_DESTROY:
+            gpu_renderer_.shutdown();
             PostQuitMessage(0);
             return 0;
         default:
@@ -620,7 +677,13 @@ private:
     dt_contour_info contour_info_{};
     HWND view_button_ = nullptr;
     HWND exaggeration_button_ = nullptr;
+    HWND gpu_canvas_ = nullptr;
     dterrain::viewer3d::Camera camera_{};
+    dterrain::viewer3d::TerrainGpuRenderer gpu_renderer_{};
+    bool gpu_mesh_dirty_ = true;
+    bool gpu_failed_ = false;
+    bool terrain_follow_ = true;
+    uint64_t gpu_picked_triangle_ = std::numeric_limits<uint64_t>::max();
     Drag3D drag3d_ = Drag3D::None;
     POINT drag3d_last_{};
     bool camera_needs_reset_ = true;
@@ -680,6 +743,20 @@ private:
         exaggeration_button_ = make_button(hwnd_, ID_Z_EXAGGERATION, L"高程×1.0");
         controls_.push_back(exaggeration_button_);
         EnableWindow(exaggeration_button_, FALSE);
+        WNDCLASSEXW gpu_class{};
+        gpu_class.cbSize = sizeof(gpu_class);
+        gpu_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+        gpu_class.lpfnWndProc = gpu_canvas_proc;
+        gpu_class.hInstance = GetModuleHandleW(nullptr);
+        gpu_class.hCursor = LoadCursorW(nullptr, IDC_CROSS);
+        gpu_class.hbrBackground = static_cast<HBRUSH>(
+            GetStockObject(BLACK_BRUSH));
+        gpu_class.lpszClassName = kGpuCanvasClass;
+        RegisterClassExW(&gpu_class);
+        gpu_canvas_ = CreateWindowExW(
+            0, kGpuCanvasClass, L"", WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP,
+            0, kToolbarHeight, 1, 1, hwnd_, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
         layout_controls();
     }
 
@@ -891,6 +968,15 @@ private:
             MoveWindow(controls_[i], x, 8, width, 30, TRUE);
             x += width + 5;
         }
+        if (gpu_canvas_) {
+            RECT client{};
+            GetClientRect(hwnd_, &client);
+            MoveWindow(gpu_canvas_, 0, kToolbarHeight,
+                       std::max(1L, client.right),
+                       std::max(1L, client.bottom - kToolbarHeight -
+                                       kStatusHeight),
+                       TRUE);
+        }
     }
 
     void set_wait_cursor(bool waiting) {
@@ -1043,6 +1129,8 @@ private:
             view_valid_ = false;
             cache_valid_ = false;
             camera_needs_reset_ = true;
+            gpu_renderer_.clear_mesh();
+            gpu_mesh_dirty_ = true;
             action_text_ = L"三角网已清空";
             InvalidateRect(hwnd_, nullptr, FALSE);
         }
@@ -1110,7 +1198,10 @@ private:
 
     void invalidate_mesh_cache() {
         cache_valid_ = false;
+        gpu_mesh_dirty_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
+        if (gpu_canvas_ && IsWindowVisible(gpu_canvas_))
+            InvalidateRect(gpu_canvas_, nullptr, FALSE);
     }
 
     void invalidate_grid_view_cache() {
@@ -2221,6 +2312,7 @@ private:
             action_text_ = L"3D 视点已平移";
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
+        if (gpu_canvas_) InvalidateRect(gpu_canvas_, nullptr, FALSE);
     }
 
     void end_drag3d() {
@@ -2233,22 +2325,29 @@ private:
         camera_.dolly(delta > 0 ? 0.82 : 1.22);
         action_text_ = L"3D 相机距离已调整";
         InvalidateRect(hwnd_, nullptr, FALSE);
+        if (gpu_canvas_) InvalidateRect(gpu_canvas_, nullptr, FALSE);
     }
 
     bool handle_key3d(WPARAM key) {
         const double step = std::max(0.025, camera_.distance * 0.035);
         bool handled = true;
+        bool moved_horizontally = false;
         switch (key) {
         case 'W':
-        case VK_UP: dterrain::viewer3d::roam_xy(camera_, step, 0.0); break;
+        case VK_UP: dterrain::viewer3d::roam_xy(camera_, step, 0.0);
+                    moved_horizontally = true; break;
         case 'S':
-        case VK_DOWN: dterrain::viewer3d::roam_xy(camera_, -step, 0.0); break;
+        case VK_DOWN: dterrain::viewer3d::roam_xy(camera_, -step, 0.0);
+                      moved_horizontally = true; break;
         case 'A':
-        case VK_LEFT: dterrain::viewer3d::roam_xy(camera_, 0.0, -step); break;
+        case VK_LEFT: dterrain::viewer3d::roam_xy(camera_, 0.0, -step);
+                      moved_horizontally = true; break;
         case 'D':
-        case VK_RIGHT: dterrain::viewer3d::roam_xy(camera_, 0.0, step); break;
+        case VK_RIGHT: dterrain::viewer3d::roam_xy(camera_, 0.0, step);
+                       moved_horizontally = true; break;
         case 'Q': camera_.target.z += step; break;
         case 'E': camera_.target.z -= step; break;
+        case 'F': terrain_follow_ = !terrain_follow_; break;
         case VK_HOME: reset_camera3d(); break;
         case VK_ADD:
         case VK_OEM_PLUS: change_exaggeration(1); break;
@@ -2257,9 +2356,13 @@ private:
         case VK_ESCAPE: end_drag3d(); break;
         default: handled = false; break;
         }
+        if (moved_horizontally) follow_camera_to_terrain();
         if (handled) {
-            action_text_ = L"3D 漫游：WASD/方向键移动，Q/E 升降，Home 复位";
+            action_text_ = terrain_follow_
+                ? L"3D 漫游：WASD 移动，贴地开启（F 切换），Q/E 升降"
+                : L"3D 漫游：WASD 移动，贴地关闭（F 切换），Q/E 升降";
             InvalidateRect(hwnd_, nullptr, FALSE);
+            if (gpu_canvas_) InvalidateRect(gpu_canvas_, nullptr, FALSE);
         }
         return handled;
     }
@@ -2278,11 +2381,16 @@ private:
             update_layer_menu();
             view_mode_ = ViewMode::Terrain3D;
             reset_view();
+            gpu_failed_ = false;
+            gpu_renderer_.shutdown();
+            gpu_mesh_dirty_ = true;
             SetWindowTextW(view_button_, L"切换2D");
             EnableWindow(exaggeration_button_, TRUE);
-            action_text_ = L"已进入 3D：左键环视，右键平移，滚轮缩放，WASD 漫游";
+            if (gpu_canvas_) ShowWindow(gpu_canvas_, SW_SHOW);
+            action_text_ = L"已进入 GPU 3D：Ctrl+左键拾取，F 切换贴地漫游";
         } else {
             view_mode_ = ViewMode::Map2D;
+            if (gpu_canvas_) ShowWindow(gpu_canvas_, SW_HIDE);
             reset_view();
             SetWindowTextW(view_button_, L"切换3D");
             EnableWindow(exaggeration_button_, FALSE);
@@ -2301,6 +2409,7 @@ private:
         if (direction > 0 && nearest + 1 < levels.size()) ++nearest;
         if (direction < 0 && nearest > 0) --nearest;
         z_exaggeration_ = levels[nearest];
+        gpu_mesh_dirty_ = true;
         std::wostringstream label;
         label << L"高程×" << std::fixed << std::setprecision(1) << z_exaggeration_;
         SetWindowTextW(exaggeration_button_, label.str().c_str());
@@ -2310,6 +2419,7 @@ private:
         action_text_ = status.str();
         SetFocus(hwnd_);
         InvalidateRect(hwnd_, nullptr, FALSE);
+        if (gpu_canvas_) InvalidateRect(gpu_canvas_, nullptr, FALSE);
     }
 
     POINT clamp_to_canvas(int x, int y) const {
@@ -3276,6 +3386,135 @@ private:
         camera_needs_reset_ = false;
     }
 
+    bool sample_tin_height(double x, double y, double& z) const {
+        const dt_point3 query{x, y, 0.0};
+        dt_location_result location{};
+        location.struct_size = sizeof(location);
+        if (dt_locate_point_xy(mesh_, &query, &location) != DT_OK)
+            return false;
+        if (location.type == DT_LOCATION_VERTEX) {
+            z = location.vertex.point.z;
+            return true;
+        }
+        if (location.type == DT_LOCATION_FACE) {
+            z = interpolate_triangle(location.triangle, query);
+            return true;
+        }
+        if (location.type == DT_LOCATION_EDGE) {
+            const auto& a = location.edge.vertex[0].point;
+            const auto& b = location.edge.vertex[1].point;
+            const double dx = b.x - a.x;
+            const double dy = b.y - a.y;
+            const double denominator = dx * dx + dy * dy;
+            if (denominator <= 0.0) return false;
+            const double t = std::clamp(
+                ((x - a.x) * dx + (y - a.y) * dy) / denominator,
+                0.0, 1.0);
+            z = a.z + (b.z - a.z) * t;
+            return true;
+        }
+        return false;
+    }
+
+    void follow_camera_to_terrain() {
+        if (!terrain_follow_) return;
+        const double x = model_center_x_ + camera_.target.x * model_xy_scale_;
+        const double y = model_center_y_ + camera_.target.y * model_xy_scale_;
+        double z = 0.0;
+        if (!sample_tin_height(x, y, z)) return;
+        const double normalized_z =
+            (z - model_center_z_) / model_xy_scale_ * z_exaggeration_;
+        camera_.target.z = dterrain::viewer3d::terrain_follow_height(
+            camera_.target.z, normalized_z, 0.04, 0.45);
+    }
+
+    bool prepare_gpu_renderer(std::string& error) {
+        if (!gpu_canvas_ || gpu_failed_) return false;
+        if (!gpu_renderer_.ready() &&
+            !gpu_renderer_.initialize(gpu_canvas_, error)) {
+            gpu_failed_ = true;
+            return false;
+        }
+        if (gpu_mesh_dirty_) {
+            update_model_metrics();
+            if (!gpu_renderer_.set_mesh(
+                    triangles_, model_center_x_, model_center_y_,
+                    model_center_z_, model_xy_scale_, mesh_zmin_, mesh_zmax_,
+                    z_exaggeration_, error)) {
+                gpu_failed_ = true;
+                return false;
+            }
+            gpu_mesh_dirty_ = false;
+            gpu_picked_triangle_ = std::numeric_limits<uint64_t>::max();
+        }
+        return true;
+    }
+
+    void render_gpu_canvas() {
+        if (view_mode_ != ViewMode::Terrain3D || !gpu_canvas_) return;
+        ensure_cache();
+        if (triangles_.empty()) return;
+        if (camera_needs_reset_) reset_camera3d();
+        std::string error;
+        if (!prepare_gpu_renderer(error) ||
+            !gpu_renderer_.render(camera_, error)) {
+            gpu_failed_ = true;
+            ShowWindow(gpu_canvas_, SW_HIDE);
+            action_text_ = L"Direct3D 回退到软件渲染：" +
+                           utf8_to_wide(error.c_str());
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    }
+
+    void resize_gpu_canvas(uint32_t width, uint32_t height) {
+        if (!gpu_renderer_.ready() || width == 0 || height == 0) return;
+        std::string error;
+        if (!gpu_renderer_.resize(width, height, error)) {
+            gpu_failed_ = true;
+            ShowWindow(gpu_canvas_, SW_HIDE);
+            action_text_ = L"Direct3D 调整失败：" +
+                           utf8_to_wide(error.c_str());
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    }
+
+    void pick_gpu_triangle(int x, int y) {
+        if (view_mode_ != ViewMode::Terrain3D || gpu_failed_) return;
+        std::string error;
+        uint64_t triangle_index = std::numeric_limits<uint64_t>::max();
+        if (!prepare_gpu_renderer(error)) return;
+        if (gpu_renderer_.pick(static_cast<uint32_t>(std::max(0, x)),
+                               static_cast<uint32_t>(std::max(0, y)),
+                               camera_, triangle_index, error) &&
+            triangle_index < triangles_.size()) {
+            gpu_picked_triangle_ = triangle_index;
+            gpu_renderer_.select_triangle(triangle_index);
+            const auto& triangle = triangles_[static_cast<size_t>(triangle_index)];
+            const double x_world = (triangle.vertex[0].point.x +
+                                    triangle.vertex[1].point.x +
+                                    triangle.vertex[2].point.x) / 3.0;
+            const double y_world = (triangle.vertex[0].point.y +
+                                    triangle.vertex[1].point.y +
+                                    triangle.vertex[2].point.y) / 3.0;
+            const double z_world = (triangle.vertex[0].point.z +
+                                    triangle.vertex[1].point.z +
+                                    triangle.vertex[2].point.z) / 3.0;
+            std::wostringstream text;
+            text << L"GPU 拾取三角形 #" << triangle_index << L"，中心 ("
+                 << std::fixed << std::setprecision(3) << x_world << L", "
+                 << y_world << L", " << z_world << L")";
+            action_text_ = text.str();
+        } else if (!error.empty()) {
+            action_text_ = L"GPU 拾取失败：" + utf8_to_wide(error.c_str());
+        } else {
+            gpu_picked_triangle_ = std::numeric_limits<uint64_t>::max();
+            gpu_renderer_.select_triangle(gpu_picked_triangle_);
+            action_text_ = L"GPU 拾取：当前位置没有地形三角形";
+        }
+        InvalidateRect(gpu_canvas_, nullptr, FALSE);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
     dterrain::viewer3d::Vec3 normalized_point(const dt_point3& point) const {
         return {(point.x - model_center_x_) / model_xy_scale_,
                 (point.y - model_center_y_) / model_xy_scale_,
@@ -3807,15 +4046,17 @@ private:
         IntersectClipRect(dc, canvas.left, canvas.top, canvas.right, canvas.bottom);
         ensure_cache();
         if (view_mode_ == ViewMode::Terrain3D) {
-            draw_mesh3d(dc, canvas);
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, RGB(218, 228, 235));
-            RECT help = canvas;
-            help.left += 12;
-            help.top += 10;
-            DrawTextW(dc,
-                      L"3D：左键环视｜右/中键平移｜滚轮缩放｜WASD/方向键漫游｜Q/E升降｜+/-垂直夸张｜Home复位",
-                      -1, &help, DT_LEFT | DT_TOP | DT_SINGLELINE);
+            if (!gpu_canvas_ || !IsWindowVisible(gpu_canvas_) || gpu_failed_) {
+                draw_mesh3d(dc, canvas);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, RGB(218, 228, 235));
+                RECT help = canvas;
+                help.left += 12;
+                help.top += 10;
+                DrawTextW(dc,
+                          L"软件3D回退：左键环视｜右键平移｜滚轮缩放｜WASD漫游",
+                          -1, &help, DT_LEFT | DT_TOP | DT_SINGLELINE);
+            }
         } else {
             if (!panning_) refresh_grid_view_cache();
             draw_grid(dc);
@@ -3873,6 +4114,14 @@ private:
              << (show_contours_ && contours_ ? L"C" : L"-")
              << (show_cdt_ && cdt_info_.vertex_count != 0 ? L"D" : L"-")
              << L" | ";
+        if (view_mode_ == ViewMode::Terrain3D && gpu_renderer_.ready() &&
+            !gpu_failed_) {
+            const auto& gpu = gpu_renderer_.statistics();
+            text << L"GPU块 " << gpu.visible_chunks << L"/"
+                 << gpu.total_chunks << L"，面 "
+                 << gpu.rendered_triangles << L"/" << gpu.total_triangles
+                 << (terrain_follow_ ? L"，贴地开 | " : L"，贴地关 | ");
+        }
         if (view_mode_ == ViewMode::Map2D && show_grid_ &&
             grid_preview_request_.task) {
             dt_task_info preview_info{};
@@ -4037,6 +4286,7 @@ private:
     void enter_2d_view() {
         if (view_mode_ == ViewMode::Map2D) return;
         view_mode_ = ViewMode::Map2D;
+        if (gpu_canvas_) ShowWindow(gpu_canvas_, SW_HIDE);
         SetWindowTextW(view_button_, L"切换3D");
         EnableWindow(exaggeration_button_, FALSE);
         end_drag3d();

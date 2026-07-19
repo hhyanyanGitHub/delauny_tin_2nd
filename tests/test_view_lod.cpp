@@ -457,8 +457,15 @@ void test_spatial_tile_cache_inflight_coalescing() {
 }
 
 std::filesystem::path temporary_tile_package(const char* suffix) {
+#ifdef _WIN32
+    const auto process_token = static_cast<unsigned long long>(GetCurrentProcessId());
+#else
+    static const auto process_token = static_cast<unsigned long long>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+#endif
     return std::filesystem::temp_directory_path() /
-        (std::string("dterrain-view-") + suffix + ".dgtile");
+        (std::string("dterrain-view-") + suffix + "-" +
+         std::to_string(process_token) + ".dgtile");
 }
 
 std::vector<double> read_cached_view(

@@ -1,5 +1,7 @@
 #include "dt_view_cache.hpp"
 
+#include "dt_tile_package.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -82,6 +84,9 @@ struct GridViewCache::Impl {
         uint64_t height = 0;
         std::vector<double> values;
         dt_grid_overview_result overview{};
+        std::optional<PersistentTileDescriptor> disk_descriptor;
+        bool loaded_from_disk = false;
+        bool recovered_disk_payload = false;
         dt_status failure_status = DT_OK;
         std::string failure_message;
         std::condition_variable changed;
@@ -101,13 +106,15 @@ struct GridViewCache::Impl {
         }
     };
 
-    enum class Reuse { Miss, Hit, Coalesced };
+    enum class Reuse { Miss, Hit, Coalesced, Disk };
     struct Lease {
         std::shared_ptr<Entry> entry;
         Reuse reuse = Reuse::Miss;
     };
 
     std::shared_ptr<Grid> source;
+    std::unique_ptr<GridTilePackage> disk_package;
+    uint64_t persistent_generation = 0;
     uint32_t tile_width = kDefaultTileSize;
     uint32_t tile_height = kDefaultTileSize;
     uint64_t maximum_bytes = kDefaultMaximumBytes;
@@ -130,7 +137,8 @@ struct GridViewCache::Impl {
     uint64_t eviction_count = 0;
 
     Impl(std::shared_ptr<Grid> source_grid,
-         const dt_grid_view_cache_options& options)
+         const dt_grid_view_cache_options& options,
+         const dt_grid_view_disk_cache_options* disk_options = nullptr)
         : source(std::move(source_grid)) {
         if (!source) {
             throw Exception(DT_E_NOT_INITIALIZED,
@@ -175,6 +183,11 @@ struct GridViewCache::Impl {
         if (worker_count > 64) {
             throw Exception(DT_E_INVALID_ARGUMENT,
                             "GRID view cache worker_count exceeds 64");
+        }
+        if (disk_options) {
+            persistent_generation = source->info().generation;
+            disk_package = std::make_unique<GridTilePackage>(
+                *source, tile_width, tile_height, *disk_options);
         }
         workers.reserve(worker_count);
         try {
@@ -235,20 +248,38 @@ struct GridViewCache::Impl {
             dt_grid_overview_result overview{};
             dt_status failure_status = DT_OK;
             std::string failure_message;
+            bool loaded_from_disk = false;
+            bool recovered_disk_payload = false;
             try {
-                values.resize(static_cast<size_t>(entry->width * entry->height));
-                dt_grid_overview_options options{};
-                options.struct_size = sizeof(options);
-                options.method = entry->key.method;
-                options.flags = entry->key.flags;
-                options.worker_count = 1;
-                options.source_column = entry->source_column;
-                options.source_row = entry->source_row;
-                options.source_width = entry->source_width;
-                options.source_height = entry->source_height;
-                overview = source->read_overview(
-                    options, entry->width, entry->height, values.data(),
-                    entry->width);
+                if (entry->disk_descriptor) {
+                    loaded_from_disk = disk_package->load(
+                        *entry->disk_descriptor, values, overview);
+                    recovered_disk_payload = !loaded_from_disk;
+                }
+                if (!loaded_from_disk) {
+                    values.resize(static_cast<size_t>(entry->width *
+                                                      entry->height));
+                    dt_grid_overview_options options{};
+                    options.struct_size = sizeof(options);
+                    options.method = entry->key.method;
+                    options.flags = entry->key.flags;
+                    options.worker_count = 1;
+                    options.source_column = entry->source_column;
+                    options.source_row = entry->source_row;
+                    options.source_width = entry->source_width;
+                    options.source_height = entry->source_height;
+                    overview = source->read_overview(
+                        options, entry->width, entry->height, values.data(),
+                        entry->width);
+                    if (disk_package &&
+                        entry->key.generation == persistent_generation) {
+                        const PersistentTileKey persistent_key{
+                            entry->key.scale, entry->key.x, entry->key.y,
+                            entry->key.method, entry->key.flags};
+                        disk_package->append(persistent_key, entry->width,
+                                             entry->height, values, overview);
+                    }
+                }
             } catch (const Exception& error) {
                 failure_status = error.status();
                 failure_message = error.what();
@@ -269,6 +300,8 @@ struct GridViewCache::Impl {
                 if (failure_status == DT_OK) {
                     entry->values = std::move(values);
                     entry->overview = overview;
+                    entry->loaded_from_disk = loaded_from_disk;
+                    entry->recovered_disk_payload = recovered_disk_payload;
                     entry->state = Ready;
                     entry->stamp = ++stamp;
                     cached_bytes += entry->values.size() * sizeof(double);
@@ -345,12 +378,26 @@ struct GridViewCache::Impl {
                                         source->height() - entry->source_row);
         entry->width = (entry->source_width + key.scale - 1) / key.scale;
         entry->height = (entry->source_height + key.scale - 1) / key.scale;
+        Reuse reuse = Reuse::Miss;
+        if (disk_package && key.generation == persistent_generation) {
+            const PersistentTileKey persistent_key{
+                key.scale, key.x, key.y, key.method, key.flags};
+            entry->disk_descriptor = disk_package->find(persistent_key);
+            if (entry->disk_descriptor) {
+                if (entry->disk_descriptor->width != entry->width ||
+                    entry->disk_descriptor->height != entry->height) {
+                    throw Exception(DT_E_CORRUPTED_DATA,
+                                    "DGTILE tile dimensions do not match GRID");
+                }
+                reuse = Reuse::Disk;
+            }
+        }
         entries.emplace(key, entry);
         jobs.push({priority, ++sequence, entry->queue_version, entry});
         ++in_flight_tiles;
-        ++miss_tile_count;
+        if (reuse == Reuse::Miss) ++miss_tile_count;
         jobs_changed.notify_one();
-        return {std::move(entry), Reuse::Miss};
+        return {std::move(entry), reuse};
     }
 
     void release(const std::shared_ptr<Entry>& entry) {
@@ -520,10 +567,10 @@ struct GridViewCache::Impl {
 
         const uint32_t tile_flags =
             ((request.flags & DT_GRID_VIEW_REQUEST_STRICT_NODATA) != 0
-                 ? DT_GRID_OVERVIEW_STRICT_NODATA
+                 ? static_cast<uint32_t>(DT_GRID_OVERVIEW_STRICT_NODATA)
                  : 0U) |
             ((request.flags & DT_GRID_VIEW_REQUEST_USE_PYRAMID) != 0
-                 ? DT_GRID_OVERVIEW_USE_PYRAMID
+                 ? static_cast<uint32_t>(DT_GRID_OVERVIEW_USE_PYRAMID)
                  : 0U);
         const uint64_t generation = source->info().generation;
         {
@@ -534,6 +581,8 @@ struct GridViewCache::Impl {
         leases.reserve(schedule.size());
         std::vector<std::shared_ptr<Entry>> directory(
             static_cast<size_t>(result.tile_count));
+        std::vector<Reuse> reuse_directory(
+            static_cast<size_t>(result.tile_count), Reuse::Miss);
         try {
             for (const auto& tile : schedule) {
                 Key key{generation, scale, tile.x, tile.y, method, tile_flags};
@@ -545,8 +594,10 @@ struct GridViewCache::Impl {
                     result.flags |= DT_GRID_VIEW_RESULT_CACHE_COALESCED;
                 const uint64_t local_x = tile.x - first_tile_x;
                 const uint64_t local_y = tile.y - first_tile_y;
-                directory[static_cast<size_t>(local_y * tile_columns + local_x)] =
-                    lease.entry;
+                const size_t directory_index = static_cast<size_t>(
+                    local_y * tile_columns + local_x);
+                directory[directory_index] = lease.entry;
+                reuse_directory[directory_index] = lease.reuse;
                 leases.push_back(std::move(lease));
             }
 
@@ -558,9 +609,17 @@ struct GridViewCache::Impl {
             for (const auto& tile : schedule) {
                 const uint64_t local_x = tile.x - first_tile_x;
                 const uint64_t local_y = tile.y - first_tile_y;
-                auto& entry = directory[static_cast<size_t>(
-                    local_y * tile_columns + local_x)];
+                const size_t directory_index = static_cast<size_t>(
+                    local_y * tile_columns + local_x);
+                auto& entry = directory[directory_index];
                 wait_ready(entry, cancelled);
+                if (entry->loaded_from_disk)
+                    result.flags |= DT_GRID_VIEW_RESULT_DISK_CACHE_HIT;
+                if (entry->recovered_disk_payload &&
+                    reuse_directory[directory_index] == Reuse::Disk &&
+                    result.reused_tile_count != 0) {
+                    --result.reused_tile_count;
+                }
                 used_pyramid = used_pyramid ||
                     (entry->overview.flags & DT_GRID_OVERVIEW_USED_PYRAMID) != 0;
                 ++completed_tiles;
@@ -668,6 +727,14 @@ struct GridViewCache::Impl {
         return result;
     }
 
+    dt_grid_view_disk_cache_statistics disk_statistics() const {
+        if (!disk_package) {
+            throw Exception(DT_E_NOT_FOUND,
+                            "GRID view cache has no DGTILE package");
+        }
+        return disk_package->statistics();
+    }
+
     void clear() {
         std::lock_guard<std::mutex> lock(mutex);
         for (auto it = entries.begin(); it != entries.end();) {
@@ -690,6 +757,11 @@ GridViewCache::GridViewCache(std::shared_ptr<Grid> source,
                              const dt_grid_view_cache_options& options)
     : impl_(std::make_unique<Impl>(std::move(source), options)) {}
 
+GridViewCache::GridViewCache(
+    std::shared_ptr<Grid> source, const dt_grid_view_cache_options& options,
+    const dt_grid_view_disk_cache_options& disk_options)
+    : impl_(std::make_unique<Impl>(std::move(source), options, &disk_options)) {}
+
 GridViewCache::~GridViewCache() = default;
 
 CachedGridView GridViewCache::read_view(
@@ -700,6 +772,10 @@ CachedGridView GridViewCache::read_view(
 
 dt_grid_view_cache_statistics GridViewCache::statistics() const {
     return impl_->statistics();
+}
+
+dt_grid_view_disk_cache_statistics GridViewCache::disk_statistics() const {
+    return impl_->disk_statistics();
 }
 
 void GridViewCache::clear() { impl_->clear(); }

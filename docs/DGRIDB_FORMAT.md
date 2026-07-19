@@ -3,6 +3,10 @@
 DGRIDB 面向本机大 GRID 的快速持久化、写时复制映射和屏幕概览。它不是跨端序交换
 格式；需要长期人工审阅或异构系统交换时仍可使用 DGRID 文本、GeoTIFF/COG。
 
+从 v0.35 起，GUI 可在同目录生成同名 `.dgridb.dgtile` 显示缓存。该旁车不修改
+DGRIDB 文件，也不保存权威地形数据，可以随时删除；格式与失效规则见
+[DGTILE_FORMAT.md](DGTILE_FORMAT.md)。
+
 ## 文件布局
 
 所有整数为无符号小端序，浮点数为 IEEE-754 little-endian `double`。v0.29 文件由六段组成：

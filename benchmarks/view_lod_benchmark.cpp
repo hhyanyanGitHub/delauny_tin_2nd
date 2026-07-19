@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <vector>
@@ -131,7 +132,8 @@ int main(int argc, char** argv) {
     require_ok(dt_grid_view_cache_create(grid, &cache_options, &cache),
                "create view cache");
     const auto cached_read = [&](const dt_grid_view_request_options& options,
-                                 uint64_t& reused, double& sampled_checksum) {
+                                 uint64_t& reused, double& sampled_checksum,
+                                 uint32_t* result_flags = nullptr) {
         dt_task_handle cached_task = nullptr;
         const auto begin = std::chrono::steady_clock::now();
         require_ok(dt_grid_read_view_cached_async(cache, &options, &cached_task),
@@ -146,6 +148,7 @@ int main(int argc, char** argv) {
         require_ok(dt_task_get_grid_view_result(cached_task, &cached_view),
                    "get cached view");
         reused = cached_view.reused_tile_count;
+        if (result_flags) *result_flags = cached_view.flags;
         sampled_checksum = 0.0;
         for (uint64_t index = 0;
              index < cached_view.width * cached_view.height; index += 97)
@@ -172,6 +175,48 @@ int main(int argc, char** argv) {
     cache_statistics.struct_size = sizeof(cache_statistics);
     require_ok(dt_grid_view_cache_get_statistics(cache, &cache_statistics),
                "get view cache statistics");
+    dt_grid_view_cache_destroy(cache);
+
+    const auto package_path = std::filesystem::temp_directory_path() /
+        "dterrain-view-lod-benchmark.dgtile";
+    std::error_code ignored;
+    std::filesystem::remove(package_path, ignored);
+    const std::string package_utf8 = package_path.u8string();
+    dt_grid_view_disk_cache_options disk_options{};
+    disk_options.struct_size = sizeof(disk_options);
+    disk_options.utf8_file_name = package_utf8.c_str();
+    disk_options.source_revision = 1;
+    disk_options.maximum_file_bytes = 256ULL * 1024ULL * 1024ULL;
+    cache = nullptr;
+    require_ok(dt_grid_view_cache_create_persistent(
+                   grid, &cache_options, &disk_options, &cache),
+               "create persistent view cache");
+    uint64_t package_seed_reused = 0;
+    double package_seed_checksum = 0.0;
+    const double package_seed_seconds = cached_read(
+        request, package_seed_reused, package_seed_checksum);
+    dt_grid_view_disk_cache_statistics package_seed_statistics{};
+    package_seed_statistics.struct_size = sizeof(package_seed_statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(
+                   cache, &package_seed_statistics),
+               "get seeded package statistics");
+    dt_grid_view_cache_destroy(cache);
+
+    cache = nullptr;
+    require_ok(dt_grid_view_cache_create_persistent(
+                   grid, &cache_options, &disk_options, &cache),
+               "reopen persistent view cache");
+    uint64_t package_disk_reused = 0;
+    double package_disk_checksum = 0.0;
+    uint32_t package_disk_flags = 0;
+    const double package_disk_seconds = cached_read(
+        request, package_disk_reused, package_disk_checksum,
+        &package_disk_flags);
+    dt_grid_view_disk_cache_statistics package_disk_statistics{};
+    package_disk_statistics.struct_size = sizeof(package_disk_statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(
+                   cache, &package_disk_statistics),
+               "get reopened package statistics");
     const double source_fraction =
         static_cast<double>(window.width * window.height) /
         static_cast<double>(width * height);
@@ -204,14 +249,30 @@ int main(int argc, char** argv) {
               << cache_statistics.coalesced_tile_count
               << " cached_repeat_error="
               << std::abs(cold_checksum - warm_checksum)
+              << " package_seed_seconds=" << package_seed_seconds
+              << " package_disk_seconds=" << package_disk_seconds
+              << " package_disk_reused=" << package_disk_reused
+              << " package_disk_hits="
+              << package_disk_statistics.disk_hit_tile_count
+              << " package_file_mib="
+              << static_cast<double>(package_seed_statistics.file_bytes) /
+                     (1024.0 * 1024.0)
+              << " package_repeat_error="
+              << std::abs(package_seed_checksum - package_disk_checksum)
               << " checksum=" << checksum << '\n';
     dt_task_destroy(task);
     dt_grid_view_cache_destroy(cache);
     dt_grid_destroy(grid);
+    std::filesystem::remove(package_path, ignored);
     return std::isfinite(checksum) &&
                    std::abs(checksum - async_checksum) < 1e-9 &&
                    std::abs(cold_checksum - warm_checksum) < 1e-9 &&
                    warm_reused != 0 && pan_reused != 0 &&
-                   std::isfinite(pan_checksum)
+                   std::isfinite(pan_checksum) &&
+                   (package_disk_flags &
+                    DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) != 0 &&
+                   package_disk_reused != 0 &&
+                   std::abs(package_seed_checksum - package_disk_checksum) <
+                       1e-9
                ? 0 : 3;
 }

@@ -41,12 +41,27 @@ enum dt_grid_view_result_flags {
     DT_GRID_VIEW_RESULT_SOURCE_VERIFIED = 1u << 1,
     DT_GRID_VIEW_RESULT_USED_TILE_CACHE = 1u << 2,
     DT_GRID_VIEW_RESULT_CACHE_HIT = 1u << 3,
-    DT_GRID_VIEW_RESULT_CACHE_COALESCED = 1u << 4
+    DT_GRID_VIEW_RESULT_CACHE_COALESCED = 1u << 4,
+    DT_GRID_VIEW_RESULT_DISK_CACHE_HIT = 1u << 5
 };
 
 enum dt_grid_view_cache_flags {
     /* Reserved for future cache policies. Must currently be zero. */
     DT_GRID_VIEW_CACHE_DEFAULT = 0
+};
+
+enum dt_grid_view_disk_cache_flags {
+    DT_GRID_VIEW_DISK_CACHE_READ_ONLY = 1u << 0,
+    /* Recreates a package whose source fingerprint or tile geometry differs. */
+    DT_GRID_VIEW_DISK_CACHE_RESET_STALE = 1u << 1,
+    /* Recreates a package with an invalid header or directory. */
+    DT_GRID_VIEW_DISK_CACHE_RESET_CORRUPTED = 1u << 2
+};
+
+enum dt_grid_view_disk_cache_statistics_flags {
+    DT_GRID_VIEW_DISK_CACHE_ACTIVE = 1u << 0,
+    DT_GRID_VIEW_DISK_CACHE_READ_ONLY_ACTIVE = 1u << 1,
+    DT_GRID_VIEW_DISK_CACHE_WRITE_DISABLED = 1u << 2
 };
 
 typedef struct dt_task_info {
@@ -144,6 +159,32 @@ typedef struct dt_grid_view_cache_statistics {
     uint64_t reserved[2];
 } dt_grid_view_cache_statistics;
 
+/* Optional sparse DGTILE sidecar. source_revision is application-defined and
+   participates in the source fingerprint; zero is valid. The package also
+   fingerprints GRID geometry, CRS, NoData and deterministic source samples. */
+typedef struct dt_grid_view_disk_cache_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    const char* utf8_file_name;
+    uint64_t source_revision;
+    /* Zero selects 2 GiB. Once full, display continues using memory/source. */
+    uint64_t maximum_file_bytes;
+    uint64_t reserved[4];
+} dt_grid_view_disk_cache_options;
+
+typedef struct dt_grid_view_disk_cache_statistics {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t capacity_bytes;
+    uint64_t file_bytes;
+    uint64_t indexed_tile_count;
+    uint64_t disk_hit_tile_count;
+    uint64_t written_tile_count;
+    uint64_t skipped_write_count;
+    uint64_t source_fingerprint;
+    uint64_t reserved[4];
+} dt_grid_view_disk_cache_statistics;
+
 typedef struct dt_grid_view_cache_t* dt_grid_view_cache_handle;
 
 DT_API dt_status DT_CALL dt_grid_from_tin_async(
@@ -191,6 +232,11 @@ DT_API dt_status DT_CALL dt_grid_read_view_async(
 DT_API dt_status DT_CALL dt_grid_view_cache_create(
     dt_grid_handle grid, const dt_grid_view_cache_options* options,
     dt_grid_view_cache_handle* output_cache);
+/* Creates a memory cache backed by a sparse, lazily read DGTILE package. */
+DT_API dt_status DT_CALL dt_grid_view_cache_create_persistent(
+    dt_grid_handle grid, const dt_grid_view_cache_options* memory_options,
+    const dt_grid_view_disk_cache_options* disk_options,
+    dt_grid_view_cache_handle* output_cache);
 /* Submits a display-oriented tiled LOD request. Tile producers are scheduled
    from the viewport center outward and are shared by concurrent requests. */
 DT_API dt_status DT_CALL dt_grid_read_view_cached_async(
@@ -200,6 +246,9 @@ DT_API dt_status DT_CALL dt_grid_read_view_cached_async(
 DT_API dt_status DT_CALL dt_grid_view_cache_get_statistics(
     dt_grid_view_cache_handle cache,
     dt_grid_view_cache_statistics* output_statistics);
+DT_API dt_status DT_CALL dt_grid_view_cache_get_disk_statistics(
+    dt_grid_view_cache_handle cache,
+    dt_grid_view_disk_cache_statistics* output_statistics);
 DT_API dt_status DT_CALL dt_grid_view_cache_clear(
     dt_grid_view_cache_handle cache);
 DT_API void DT_CALL dt_grid_view_cache_destroy(

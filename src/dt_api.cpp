@@ -1270,6 +1270,26 @@ dt_status DT_CALL dt_grid_view_cache_create(
     });
 }
 
+dt_status DT_CALL dt_grid_view_cache_create_persistent(
+    dt_grid_handle grid, const dt_grid_view_cache_options* memory_options,
+    const dt_grid_view_disk_cache_options* disk_options,
+    dt_grid_view_cache_handle* output_cache) {
+    if (output_cache) *output_cache = nullptr;
+    return guarded([&] {
+        validate_options(memory_options, "dt_grid_view_cache_options");
+        validate_options(disk_options,
+                         "dt_grid_view_disk_cache_options");
+        if (!output_cache) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_cache is null");
+        }
+        auto handle = std::make_unique<dt_grid_view_cache_t>();
+        handle->cache = std::make_shared<dt::GridViewCache>(
+            require_grid_shared(grid), *memory_options, *disk_options);
+        *output_cache = handle.release();
+    });
+}
+
 dt_status DT_CALL dt_grid_read_view_cached_async(
     dt_grid_view_cache_handle cache,
     const dt_grid_view_request_options* options,
@@ -1324,6 +1344,20 @@ dt_status DT_CALL dt_grid_view_cache_get_statistics(
         }
         *output_statistics =
             require_grid_view_cache_shared(cache)->statistics();
+    });
+}
+
+dt_status DT_CALL dt_grid_view_cache_get_disk_statistics(
+    dt_grid_view_cache_handle cache,
+    dt_grid_view_disk_cache_statistics* output_statistics) {
+    if (output_statistics) *output_statistics = {};
+    return guarded([&] {
+        if (!output_statistics) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_statistics is null");
+        }
+        *output_statistics =
+            require_grid_view_cache_shared(cache)->disk_statistics();
     });
 }
 

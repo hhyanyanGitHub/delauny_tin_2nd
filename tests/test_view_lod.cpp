@@ -5,7 +5,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -357,6 +360,250 @@ void test_spatial_tile_cache_inflight_coalescing() {
     dt_grid_destroy(grid);
 }
 
+std::filesystem::path temporary_tile_package(const char* suffix) {
+    return std::filesystem::temp_directory_path() /
+        (std::string("dterrain-view-") + suffix + ".dgtile");
+}
+
+std::vector<double> read_cached_view(
+    dt_grid_view_cache_handle cache,
+    const dt_grid_view_request_options& request,
+    dt_grid_view_result& output_view,
+    dt_task_info* output_info = nullptr) {
+    dt_task_handle task = nullptr;
+    require_ok(dt_grid_read_view_cached_async(cache, &request, &task));
+    int32_t completed = 0;
+    require_ok(dt_task_wait(task, UINT32_MAX, &completed));
+    assert(completed == 1);
+    dt_task_info info{};
+    info.struct_size = sizeof(info);
+    require_ok(dt_task_get_info(task, &info));
+    if (output_info) *output_info = info;
+    std::vector<double> values;
+    if (info.state == DT_TASK_SUCCEEDED) {
+        output_view = {};
+        output_view.struct_size = sizeof(output_view);
+        require_ok(dt_task_get_grid_view_result(task, &output_view));
+        values.assign(output_view.values,
+                      output_view.values + static_cast<size_t>(
+                          output_view.width * output_view.height));
+    }
+    dt_task_destroy(task);
+    return values;
+}
+
+void test_persistent_tile_package_roundtrip_and_validation() {
+    const auto path = temporary_tile_package("roundtrip");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    dt_grid_handle grid = create_identity_grid(32, 16);
+
+    dt_grid_view_cache_options memory{};
+    memory.struct_size = sizeof(memory);
+    memory.tile_width = 16;
+    memory.tile_height = 16;
+    memory.worker_count = 1;
+    memory.maximum_bytes = 1024ULL * 1024ULL;
+    memory.maximum_tiles = 32;
+    const std::string utf8_path = path.u8string();
+    dt_grid_view_disk_cache_options disk{};
+    disk.struct_size = sizeof(disk);
+    dt_grid_view_cache_handle cache = nullptr;
+    cache = reinterpret_cast<dt_grid_view_cache_handle>(1);
+    assert(dt_grid_view_cache_create_persistent(
+               grid, &memory, &disk, &cache) == DT_E_INVALID_ARGUMENT);
+    assert(cache == nullptr);
+    disk.utf8_file_name = utf8_path.c_str();
+    disk.source_revision = 77;
+    disk.maximum_file_bytes = 16ULL * 1024ULL * 1024ULL;
+
+    dt_grid_view_request_options request{};
+    request.struct_size = sizeof(request);
+    request.world_bounds = {0.0, 0.0, 31.0, 15.0};
+    request.output_width = 32;
+    request.output_height = 16;
+    request.overview_method = DT_GRID_OVERVIEW_NEAREST;
+
+    cache = nullptr;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    dt_grid_view_result first_view{};
+    const auto first = read_cached_view(cache, request, first_view);
+    assert((first_view.flags & DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) == 0);
+    dt_grid_view_disk_cache_statistics disk_statistics{};
+    disk_statistics.struct_size = sizeof(disk_statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(
+        cache, &disk_statistics));
+    assert((disk_statistics.flags & DT_GRID_VIEW_DISK_CACHE_ACTIVE) != 0);
+    assert(disk_statistics.indexed_tile_count == first_view.tile_count);
+    assert(disk_statistics.written_tile_count == first_view.tile_count);
+    assert(disk_statistics.file_bytes > 4096);
+    const uint64_t fingerprint = disk_statistics.source_fingerprint;
+    dt_grid_view_cache_handle competing =
+        reinterpret_cast<dt_grid_view_cache_handle>(1);
+    assert(dt_grid_view_cache_create_persistent(
+               grid, &memory, &disk, &competing) == DT_E_IO);
+    assert(competing == nullptr);
+    disk.flags = DT_GRID_VIEW_DISK_CACHE_READ_ONLY;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &competing));
+    dt_grid_view_cache_destroy(competing);
+    disk.flags = 0;
+    dt_grid_view_cache_destroy(cache);
+
+    cache = nullptr;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    dt_grid_view_result second_view{};
+    const auto second = read_cached_view(cache, request, second_view);
+    assert(first == second);
+    assert((second_view.flags & DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) != 0);
+    assert(second_view.reused_tile_count == second_view.tile_count);
+    disk_statistics = {};
+    disk_statistics.struct_size = sizeof(disk_statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(
+        cache, &disk_statistics));
+    assert(disk_statistics.disk_hit_tile_count == second_view.tile_count);
+    assert(disk_statistics.source_fingerprint == fingerprint);
+    dt_grid_view_cache_destroy(cache);
+
+    const double changed = -1000.0;
+    require_ok(dt_grid_write_window(grid, 0, 0, 1, 1, &changed, 1));
+    cache = reinterpret_cast<dt_grid_view_cache_handle>(1);
+    assert(dt_grid_view_cache_create_persistent(
+               grid, &memory, &disk, &cache) == DT_E_STALE_QUERY);
+    assert(cache == nullptr);
+    disk.flags = DT_GRID_VIEW_DISK_CACHE_RESET_STALE;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    disk_statistics = {};
+    disk_statistics.struct_size = sizeof(disk_statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(
+        cache, &disk_statistics));
+    assert(disk_statistics.indexed_tile_count == 0);
+    assert(disk_statistics.file_bytes == 4096);
+    dt_grid_view_cache_destroy(cache);
+
+    dt_grid_view_cache_handle volatile_cache = nullptr;
+    require_ok(dt_grid_view_cache_create(grid, &memory, &volatile_cache));
+    disk_statistics = {};
+    disk_statistics.struct_size = sizeof(disk_statistics);
+    assert(dt_grid_view_cache_get_disk_statistics(
+               volatile_cache, &disk_statistics) == DT_E_NOT_FOUND);
+    dt_grid_view_cache_destroy(volatile_cache);
+    dt_grid_destroy(grid);
+    std::filesystem::remove(path, ignored);
+}
+
+void test_persistent_tile_package_corruption_and_capacity() {
+    const auto path = temporary_tile_package("corrupt");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    dt_grid_handle grid = create_identity_grid(16, 16);
+    dt_grid_view_cache_options memory{};
+    memory.struct_size = sizeof(memory);
+    memory.tile_width = 16;
+    memory.tile_height = 16;
+    memory.worker_count = 1;
+    memory.maximum_bytes = 16ULL * 16ULL * sizeof(double);
+    memory.maximum_tiles = 2;
+    const std::string utf8_path = path.u8string();
+    dt_grid_view_disk_cache_options disk{};
+    disk.struct_size = sizeof(disk);
+    disk.utf8_file_name = utf8_path.c_str();
+    disk.maximum_file_bytes = 4096 + 128; // Header fits, payload does not.
+    dt_grid_view_cache_handle cache = nullptr;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    dt_grid_view_request_options request{};
+    request.struct_size = sizeof(request);
+    request.world_bounds = {0.0, 0.0, 15.0, 15.0};
+    request.output_width = 16;
+    request.output_height = 16;
+    request.overview_method = DT_GRID_OVERVIEW_NEAREST;
+    dt_grid_view_result view{};
+    read_cached_view(cache, request, view);
+    dt_grid_view_disk_cache_statistics statistics{};
+    statistics.struct_size = sizeof(statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(cache, &statistics));
+    assert(statistics.indexed_tile_count == 0);
+    assert(statistics.skipped_write_count == 1);
+    dt_grid_view_cache_destroy(cache);
+
+    disk.maximum_file_bytes = 1024ULL * 1024ULL;
+    disk.flags = DT_GRID_VIEW_DISK_CACHE_RESET_CORRUPTED;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    read_cached_view(cache, request, view);
+    dt_grid_view_cache_destroy(cache);
+    {
+        std::fstream stream(path, std::ios::binary | std::ios::in |
+                                  std::ios::out);
+        assert(stream);
+        stream.seekg(4096 + 128);
+        char byte = 0;
+        stream.read(&byte, 1);
+        byte ^= static_cast<char>(0x7f);
+        stream.seekp(4096 + 128);
+        stream.write(&byte, 1);
+    }
+    disk.flags = 0;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    dt_task_info failed_info{};
+    read_cached_view(cache, request, view, &failed_info);
+    assert(failed_info.state == DT_TASK_FAILED);
+    assert(failed_info.result_status == DT_E_CORRUPTED_DATA);
+    dt_grid_view_cache_destroy(cache);
+    disk.flags = DT_GRID_VIEW_DISK_CACHE_RESET_CORRUPTED;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    dt_task_info recovered_info{};
+    const auto recovered = read_cached_view(
+        cache, request, view, &recovered_info);
+    assert(recovered_info.state == DT_TASK_SUCCEEDED);
+    assert(recovered.size() == 16 * 16);
+    assert((view.flags & DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) == 0);
+    dt_grid_view_cache_destroy(cache);
+    {
+        std::fstream stream(path, std::ios::binary | std::ios::in |
+                                  std::ios::out);
+        assert(stream);
+        stream.seekp(200);
+        const char damaged = static_cast<char>(0x5a);
+        stream.write(&damaged, 1);
+    }
+    disk.flags = 0;
+    cache = reinterpret_cast<dt_grid_view_cache_handle>(1);
+    assert(dt_grid_view_cache_create_persistent(
+               grid, &memory, &disk, &cache) == DT_E_CORRUPTED_DATA);
+    assert(cache == nullptr);
+    disk.flags = DT_GRID_VIEW_DISK_CACHE_RESET_CORRUPTED;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    statistics = {};
+    statistics.struct_size = sizeof(statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(cache, &statistics));
+    assert(statistics.indexed_tile_count == 0);
+    dt_grid_view_cache_destroy(cache);
+
+    disk.flags = DT_GRID_VIEW_DISK_CACHE_READ_ONLY;
+    require_ok(dt_grid_view_cache_create_persistent(
+        grid, &memory, &disk, &cache));
+    statistics = {};
+    statistics.struct_size = sizeof(statistics);
+    require_ok(dt_grid_view_cache_get_disk_statistics(cache, &statistics));
+    assert((statistics.flags &
+            DT_GRID_VIEW_DISK_CACHE_READ_ONLY_ACTIVE) != 0);
+    dt_grid_view_cache_destroy(cache);
+    dt_grid_destroy(grid);
+    std::filesystem::remove(path, ignored);
+    cache = reinterpret_cast<dt_grid_view_cache_handle>(1);
+    assert(dt_grid_view_cache_create_persistent(
+               nullptr, &memory, &disk, &cache) == DT_E_NOT_INITIALIZED);
+    assert(cache == nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -365,11 +612,15 @@ int main() {
     static_assert(sizeof(dt_grid_view_request_options) == 96);
     static_assert(sizeof(dt_grid_view_cache_options) == 64);
     static_assert(sizeof(dt_grid_view_cache_statistics) == 96);
+    static_assert(sizeof(dt_grid_view_disk_cache_options) == 64);
+    static_assert(sizeof(dt_grid_view_disk_cache_statistics) == 96);
     test_identity_and_overview_composition();
     test_rotated_sheared_and_validation();
     test_unified_async_view_request();
     test_spatial_tile_cache_reuse_and_eviction();
     test_spatial_tile_cache_inflight_coalescing();
+    test_persistent_tile_package_roundtrip_and_validation();
+    test_persistent_tile_package_corruption_and_capacity();
     std::cout << "All GRID view LOD tests passed.\n";
     return 0;
 }

@@ -26,6 +26,9 @@ class GridViewCache final {
 public:
     GridViewCache(std::shared_ptr<Grid> source,
                   const dt_grid_view_cache_options& options);
+    GridViewCache(std::shared_ptr<Grid> source,
+                  const dt_grid_view_cache_options& options,
+                  const dt_grid_view_disk_cache_options& disk_options);
     ~GridViewCache();
 
     GridViewCache(const GridViewCache&) = delete;
@@ -35,6 +38,7 @@ public:
                              const ProgressCallback& progress,
                              const CancelCallback& cancelled);
     dt_grid_view_cache_statistics statistics() const;
+    dt_grid_view_disk_cache_statistics disk_statistics() const;
     void clear();
 
 private:

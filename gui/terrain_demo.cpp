@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -580,12 +581,15 @@ private:
     bool grid_preview_view_valid_ = false;
     bool grid_preview_used_pyramid_ = false;
     bool grid_preview_used_tile_cache_ = false;
+    bool grid_preview_used_disk_cache_ = false;
     uint64_t grid_preview_lod_scale_ = 1;
     uint64_t grid_preview_tile_count_ = 0;
     uint64_t grid_preview_reused_tile_count_ = 0;
     GridTheme grid_preview_theme_ = GridTheme::Elevation;
     dt_grid_view_cache_handle grid_view_cache_ = nullptr;
     dt_grid_handle grid_view_cache_source_ = nullptr;
+    std::string grid_disk_cache_file_;
+    uint64_t grid_disk_cache_revision_ = 0;
     struct GridPreviewRequest {
         dt_task_handle task = nullptr;
         dt_grid_handle source = nullptr;
@@ -957,10 +961,13 @@ private:
         grid_preview_view_valid_ = false;
         grid_preview_used_pyramid_ = false;
         grid_preview_used_tile_cache_ = false;
+        grid_preview_used_disk_cache_ = false;
         grid_preview_lod_scale_ = 1;
         grid_preview_tile_count_ = 0;
         grid_preview_reused_tile_count_ = 0;
         grid_preview_theme_ = GridTheme::Elevation;
+        grid_disk_cache_file_.clear();
+        grid_disk_cache_revision_ = 0;
     }
 
     void destroy_contour_layer() {
@@ -2568,8 +2575,23 @@ private:
             : std::min(terrain_worker_count_, 8U);
         options.maximum_bytes = 128ULL * 1024ULL * 1024ULL;
         options.maximum_tiles = 4096;
-        if (dt_grid_view_cache_create(source, &options, &grid_view_cache_) !=
-            DT_OK) {
+        dt_status status = DT_E_NOT_FOUND;
+        if (source == grid_ && !grid_disk_cache_file_.empty()) {
+            dt_grid_view_disk_cache_options disk{};
+            disk.struct_size = sizeof(disk);
+            disk.flags = DT_GRID_VIEW_DISK_CACHE_RESET_STALE |
+                         DT_GRID_VIEW_DISK_CACHE_RESET_CORRUPTED;
+            disk.utf8_file_name = grid_disk_cache_file_.c_str();
+            disk.source_revision = grid_disk_cache_revision_;
+            disk.maximum_file_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+            status = dt_grid_view_cache_create_persistent(
+                source, &options, &disk, &grid_view_cache_);
+        }
+        if (status != DT_OK) {
+            status = dt_grid_view_cache_create(
+                source, &options, &grid_view_cache_);
+        }
+        if (status != DT_OK) {
             grid_view_cache_ = nullptr;
             return false;
         }
@@ -2672,6 +2694,9 @@ private:
                         grid_preview_used_tile_cache_ =
                             (view.flags &
                              DT_GRID_VIEW_RESULT_USED_TILE_CACHE) != 0;
+                        grid_preview_used_disk_cache_ =
+                            (view.flags &
+                             DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) != 0;
                         grid_preview_lod_scale_ = view.lod_scale;
                         grid_preview_tile_count_ = view.tile_count;
                         grid_preview_reused_tile_count_ =
@@ -2709,6 +2734,7 @@ private:
         grid_preview_width_ = grid_preview_height_ = 0;
         grid_preview_used_pyramid_ = false;
         grid_preview_used_tile_cache_ = false;
+        grid_preview_used_disk_cache_ = false;
         grid_preview_lod_scale_ = 1;
         grid_preview_tile_count_ = 0;
         grid_preview_reused_tile_count_ = 0;
@@ -2742,6 +2768,7 @@ private:
         grid_preview_view_valid_ = false;
         grid_preview_theme_ = grid_theme_;
         grid_preview_used_tile_cache_ = false;
+        grid_preview_used_disk_cache_ = false;
         grid_preview_lod_scale_ = 1;
         grid_preview_tile_count_ = 0;
         grid_preview_reused_tile_count_ = 0;
@@ -2781,6 +2808,7 @@ private:
         grid_preview_width_ = grid_preview_height_ = 0;
         grid_preview_used_pyramid_ = false;
         grid_preview_used_tile_cache_ = false;
+        grid_preview_used_disk_cache_ = false;
         grid_preview_lod_scale_ = 1;
         grid_preview_tile_count_ = 0;
         grid_preview_reused_tile_count_ = 0;
@@ -2809,6 +2837,7 @@ private:
         grid_preview_view_valid_ = false;
         grid_preview_theme_ = grid_theme_;
         grid_preview_used_tile_cache_ = false;
+        grid_preview_used_disk_cache_ = false;
         grid_preview_lod_scale_ = 1;
         grid_preview_tile_count_ = 0;
         grid_preview_reused_tile_count_ = 0;
@@ -2853,6 +2882,7 @@ private:
             grid_preview_view_valid_ = true;
             grid_preview_used_pyramid_ = false;
             grid_preview_used_tile_cache_ = false;
+            grid_preview_used_disk_cache_ = false;
             grid_preview_lod_scale_ = 1;
             grid_preview_tile_count_ = 0;
             grid_preview_reused_tile_count_ = 0;
@@ -3843,6 +3873,7 @@ private:
                 text << L" s" << grid_preview_lod_scale_ << L"，"
                      << grid_preview_reused_tile_count_ << L"/"
                      << grid_preview_tile_count_ << L"复用";
+                if (grid_preview_used_disk_cache_) text << L"（磁盘）";
             }
             text << L" | ";
         }
@@ -3876,6 +3907,27 @@ private:
         std::transform(extension.begin(), extension.end(), extension.begin(),
                        [](wchar_t ch) { return std::towlower(ch); });
         return extension;
+    }
+
+    static uint64_t persistent_file_revision(const std::wstring& file) {
+        std::error_code error;
+        const std::filesystem::path path(file);
+        const uint64_t size = std::filesystem::file_size(path, error);
+        if (error) return 0;
+        const auto write_time = std::filesystem::last_write_time(path, error);
+        if (error) return size;
+        const auto ticks = write_time.time_since_epoch().count();
+        uint64_t hash = 1469598103934665603ULL;
+        const auto add = [&](const void* data, size_t bytes) {
+            const auto* input = static_cast<const unsigned char*>(data);
+            for (size_t index = 0; index < bytes; ++index) {
+                hash ^= input[index];
+                hash *= 1099511628211ULL;
+            }
+        };
+        add(&size, sizeof(size));
+        add(&ticks, sizeof(ticks));
+        return hash;
     }
 
     void import_points_file() {
@@ -5294,6 +5346,10 @@ private:
         }
         destroy_grid_layer();
         grid_ = output;
+        if (binary) {
+            grid_disk_cache_file_ = utf8 + ".dgtile";
+            grid_disk_cache_revision_ = persistent_file_revision(file);
+        }
         show_grid_ = true;
         update_layer_menu();
         refresh_grid_cache();
@@ -5315,6 +5371,7 @@ private:
             text << L"；多级金字塔";
         if ((grid_info_.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0)
             text << L"；按需块校验缓存";
+        if (binary) text << L"；DGTILE 跨会话瓦片";
         if (grid_info_.width > grid_preview_width_ ||
             grid_info_.height > grid_preview_height_)
             text << L"；LOD 预览 " << grid_preview_width_ << L"×"
@@ -5341,6 +5398,13 @@ private:
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
         if (status == DT_OK) {
+            if (binary) {
+                cancel_grid_preview_tasks(false);
+                destroy_grid_view_cache();
+                grid_disk_cache_file_ = utf8 + ".dgtile";
+                grid_disk_cache_revision_ = persistent_file_revision(file);
+                invalidate_grid_view_cache();
+            }
             std::wostringstream text;
             text << L"已导出 " << (binary ? L"DGRIDB：" : L"DGRID：")
                  << file << L"，耗时 " << std::fixed << std::setprecision(1)

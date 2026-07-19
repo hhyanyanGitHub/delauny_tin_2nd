@@ -284,6 +284,49 @@ dt_grid_view_cache_destroy(cache);
 设置 `DT_GRID_OVERVIEW_USED_TILE_CACHE` 且不设置 `EXACT_SOURCE_STATISTICS`。GRID 写入后
 generation 改变，新请求自动使用新目录键，不会读到旧代次瓦片。
 
+### DGTILE 持久显示缓存（v0.35）
+
+需要跨进程会话保留已浏览热点时，用 `dt_grid_view_cache_create_persistent()` 代替内存版
+create；后续提交、等待、取结果和销毁流程完全相同：
+
+```cpp
+dt_grid_view_disk_cache_options disk{};
+disk.struct_size = sizeof(disk);
+disk.flags = DT_GRID_VIEW_DISK_CACHE_RESET_STALE |
+             DT_GRID_VIEW_DISK_CACHE_RESET_CORRUPTED;
+disk.utf8_file_name = "terrain.dgridb.dgtile"; // 创建时复制路径内容
+disk.source_revision = application_revision;   // 数据改变时必须改变
+disk.maximum_file_bytes = 2ULL * 1024 * 1024 * 1024;
+
+dt_grid_view_cache_handle cache = nullptr;
+dt_status status = dt_grid_view_cache_create_persistent(
+    grid, &cache_options, &disk, &cache);
+if (status == DT_OK) {
+    // 与内存缓存相同：dt_grid_read_view_cached_async(cache, ...)
+    dt_grid_view_disk_cache_statistics stats{};
+    stats.struct_size = sizeof(stats);
+    dt_grid_view_cache_get_disk_statistics(cache, &stats);
+    dt_grid_view_cache_destroy(cache);
+}
+```
+
+`dt_grid_view_disk_cache_options` 固定 64 字节。文件名是 UTF-8，库在 create 返回前复制为
+内部路径；字符串随后可释放。`source_revision` 由应用定义，零也合法。库还把尺寸、仿射、
+CRS、NoData 和最多 64×64 个确定性源样本加入指纹，但抽样不能替代 revision。默认容量
+为 2 GiB，最大 1 TiB。`READ_ONLY` 要求文件已存在；`RESET_STALE` 在源指纹或瓦片尺寸
+变化时原子重建；`RESET_CORRUPTED` 重建坏头/目录，并允许在按需读取发现坏负载时重新
+生成该瓦片。只读模式不会执行两种 reset。
+
+`dt_grid_view_disk_cache_statistics` 固定 96 字节，报告容量、当前文件字节数、索引键数、
+目录命中次数、成功写入数、停写/容量跳过数和源指纹。`DISK_CACHE_HIT` 结果标志表示至少
+一个负载实际来自磁盘；仅查到但校验失败并重算的瓦片不设置该标志。对普通内存缓存调用
+磁盘统计返回 `DT_E_NOT_FOUND`。`dt_grid_view_cache_clear()` 只清理内存层，不删除旁车。
+
+缓存只在源 GRID generation 与 create 时一致时查写旁车；写入后继续显示但绕过旧包。
+包满、只读或写失败不会使视口任务失败。单进程同一路径只允许一个可写缓存，可并存多个
+只读缓存；尚无跨进程写锁。文件为追加式且不在线压缩，关闭所有句柄后可安全删除并重建。
+完整布局见 [DGTILE_FORMAT.md](DGTILE_FORMAT.md)。
+
 ## 世界视口到 GRID 行列窗口
 
 `dt_grid_get_view_window()` 为视口自适应 LOD 提供稳定的仿射几何入口：

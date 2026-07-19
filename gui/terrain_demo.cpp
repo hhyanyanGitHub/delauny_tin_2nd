@@ -77,6 +77,9 @@ enum CommandId {
     ID_EXPORT_COG,
     ID_IMPORT_GDAL_CONTOURS,
     ID_EXPORT_GPKG_CONTOURS,
+    ID_REPROJECT_TIN,
+    ID_REPROJECT_GRID,
+    ID_REPROJECT_CONTOURS,
     ID_IMPORT_CDT,
     ID_EXPORT_CDT,
     ID_LAYER_TIN,
@@ -379,6 +382,7 @@ public:
         dt_create(nullptr, &mesh_);
         dt_cdt_create(nullptr, &cdt_);
         if (dt_gdal_initialize() == DT_OK) {
+            gdal_available_ = true;
             int32_t available = 0;
             if (dt_gdal_is_driver_available("GTiff", &available) == DT_OK)
                 gdal_gtiff_available_ = available != 0;
@@ -627,6 +631,7 @@ private:
     bool gdal_gtiff_available_ = false;
     bool gdal_cog_available_ = false;
     bool gdal_gpkg_available_ = false;
+    bool gdal_available_ = false;
     dt_grid_info grid_info_{};
     std::vector<uint32_t> grid_preview_;
     uint32_t grid_preview_width_ = 0;
@@ -805,17 +810,26 @@ private:
             (gdal_cog_available_ ? MF_ENABLED : MF_GRAYED);
         const UINT gpkg_flags = MF_STRING |
             (gdal_gpkg_available_ ? MF_ENABLED : MF_GRAYED);
+        const UINT gdal_flags = MF_STRING |
+            (gdal_available_ ? MF_ENABLED : MF_GRAYED);
         AppendMenuW(exchange_menu, gtiff_flags, ID_IMPORT_GDAL_RASTER,
-                    L"导入 GeoTIFF / COG…");
+                    L"导入 GDAL 栅格（GeoTIFF/DEM/IMG 等）…");
         AppendMenuW(exchange_menu, gtiff_flags, ID_EXPORT_GEOTIFF,
                     L"导出 GeoTIFF（DEFLATE）…");
         AppendMenuW(exchange_menu, cog_flags, ID_EXPORT_COG,
                     L"导出 Cloud Optimized GeoTIFF…");
         AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(exchange_menu, gpkg_flags, ID_IMPORT_GDAL_CONTOURS,
-                    L"导入 GeoPackage 等高线…");
+                    L"导入 GDAL 线矢量等高线（GPKG/SHP 等）…");
         AppendMenuW(exchange_menu, gpkg_flags, ID_EXPORT_GPKG_CONTOURS,
                     L"导出 GeoPackage 等高线…");
+        AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(exchange_menu, gdal_flags, ID_REPROJECT_TIN,
+                    L"当前 TIN 重投影到 EPSG…");
+        AppendMenuW(exchange_menu, gdal_flags, ID_REPROJECT_GRID,
+                    L"当前 GRID 重投影到 EPSG…");
+        AppendMenuW(exchange_menu, gdal_flags, ID_REPROJECT_CONTOURS,
+                    L"当前等高线重投影到 EPSG…");
         AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CDT,
                     L"打开约束网 DCDT…");
@@ -5803,13 +5817,13 @@ private:
     }
 
     void import_gdal_raster() {
-        if (!gdal_gtiff_available_) {
-            action_text_ = L"当前构建未启用 GDAL GeoTIFF 驱动";
+        if (!gdal_available_) {
+            action_text_ = L"当前构建未启用 GDAL";
             return;
         }
         const auto file = choose_file(
             false, L"terrain.tif",
-            L"GeoTIFF / COG (*.tif;*.tiff)\0*.tif;*.tiff\0所有文件 (*.*)\0*.*\0",
+            L"常用地形栅格 (*.tif;*.tiff;*.dem;*.img;*.asc;*.vrt)\0*.tif;*.tiff;*.dem;*.img;*.asc;*.vrt\0所有 GDAL 栅格 (*.*)\0*.*\0",
             L"tif");
         if (file.empty()) return;
         dt_gdal_raster_load_options options{};
@@ -5823,7 +5837,7 @@ private:
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
         if (status != DT_OK) {
-            action_text_ = L"GeoTIFF/COG 导入失败：" + last_error_text();
+            action_text_ = L"GDAL 栅格导入失败：" + last_error_text();
             return;
         }
         destroy_grid_layer();
@@ -5837,7 +5851,7 @@ private:
         const double ms =
             std::chrono::duration<double, std::milli>(end - begin).count();
         std::wostringstream text;
-        text << L"已导入 GeoTIFF/COG：" << grid_info_.width << L"×"
+        text << L"已导入 GDAL 栅格：" << grid_info_.width << L"×"
              << grid_info_.height << L"，有效节点 "
              << grid_info_.valid_value_count << L"，耗时 " << std::fixed
              << std::setprecision(1) << ms << L" ms";
@@ -5892,13 +5906,13 @@ private:
     }
 
     void import_gdal_contours() {
-        if (!gdal_gpkg_available_) {
-            action_text_ = L"当前构建未启用 GDAL GeoPackage 驱动";
+        if (!gdal_available_) {
+            action_text_ = L"当前构建未启用 GDAL/OGR";
             return;
         }
         const auto file = choose_file(
             false, L"terrain_contours.gpkg",
-            L"GeoPackage (*.gpkg)\0*.gpkg\0所有矢量文件 (*.*)\0*.*\0",
+            L"常用线矢量 (*.gpkg;*.shp;*.geojson;*.json;*.kml)\0*.gpkg;*.shp;*.geojson;*.json;*.kml\0所有 GDAL/OGR 矢量 (*.*)\0*.*\0",
             L"gpkg");
         if (file.empty()) return;
         dt_gdal_contour_load_options options{};
@@ -5912,7 +5926,7 @@ private:
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
         if (status != DT_OK) {
-            action_text_ = L"GeoPackage 等高线导入失败：" + last_error_text();
+            action_text_ = L"GDAL/OGR 等高线导入失败：" + last_error_text();
             return;
         }
         destroy_contour_layer();
@@ -5928,7 +5942,7 @@ private:
         const double ms =
             std::chrono::duration<double, std::milli>(end - begin).count();
         std::wostringstream text;
-        text << L"已导入 GeoPackage 等高线：" << contour_info_.line_count
+        text << L"已导入 GDAL/OGR 等高线：" << contour_info_.line_count
              << L" 条，" << contour_info_.vertex_count << L" 点，耗时 "
              << std::fixed << std::setprecision(1) << ms << L" ms";
         action_text_ = text.str();
@@ -5971,6 +5985,160 @@ private:
         text << L"已导出 GeoPackage 等高线：" << file << L"，耗时 "
              << std::fixed << std::setprecision(1) << ms << L" ms";
         action_text_ = text.str();
+    }
+
+    bool prompt_target_epsg(std::string& target) {
+        double code = 3857.0;
+        if (!prompt_double(hwnd_, L"坐标系重投影",
+                           L"请输入目标 EPSG 代码（例如 3857、4490）：",
+                           code)) {
+            action_text_ = L"已取消重投影";
+            return false;
+        }
+        const double rounded = std::round(code);
+        if (code < 1.0 || code > 9999999.0 ||
+            std::abs(code - rounded) > 1.0e-9) {
+            action_text_ = L"EPSG 代码必须是 1 到 9999999 的整数";
+            return false;
+        }
+        target = "EPSG:" + std::to_string(static_cast<uint32_t>(rounded));
+        return true;
+    }
+
+    void reproject_current_tin() {
+        dt_statistics source_stats{};
+        source_stats.struct_size = sizeof(source_stats);
+        if (dt_get_statistics(mesh_, &source_stats) != DT_OK ||
+            source_stats.vertex_count == 0) {
+            action_text_ = L"没有可重投影的 TIN";
+            return;
+        }
+        if (!gdal_available_) {
+            action_text_ = L"当前构建未启用 GDAL/PROJ";
+            return;
+        }
+        std::string target;
+        if (!prompt_target_epsg(target)) return;
+        dt_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_tin_reproject_gdal(
+            mesh_, target.c_str(), &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"TIN 重投影失败：" + last_error_text();
+            return;
+        }
+        clear_analysis_for_source(ProfileSource::Tin);
+        dt_destroy(mesh_);
+        mesh_ = output;
+        show_tin_ = true;
+        show_grid_ = show_cdt_ = show_contours_ = false;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        dt_statistics result{};
+        result.struct_size = sizeof(result);
+        dt_get_statistics(mesh_, &result);
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream message;
+        message << L"TIN 已重投影到 " << utf8_to_wide(target.c_str())
+                << L"：" << result.vertex_count << L" 点，"
+                << result.finite_triangle_count << L" 面，耗时 "
+                << std::fixed << std::setprecision(1) << ms
+                << L" ms；其他坐标系图层已隐藏";
+        action_text_ = message.str();
+    }
+
+    void reproject_current_grid() {
+        if (!grid_) {
+            action_text_ = L"没有可重投影的 GRID";
+            return;
+        }
+        if (!gdal_available_) {
+            action_text_ = L"当前构建未启用 GDAL/PROJ";
+            return;
+        }
+        std::string target;
+        if (!prompt_target_epsg(target)) return;
+        dt_gdal_reproject_options options{};
+        options.struct_size = sizeof(options);
+        options.target_crs = target.c_str();
+        options.resample_algorithm = DT_GDAL_RESAMPLE_BILINEAR;
+        dt_grid_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status =
+            dt_grid_reproject_gdal(grid_, &options, &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"GRID 重投影失败：" + last_error_text();
+            return;
+        }
+        destroy_grid_layer();
+        grid_ = output;
+        show_grid_ = true;
+        show_tin_ = show_cdt_ = show_contours_ = false;
+        refresh_grid_cache();
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream message;
+        message << L"GRID 已重投影到 " << utf8_to_wide(target.c_str())
+                << L"：" << grid_info_.width << L"×" << grid_info_.height
+                << L"，耗时 " << std::fixed << std::setprecision(1) << ms
+                << L" ms；其他坐标系图层已隐藏";
+        action_text_ = message.str();
+    }
+
+    void reproject_current_contours() {
+        if (!contours_) {
+            action_text_ = L"没有可重投影的等高线";
+            return;
+        }
+        if (!gdal_available_) {
+            action_text_ = L"当前构建未启用 GDAL/PROJ";
+            return;
+        }
+        std::string target;
+        if (!prompt_target_epsg(target)) return;
+        dt_contour_handle output = nullptr;
+        set_wait_cursor(true);
+        const auto begin = std::chrono::steady_clock::now();
+        const dt_status status = dt_contours_reproject_gdal(
+            contours_, target.c_str(), &output);
+        const auto end = std::chrono::steady_clock::now();
+        set_wait_cursor(false);
+        if (status != DT_OK) {
+            action_text_ = L"等高线重投影失败：" + last_error_text();
+            return;
+        }
+        destroy_contour_layer();
+        contours_ = output;
+        contour_info_ = {};
+        contour_info_.struct_size = sizeof(contour_info_);
+        dt_contours_get_info(contours_, &contour_info_);
+        show_contours_ = true;
+        show_tin_ = show_cdt_ = show_grid_ = false;
+        update_layer_menu();
+        enter_2d_view();
+        reset_view();
+        invalidate_mesh_cache();
+        const double ms =
+            std::chrono::duration<double, std::milli>(end - begin).count();
+        std::wostringstream message;
+        message << L"等高线已重投影到 " << utf8_to_wide(target.c_str())
+                << L"：" << contour_info_.line_count << L" 条，"
+                << contour_info_.vertex_count << L" 点，耗时 " << std::fixed
+                << std::setprecision(1) << ms << L" ms；其他坐标系图层已隐藏";
+        action_text_ = message.str();
     }
 
     bool refresh_cdt_constraints() {
@@ -6217,6 +6385,9 @@ private:
         case ID_EXPORT_COG: export_gdal_raster(true); break;
         case ID_IMPORT_GDAL_CONTOURS: import_gdal_contours(); break;
         case ID_EXPORT_GPKG_CONTOURS: export_gdal_contours(); break;
+        case ID_REPROJECT_TIN: reproject_current_tin(); break;
+        case ID_REPROJECT_GRID: reproject_current_grid(); break;
+        case ID_REPROJECT_CONTOURS: reproject_current_contours(); break;
         case ID_IMPORT_CDT: import_cdt_file(); break;
         case ID_EXPORT_CDT: export_cdt_file(); break;
         case ID_CDT_DRAW_BREAKLINE:

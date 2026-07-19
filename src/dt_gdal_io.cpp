@@ -3,6 +3,7 @@
 #include <cpl_conv.h>
 #include <cpl_error.h>
 #include <gdal_priv.h>
+#include <gdalwarper.h>
 #include <ogrsf_frmts.h>
 
 #include <algorithm>
@@ -38,6 +39,15 @@ struct FeatureCloser {
     }
 };
 using FeaturePtr = std::unique_ptr<OGRFeature, FeatureCloser>;
+
+struct CoordinateTransformationCloser {
+    void operator()(OGRCoordinateTransformation* transformation) const noexcept {
+        if (transformation) OCTDestroyCoordinateTransformation(transformation);
+    }
+};
+using CoordinateTransformationPtr =
+    std::unique_ptr<OGRCoordinateTransformation,
+                    CoordinateTransformationCloser>;
 
 std::once_flag g_gdal_once;
 
@@ -98,6 +108,80 @@ GDALDriver* require_driver(const char* name) {
                         std::string("GDAL driver is unavailable: ") + name);
     }
     return driver;
+}
+
+std::unique_ptr<OGRSpatialReference> parse_crs(const char* definition,
+                                                const char* field) {
+    require_name(definition, field);
+    auto reference = std::make_unique<OGRSpatialReference>();
+    if (reference->SetFromUserInput(definition) != OGRERR_NONE) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        std::string("invalid ") + field + ": " + definition);
+    }
+    reference->SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    return reference;
+}
+
+CoordinateTransformationPtr make_transformation(
+    const char* source_definition, const char* target_definition,
+    std::unique_ptr<OGRSpatialReference>& source,
+    std::unique_ptr<OGRSpatialReference>& target) {
+    source = parse_crs(source_definition, "source CRS");
+    target = parse_crs(target_definition, "target CRS");
+    CoordinateTransformationPtr transformation(
+        OGRCreateCoordinateTransformation(source.get(), target.get()));
+    if (!transformation) throw_gdal("cannot create CRS transformation",
+                                    DT_E_INVALID_ARGUMENT);
+    return transformation;
+}
+
+void transform_point_vector(OGRCoordinateTransformation& transformation,
+                            std::vector<dt_point3>& points) {
+    constexpr size_t kBatch = 65536;
+    std::vector<double> x(kBatch), y(kBatch), z(kBatch);
+    std::vector<int> success(kBatch);
+    for (size_t base = 0; base < points.size(); base += kBatch) {
+        const size_t count = std::min(kBatch, points.size() - base);
+        for (size_t i = 0; i < count; ++i) {
+            const dt_point3& point = points[base + i];
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+                !std::isfinite(point.z)) {
+                throw Exception(DT_E_INVALID_ARGUMENT,
+                                "CRS transformation input is not finite");
+            }
+            x[i] = point.x;
+            y[i] = point.y;
+            z[i] = point.z;
+            success[i] = FALSE;
+        }
+        if (!transformation.Transform(static_cast<int>(count), x.data(),
+                                      y.data(), z.data(), success.data())) {
+            throw_gdal("CRS coordinate transformation failed",
+                       DT_E_INVALID_ARGUMENT);
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (!success[i] || !std::isfinite(x[i]) || !std::isfinite(y[i]) ||
+                !std::isfinite(z[i])) {
+                throw Exception(DT_E_INVALID_ARGUMENT,
+                                "CRS coordinate transformation failed for a point");
+            }
+            points[base + i] = {x[i], y[i], z[i]};
+        }
+    }
+}
+
+GDALResampleAlg resample_algorithm(uint32_t value) {
+    switch (value == 0 ? static_cast<uint32_t>(DT_GDAL_RESAMPLE_BILINEAR)
+                       : value) {
+    case DT_GDAL_RESAMPLE_NEAREST: return GRA_NearestNeighbour;
+    case DT_GDAL_RESAMPLE_BILINEAR: return GRA_Bilinear;
+    case DT_GDAL_RESAMPLE_CUBIC: return GRA_Cubic;
+    case DT_GDAL_RESAMPLE_CUBIC_SPLINE: return GRA_CubicSpline;
+    case DT_GDAL_RESAMPLE_LANCZOS: return GRA_Lanczos;
+    default:
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "unsupported GDAL reprojection resample algorithm");
+    }
 }
 
 void set_dataset_spatial_metadata(GDALDataset& dataset, const Grid& grid) {
@@ -189,6 +273,57 @@ bool gdal_driver_available(const char* driver_name) {
     return GetGDALDriverManager()->GetDriverByName(driver_name) != nullptr;
 }
 
+std::string normalize_crs_wkt(const char* definition) {
+    gdal_initialize();
+    auto reference = parse_crs(definition, "CRS definition");
+    char* text = nullptr;
+    if (reference->exportToWkt(&text) != OGRERR_NONE || !text) {
+        throw_gdal("cannot export normalized CRS", DT_E_INVALID_ARGUMENT);
+    }
+    std::string result(text);
+    CPLFree(text);
+    return result;
+}
+
+bool crs_is_same(const char* first, const char* second) {
+    gdal_initialize();
+    auto first_reference = parse_crs(first, "first CRS");
+    auto second_reference = parse_crs(second, "second CRS");
+    const char* options[]{
+        "CRITERION=EQUIVALENT_EXCEPT_AXIS_ORDER_GEOGCRS", nullptr};
+    if (first_reference->IsSame(second_reference.get(), options) != FALSE)
+        return true;
+    return first_reference->IsGeographic() != FALSE &&
+           second_reference->IsGeographic() != FALSE &&
+           first_reference->IsSameGeogCS(second_reference.get()) != FALSE;
+}
+
+void transform_points(const char* source_crs, const char* target_crs,
+                      const dt_point3* input, uint64_t count,
+                      dt_point3* output) {
+    gdal_initialize();
+    if (count != 0 && (!input || !output)) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "CRS point input/output array is null");
+    }
+    if (count > static_cast<uint64_t>(
+                    std::numeric_limits<size_t>::max() / sizeof(dt_point3))) {
+        throw Exception(DT_E_LIMIT_EXCEEDED,
+                        "CRS point count exceeds addressable memory");
+    }
+    std::unique_ptr<OGRSpatialReference> source_reference;
+    std::unique_ptr<OGRSpatialReference> target_reference;
+    auto transformation = make_transformation(
+        source_crs, target_crs, source_reference, target_reference);
+    std::vector<dt_point3> transformed;
+    if (count != 0) transformed.assign(input, input + count);
+    transform_point_vector(*transformation, transformed);
+    if (count != 0) {
+        std::memmove(output, transformed.data(),
+                     static_cast<size_t>(count) * sizeof(dt_point3));
+    }
+}
+
 std::unique_ptr<Grid> grid_load_gdal(
     const char* file_name, const dt_gdal_raster_load_options& options) {
     gdal_initialize();
@@ -273,6 +408,126 @@ void grid_save_gdal(const Grid& grid, const char* file_name,
     if (output->FlushCache() != CE_None) {
         throw_gdal("cannot flush GDAL raster");
     }
+}
+
+std::unique_ptr<Grid> grid_reproject_gdal(
+    const Grid& source, const dt_gdal_reproject_options& options) {
+    gdal_initialize();
+    if (source.crs_wkt().empty()) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "source GRID has no CRS metadata");
+    }
+    const std::string target_wkt = normalize_crs_wkt(options.target_crs);
+    auto source_dataset = create_memory_raster(source);
+    double output_pixel[6]{};
+    int output_width = 0;
+    int output_height = 0;
+    if ((options.flags & DT_GDAL_REPROJECT_EXPLICIT_GRID) != 0) {
+        if (options.width == 0 || options.height == 0 ||
+            options.width > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+            options.height > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "explicit reprojection GRID size is invalid");
+        }
+        for (double value : options.geo_transform) {
+            if (!std::isfinite(value)) {
+                throw Exception(DT_E_INVALID_ARGUMENT,
+                                "explicit reprojection affine is not finite");
+            }
+        }
+        const double determinant =
+            options.geo_transform[1] * options.geo_transform[5] -
+            options.geo_transform[2] * options.geo_transform[4];
+        if (std::abs(determinant) <= 1.0e-18) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "explicit reprojection affine is singular");
+        }
+        output_width = static_cast<int>(options.width);
+        output_height = static_cast<int>(options.height);
+        output_pixel[0] = options.geo_transform[0] -
+                          0.5 * options.geo_transform[1] -
+                          0.5 * options.geo_transform[2];
+        output_pixel[1] = options.geo_transform[1];
+        output_pixel[2] = options.geo_transform[2];
+        output_pixel[3] = options.geo_transform[3] -
+                          0.5 * options.geo_transform[4] -
+                          0.5 * options.geo_transform[5];
+        output_pixel[4] = options.geo_transform[4];
+        output_pixel[5] = options.geo_transform[5];
+    } else {
+        void* transformer = GDALCreateGenImgProjTransformer(
+            source_dataset.get(), source.crs_wkt().c_str(), nullptr,
+            target_wkt.c_str(), FALSE, 0.0, 1);
+        if (!transformer) throw_gdal("cannot prepare GRID reprojection",
+                                     DT_E_INVALID_ARGUMENT);
+        const CPLErr suggested = GDALSuggestedWarpOutput(
+            source_dataset.get(), GDALGenImgProjTransform, transformer,
+            output_pixel, &output_width, &output_height);
+        GDALDestroyGenImgProjTransformer(transformer);
+        if (suggested != CE_None || output_width <= 0 || output_height <= 0) {
+            throw_gdal("cannot derive reprojection output grid",
+                       DT_E_INVALID_ARGUMENT);
+        }
+    }
+
+    GDALDriver* memory_driver = require_driver("MEM");
+    DatasetPtr output_dataset(memory_driver->Create(
+        "", output_width, output_height, 1, GDT_Float64, nullptr));
+    if (!output_dataset) throw_gdal("cannot create reprojection output GRID");
+    if (output_dataset->SetGeoTransform(output_pixel) != CE_None ||
+        output_dataset->SetProjection(target_wkt.c_str()) != CE_None) {
+        throw_gdal("cannot configure reprojection output GRID");
+    }
+    const double output_nodata =
+        options.output_nodata_value != 0.0
+            ? options.output_nodata_value
+            : ((source.flags() & DT_GRID_HAS_NODATA) != 0
+                   ? source.nodata()
+                   : std::numeric_limits<double>::quiet_NaN());
+    GDALRasterBand* output_band = output_dataset->GetRasterBand(1);
+    if (!output_band || output_band->SetNoDataValue(output_nodata) != CE_None ||
+        output_band->Fill(output_nodata) != CE_None) {
+        throw_gdal("cannot initialize reprojection output values");
+    }
+    CPLErrorReset();
+    if (GDALReprojectImage(
+            source_dataset.get(), source.crs_wkt().c_str(),
+            output_dataset.get(), target_wkt.c_str(),
+            resample_algorithm(options.resample_algorithm), 0.0, 0.0,
+            nullptr, nullptr, nullptr) != CE_None) {
+        throw_gdal("GRID reprojection failed", DT_E_INVALID_ARGUMENT);
+    }
+
+    dt_grid_create_options create{};
+    create.struct_size = sizeof(create);
+    create.flags = DT_GRID_HAS_NODATA;
+    create.width = static_cast<uint64_t>(output_width);
+    create.height = static_cast<uint64_t>(output_height);
+    create.geo_transform[0] = output_pixel[0] +
+                              0.5 * output_pixel[1] +
+                              0.5 * output_pixel[2];
+    create.geo_transform[1] = output_pixel[1];
+    create.geo_transform[2] = output_pixel[2];
+    create.geo_transform[3] = output_pixel[3] +
+                              0.5 * output_pixel[4] +
+                              0.5 * output_pixel[5];
+    create.geo_transform[4] = output_pixel[4];
+    create.geo_transform[5] = output_pixel[5];
+    create.nodata_value = output_nodata;
+    auto output = std::make_unique<Grid>(create);
+    output->set_crs_wkt(target_wkt);
+    std::vector<double> row(static_cast<size_t>(output_width));
+    for (int y = 0; y < output_height; ++y) {
+        if (output_band->RasterIO(GF_Read, 0, y, output_width, 1,
+                                  row.data(), output_width, 1, GDT_Float64,
+                                  0, 0, nullptr) != CE_None) {
+            throw_gdal("cannot read reprojected GRID", DT_E_CORRUPTED_DATA);
+        }
+        output->write_window(0, static_cast<uint64_t>(y),
+                             static_cast<uint64_t>(output_width), 1,
+                             row.data(), static_cast<uint64_t>(output_width));
+    }
+    return output;
 }
 
 std::unique_ptr<ContourSet> contours_load_gdal(
@@ -397,6 +652,33 @@ void contours_save_gdal(const ContourSet& contours, const char* file_name,
         layer->RollbackTransaction();
         throw;
     }
+}
+
+std::unique_ptr<ContourSet> contours_reproject_gdal(
+    const ContourSet& source, const char* target_crs) {
+    gdal_initialize();
+    if (source.crs_wkt.empty()) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "source contours have no CRS metadata");
+    }
+    std::unique_ptr<OGRSpatialReference> source_reference;
+    std::unique_ptr<OGRSpatialReference> target_reference;
+    auto transformation = make_transformation(
+        source.crs_wkt.c_str(), target_crs, source_reference,
+        target_reference);
+    auto output = std::make_unique<ContourSet>(source);
+    for (ContourLine& line : output->lines) {
+        transform_point_vector(*transformation, line.points);
+        if (!line.points.empty()) line.elevation = line.points.front().z;
+    }
+    char* target_wkt = nullptr;
+    if (target_reference->exportToWkt(&target_wkt) != OGRERR_NONE ||
+        !target_wkt) {
+        throw_gdal("cannot export target contour CRS", DT_E_INVALID_ARGUMENT);
+    }
+    output->crs_wkt = target_wkt;
+    CPLFree(target_wkt);
+    return output;
 }
 
 } // namespace dt

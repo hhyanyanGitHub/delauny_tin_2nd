@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.40.0"
+VERSION = "0.55.0"
 TODAY = date(2026, 7, 19).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.40.0：GUI 新增 Direct3D 11 分块地形、GPU ID 拾取和 TIN 贴地漫游；v0.37 粗到细渐进视口、v0.36 DGTILE 生命周期管理及全部旧 DLL 接口保持兼容。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.55.0：新增 CRS 规范化、等价判断、批量坐标转换，以及 TIN、GRID、等高线的显式 GDAL/PROJ 重投影；v0.40 Direct3D 分块地形、GPU 拾取和贴地漫游及全部旧 DLL 接口保持兼容。", "gold")
 
 
 def build_developer_manual():
@@ -744,7 +744,7 @@ if (info.state == DT_TASK_SUCCEEDED) {
 dt_task_destroy(task);""")
 
     m.h2("4.7 CRS 与 GDAL 格式交换")
-    m.para("dt_gdal_api.h 是可选适配层。默认 DT_WITH_GDAL=OFF 时函数仍然导出，但返回 DT_E_UNSUPPORTED；启用后可导入导出 GeoTIFF/COG GRID 和 GeoPackage 等高线。TIN、GRID 与等高线的 CRS 以 UTF-8 WKT 保存并在转换时传播，当前不执行坐标重投影。")
+    m.para("dt_gdal_api.h 是可选适配层。默认 DT_WITH_GDAL=OFF 时函数仍然导出，但返回 DT_E_UNSUPPORTED；启用后可通过 GDAL 驱动读写常见单波段地形栅格和 LineString 等高线。TIN、GRID 与等高线的 CRS 以 UTF-8 WKT 保存；v0.55 起可显式执行 CRS 规范化、等价判断、批量点转换和三类地形对象重投影。")
     m.code("""#include "dt_gdal_api.h"
 
 dt_gdal_raster_save_options save{};
@@ -768,7 +768,7 @@ dt_grid_destroy(loaded);""")
         [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
     )
     m.callout("部署", "启用 GDAL 的便携目录必须携带构建目录复制出的 GDAL、PROJ、SQLite、GeoTIFF 等运行时 DLL，以及 DLL 同级 share/proj/proj.db。COG 使用 CreateCopy，会比普通 GTiff 需要更多临时内存/存储。", "gold")
-    m.callout("GUI 集成", "v0.13 的演示程序启动时探测 GTiff、COG、GPKG 驱动，按能力启用五个数据交换菜单。栅格导入只替换 GRID，GeoPackage 导入只替换等高线，普通 TIN、CDT 和无关图层保持不变。", "blue")
+    m.callout("GUI 集成", "演示程序启动时探测 GDAL 及 GTiff、COG、GPKG 写驱动。普通导入仍只替换同类图层；v0.55 的显式重投影替换当前同类图层并隐藏其他坐标系图层，避免误叠加。", "blue")
 
     m.h2("4.8 约束 Delaunay")
     m.para("dt_cdt_api.h 提供独立 dt_cdt_handle。基础点与普通 TIN 相互独立；断裂线只强制成边，外边界和孔洞通过奇偶嵌套层级决定有效域。没有外边界时全部有限面均为有效域。")
@@ -1306,6 +1306,22 @@ dt_task_destroy(task);""")
     m.para("拾取通道把三角形 ID 写入 R32_UINT 离屏目标，只将点击处一个像素复制到 1×1 staging 纹理。贴地漫游把归一化相机目标反算为世界 XY，通过 dt_locate_point_xy() 获得支撑顶点、边或面并作线性高程插值。该策略保证拾取颜色和贴地高度不依赖近似显示 LOD。")
     m.callout("资源边界", "当前 TIN 改变或垂直夸张改变时同步重建全部 GPU 块；尚未实现三维块后台上传、显存 LRU、几何 LOD 与跨块裂缝处理。千万点连续三维仍需后续流式化，二维编辑、分析和导出不受此限制。", "gold")
 
+    m.h2("4.26 CRS 与三类地形对象重投影")
+    m.para("v0.55 的 dt_crs_normalize_wkt() 接受 EPSG:xxxx、WKT、PROJ 字符串等 GDAL user input 并输出规范 WKT；dt_crs_is_same() 用语义等价而不是字符串相等判断坐标系。dt_crs_transform_points() 按传统 GIS XY 轴序分批转换，先在临时缓冲完成全部点，任一点失败都不改写调用方输出。")
+    m.code("""dt_point3 input[] = {{116.0, 40.0, 100.0}};
+dt_point3 output[1]{};
+dt_crs_transform_points("EPSG:4326", "EPSG:3857",
+                        input, 1, output);
+
+dt_gdal_reproject_options opt{};
+opt.struct_size = sizeof(opt);
+opt.target_crs = "EPSG:4490";
+opt.resample_algorithm = DT_GDAL_RESAMPLE_BILINEAR;
+dt_grid_handle projected = nullptr;
+dt_grid_reproject_gdal(source, &opt, &projected);""")
+    m.para("dt_tin_reproject_gdal() 转换全部顶点后在目标平面重新构建 Delaunay；dt_grid_reproject_gdal() 默认用 GDAL 推导北向上输出范围与分辨率，也可用 DT_GDAL_REPROJECT_EXPLICIT_GRID 指定节点中心仿射、宽高和重采样方法；dt_contours_reproject_gdal() 保留折线分组与闭合标志。三个入口都返回独立句柄，源对象保持不变。")
+    m.callout("工程约束", "重投影必须由调用方显式发起，原有 GRID 对齐、土方和转换接口仍不静默改坐标。源对象必须携带有效 CRS；调用方负责确认 XY/Z 单位与目标用途。自动 GRID 输出适合通用交换，工程对齐应使用显式输出网格。", "gold")
+
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
     legacy_rows = [
@@ -1534,7 +1550,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32 演示程序：二维使用 GDI，三维优先使用 Direct3D 11，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、大 GRID 非阻塞视口 LOD、任意多边形 GRID 裁剪/掩膜、错位设计 GRID 显式对齐、现状/设计双 GRID 挖填方、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.40 功能边界", "三维 TIN 按 16,384 面建立 Direct3D 11 块，使用视锥裁剪、深度缓冲、高程光照着色、Ctrl+左键 GPU ID 拾取和 F 键贴地漫游；硬件失败自动尝试 WARP，再失败回退 GDI。二维 GRID 继续按 s4→s2→目标 LOD 渐进发布，并复用内存/DGTILE 瓦片。", "gold")
+    m.callout("0.55 功能边界", "TIN、GRID 与等高线可显式重投影到目标 EPSG；GRID 自动推导北向上目标范围与分辨率，也可由 DLL 调用方指定精确输出仿射。批量点转换采用传统 GIS XY 轴序且失败不改写输出。三维 TIN 继续使用 v0.40 的 Direct3D 分块渲染与 GPU 拾取。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1569,7 +1585,8 @@ def build_gui_manual():
         "打开“地形转换”菜单，依次执行“TIN → GRID”和“从 GRID 生成等高线”，观察三类图层叠加。",
         "继续执行“等高线 → TIN”和“等高线 → GRID”，观察源等高线保留并与近似重建结果叠加。",
         "打开“图层”菜单，分别隐藏和显示 TIN、GRID、等高线，再用“全图”恢复联合范围。",
-        "若当前为 GDAL 构建，执行‘数据交换→导出 GeoTIFF（DEFLATE）’和‘导出 GeoPackage 等高线’，再重新导入检查图层叠加。",
+        "若当前为 GDAL 构建，导入 GeoTIFF/DEM/IMG 或 GPKG/SHP 等常见数据；再分别把 TIN、GRID 或等高线显式重投影到目标 EPSG，程序会隐藏其他坐标系图层。",
+        "执行‘数据交换→导出 GeoTIFF（DEFLATE）’和‘导出 GeoPackage 等高线’，再重新导入检查数据往返。",
         "打开“数据交换→打开约束网 DCDT”，选择 sample_constraints.dcdt，观察孔洞和断裂线。",
         "打开“约束编辑→绘制断裂线”，在画布逐点单击，按 Enter 完成；用 Backspace 撤点、Esc 取消。",
         "选择“移动约束顶点（两次单击）”，第一次单击白色约束顶点使其变黄，第二次单击目标位置；观察红色旧面、黄色边界和绿色新增面/边。",
@@ -1616,7 +1633,7 @@ def build_gui_manual():
         ["菜单", "主要命令"],
         [
             ("地形转换", "TIN/GRID/等高线双向派生，CDT 域内转换，并自动生成等高线。"),
-            ("数据交换", "交换 DGRID、DCONTOUR、DCDT 文本；GDAL 构建还支持 GeoTIFF/COG 与 GeoPackage。"),
+            ("数据交换", "交换 DGRID、DCONTOUR、DCDT；GDAL 构建支持常见栅格/线矢量、GeoTIFF/COG/GPKG 导出，以及 TIN/GRID/等高线 EPSG 重投影。"),
             ("约束编辑", "绘制或批量添加断裂线；移动/安全删除顶点，或删除整条约束。"),
             ("分析", "生成全幅坡度/坡向/阴影专题图并导出；单击分析局部坡面；生成任意 A—B 剖面；逐点圈定多边形并估算面积/土方。"),
             ("图层", "分别显示或隐藏 TIN、GRID、等高线和约束 Delaunay。"),
@@ -1960,8 +1977,9 @@ def build_gui_manual():
     m.callout("格式选择", "大 GRID 本机工作与快速重开优先 DGRIDB；人工检查或简单异构交换用 DGRID 文本；GIS 交换用 GeoTIFF/COG。DGRIDB 写时复制编辑不自动回写源文件，必须显式导出；保存失败不会覆盖已有目标。", "blue")
     m.callout("自动旁车", "DGRIDB 的 .dgridb.dgtile 只缓存浏览过的显示瓦片，不是数据交换文件。复制时可带上以保留热点，也可省略；可用菜单在线压缩，也可关闭程序后直接删除。Windows 会拒绝第二个程序进程同时写同一路径。", "gold")
     m.callout("等高线反向转换", "导入 DCONTOUR 后，可执行‘等高线 → TIN’或‘等高线 → GRID’。GUI 使用原折点和 LINE elevation；输入共线或同一 XY 高程冲突时拒绝转换，原数据保持不变。", "blue")
-    m.h2("8.4 GeoTIFF、COG 与 GeoPackage")
-    m.para("启用 DT_WITH_GDAL 后，数据交换菜单增加五个命令：导入 GeoTIFF/COG、导出 DEFLATE GeoTIFF、导出 Cloud Optimized GeoTIFF、导入 GeoPackage 等高线和导出 GeoPackage 等高线。程序分别探测 GTiff、COG、GPKG 驱动；普通构建或缺少驱动时，相应命令置灰而不是在运行时失败。")
+    m.h2("8.4 GDAL 标准格式与 CRS 重投影")
+    m.para("启用 DT_WITH_GDAL 后，数据交换菜单可打开 GDAL 支持的常见地形栅格（GeoTIFF、DEM、IMG、ASCII Grid、VRT 等）和 OGR 线矢量（GeoPackage、Shapefile、GeoJSON、KML 等），并保留专用的 DEFLATE GeoTIFF、COG 与 GeoPackage 导出。程序探测 GDAL 与具体写驱动；普通构建或缺少驱动时相应命令置灰。")
+    m.para("‘当前 TIN/GRID/等高线重投影到 EPSG’要求源图层已有 CRS，输入整数 EPSG 后生成新对象并替换当前同类图层。为防止不同坐标系误叠加，成功后其他地形图层自动隐藏；需要对照时，应先把所有图层转换到同一 CRS 再逐一开启。GRID 使用双线性重采样和 GDAL 自动输出网格，适合演示与通用交换。")
     m.table(
         ["对象", "导入行为", "导出设置"],
         [
@@ -2075,7 +2093,7 @@ def build_gui_manual():
         "若有大 GRID，连续滚轮缩放、拉框和拖动平移，确认状态栏出现‘异步LOD’进度且旧画面不中断；停止操作后只发布当前视口结果，并核对导出或等高线仍来自完整数据。",
         "把当前 GRID 导出为 DGRIDB 后重新导入，确认状态栏出现写时复制映射、内置概览、多级金字塔、按需块校验缓存和 DGTILE 跨会话瓦片；浏览几个局部后关闭并重开同一文件，确认状态栏出现‘（磁盘）’，执行‘压缩当前 DGTILE 显示缓存’并核对回收统计，再执行‘验证 DGRIDB 数据块’完成正式数据审计。",
         "至少导出一次 DGRID 和 DCONTOUR，并重新导入检查范围和数量。",
-        "若使用 GDAL 构建，确认五个格式菜单已启用；往返一次 GeoTIFF/COG 和 GeoPackage，并检查 TIN/CDT 未被替换。",
+        "若使用 GDAL 构建，确认通用栅格/线矢量、GeoTIFF/COG/GPKG 与三类重投影菜单已启用；验证 EPSG:4326→3857 后范围和 CRS，并往返一次标准格式。",
         "从导入的等高线反向生成一次 TIN 和 GRID，确认源等高线仍可叠加显示。",
         "打开 sample_constraints.dcdt，隐藏普通 TIN 后确认孔洞为空、三类约束颜色正确。",
         "从 TIN 创建空约束网，批量添加 12 条示例断裂线并记录状态栏事务耗时。",
@@ -2094,9 +2112,6 @@ def build_gui_manual():
     ):
         m.bullet(text)
     m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID → 流式导出并重开 DGRIDB，观察映射/内置概览/金字塔/按需块校验缓存 → 连续缩放并观察异步进度与瓦片LOD → 关闭并重开同一 DGRIDB，观察复用计数后的‘（磁盘）’ → 水平平移约一个瓦片宽度，观察多数瓦片继续复用 → 主动验证 DGRIDB 全部数据块 → 等高线 → 圈定多边形并作紧凑 GRID 裁剪/掩膜 → 打开错位设计 GRID → 双线性显式对齐 → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
-    m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付 2D 浏览、Direct3D 11 分块 3D/GPU 拾取/TIN 贴地漫游、DGRIDB 映射/金字塔、二维瓦片目录、DGTILE 跨会话缓存/在线压缩/跨进程单写保护、跨级渐进视口，以及 GRID 裁剪、重采样、双表面土方、地形专题、局部坡面、剖面、量测、格式交换和约束编辑。后续重点是三维块 LOD/后台上传/显存 LRU、显式重投影、DGTILE 自动清理和局部 CDT 更新。")
-
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)
     return path

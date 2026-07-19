@@ -347,6 +347,104 @@ dt_status DT_CALL dt_gdal_is_driver_available(const char* driver_name,
     });
 }
 
+dt_status DT_CALL dt_crs_normalize_wkt(
+    const char* crs_definition, char* buffer, size_t buffer_size,
+    size_t* required_size) {
+    return guarded([&] {
+#if DT_WITH_GDAL
+        const std::string normalized = dt::normalize_crs_wkt(crs_definition);
+        const dt_status status = copy_utf8_string(
+            normalized, buffer, buffer_size, required_size);
+        if (status != DT_OK) {
+            throw dt::Exception(status, "CRS output buffer is too small");
+        }
+#else
+        (void)crs_definition;
+        (void)buffer;
+        (void)buffer_size;
+        (void)required_size;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_crs_is_same(const char* first_crs,
+                                 const char* second_crs,
+                                 int32_t* output_same) {
+    if (output_same) *output_same = 0;
+    return guarded([&] {
+        if (!output_same) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_same is null");
+        }
+#if DT_WITH_GDAL
+        *output_same = dt::crs_is_same(first_crs, second_crs) ? 1 : 0;
+#else
+        (void)first_crs;
+        (void)second_crs;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_crs_transform_points(
+    const char* source_crs, const char* target_crs,
+    const dt_point3* input_points, uint64_t point_count,
+    dt_point3* output_points) {
+    return guarded([&] {
+#if DT_WITH_GDAL
+        dt::transform_points(source_crs, target_crs, input_points,
+                             point_count, output_points);
+#else
+        (void)source_crs;
+        (void)target_crs;
+        (void)input_points;
+        (void)point_count;
+        (void)output_points;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_tin_reproject_gdal(
+    dt_handle source, const char* target_crs, dt_handle* output_tin) {
+    if (output_tin) *output_tin = nullptr;
+    return guarded([&] {
+        if (!output_tin) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_tin is null");
+        }
+#if DT_WITH_GDAL
+        dt::Context& source_context = require_context(source);
+        const std::string source_crs = source_context.crs_wkt();
+        if (source_crs.empty()) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "source TIN has no CRS metadata");
+        }
+        std::vector<dt_point3> points = source_context.points();
+        if (points.empty()) {
+            throw dt::Exception(DT_E_EMPTY,
+                                "source TIN is empty");
+        }
+        std::vector<dt_point3> transformed(points.size());
+        dt::transform_points(source_crs.c_str(), target_crs, points.data(),
+                             points.size(), transformed.data());
+        auto result = std::make_unique<dt_context_t>();
+        result->context->build(transformed.data(), transformed.size(), nullptr);
+        result->context->set_crs_wkt(dt::normalize_crs_wkt(target_crs));
+        *output_tin = result.release();
+#else
+        (void)source;
+        (void)target_crs;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
 dt_status DT_CALL dt_grid_load_gdal_raster(
     const char* utf8_file_name, const dt_gdal_raster_load_options* options,
     dt_grid_handle* output_grid) {
@@ -390,6 +488,32 @@ dt_status DT_CALL dt_grid_save_gdal_raster(
         (void)grid;
         (void)utf8_file_name;
         (void)actual;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_grid_reproject_gdal(
+    dt_grid_handle source, const dt_gdal_reproject_options* options,
+    dt_grid_handle* output_grid) {
+    if (output_grid) *output_grid = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_gdal_reproject_options");
+        if (!output_grid) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_grid is null");
+        }
+        if ((options->flags & ~DT_GDAL_REPROJECT_EXPLICIT_GRID) != 0) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "unsupported GRID reprojection flags");
+        }
+#if DT_WITH_GDAL
+        auto result = std::make_unique<dt_grid_t>();
+        result->grid = dt::grid_reproject_gdal(require_grid(source), *options);
+        *output_grid = result.release();
+#else
+        (void)source;
         throw dt::Exception(DT_E_UNSUPPORTED,
                             "dterrain was built without GDAL support");
 #endif
@@ -441,6 +565,29 @@ dt_status DT_CALL dt_contours_save_gdal_vector(
         (void)contours;
         (void)utf8_file_name;
         (void)actual;
+        throw dt::Exception(DT_E_UNSUPPORTED,
+                            "dterrain was built without GDAL support");
+#endif
+    });
+}
+
+dt_status DT_CALL dt_contours_reproject_gdal(
+    dt_contour_handle source, const char* target_crs,
+    dt_contour_handle* output_contours) {
+    if (output_contours) *output_contours = nullptr;
+    return guarded([&] {
+        if (!output_contours) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_contours is null");
+        }
+#if DT_WITH_GDAL
+        auto result = std::make_unique<dt_contour_set_t>();
+        result->contours = dt::contours_reproject_gdal(
+            require_contours(source), target_crs);
+        *output_contours = result.release();
+#else
+        (void)source;
+        (void)target_crs;
         throw dt::Exception(DT_E_UNSUPPORTED,
                             "dterrain was built without GDAL support");
 #endif

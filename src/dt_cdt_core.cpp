@@ -9,10 +9,14 @@
 #include <CGAL/Triangulation_vertex_base_with_info_2.h>
 #include <CGAL/number_utils.h>
 
+#include <boost/geometry.hpp>
+#include <boost/geometry/index/rtree.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <list>
@@ -22,6 +26,8 @@
 #include <set>
 #include <sstream>
 #include <tuple>
+#include <cstring>
+#include <cstdint>
 #include <utility>
 
 namespace dt {
@@ -52,6 +58,22 @@ using BarrierKey = std::pair<dt_vertex_id, dt_vertex_id>;
 using PointKey = std::tuple<double, double, double>;
 using TriangleKey = std::array<PointKey, 3>;
 using GeometryEdgeKey = std::pair<PointKey, PointKey>;
+namespace bg = boost::geometry;
+namespace bgi = boost::geometry::index;
+using IndexPoint = bg::model::point<double, 2, bg::cs::cartesian>;
+using IndexBox = bg::model::box<IndexPoint>;
+
+struct ConstraintSegmentRef {
+    size_t constraint_index = 0;
+    size_t segment_index = 0;
+    dt_point3 a{};
+    dt_point3 b{};
+};
+
+struct SegmentCut {
+    double t = 0.0;
+    dt_point3 point{};
+};
 
 bool finite_value(double value) {
     return std::isfinite(value) != 0;
@@ -86,6 +108,156 @@ bool valid_constraint_kind(int32_t kind) {
     return kind == DT_CONSTRAINT_BREAKLINE ||
            kind == DT_CONSTRAINT_OUTER_BOUNDARY ||
            kind == DT_CONSTRAINT_HOLE_BOUNDARY;
+}
+
+bool valid_crossing_policy(int32_t policy) {
+    return policy == DT_CDT_CROSSING_REJECT ||
+           policy == DT_CDT_CROSSING_SPLIT_COMPATIBLE_Z;
+}
+
+std::vector<CdtConstraint> node_constraint_crossings(
+    const std::vector<dt_point3>& base_points,
+    const std::vector<CdtConstraint>& input, double z_tolerance) {
+    std::vector<CdtConstraint> result = input;
+    std::vector<ConstraintSegmentRef> segments;
+    std::vector<std::pair<IndexBox, size_t>> indexed;
+    for (size_t ci = 0; ci < input.size(); ++ci) {
+        const auto& constraint = input[ci];
+        const size_t count = constraint.points.size();
+        if (count < 2) continue;
+        const size_t segment_count = count - 1 +
+            ((constraint.flags & DT_CONSTRAINT_CLOSED) ? 1 : 0);
+        for (size_t si = 0; si < segment_count; ++si) {
+            const auto a = constraint.points[si % count];
+            const auto b = constraint.points[(si + 1) % count];
+            const size_t index = segments.size();
+            segments.push_back({ci, si, a, b});
+            indexed.push_back({IndexBox(
+                IndexPoint(std::min(a.x, b.x), std::min(a.y, b.y)),
+                IndexPoint(std::max(a.x, b.x), std::max(a.y, b.y))), index});
+        }
+    }
+
+    bgi::rtree<std::pair<IndexBox, size_t>, bgi::quadratic<16>> tree(
+        indexed.begin(), indexed.end());
+    std::vector<std::vector<SegmentCut>> cuts(segments.size());
+    std::map<std::pair<double, double>, double> base_z;
+    for (const auto& point : base_points)
+        base_z.emplace(std::make_pair(point.x, point.y), point.z);
+
+    constexpr double endpoint_epsilon = 1e-12;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        std::vector<std::pair<IndexBox, size_t>> candidates;
+        tree.query(bgi::intersects(indexed[i].first),
+                   std::back_inserter(candidates));
+        const auto& lhs = segments[i];
+        const Kernel::Segment_2 left(Kernel::Point_2(lhs.a.x, lhs.a.y),
+                                     Kernel::Point_2(lhs.b.x, lhs.b.y));
+        for (const auto& candidate : candidates) {
+            const size_t j = candidate.second;
+            if (j <= i) continue;
+            const auto& rhs = segments[j];
+            const Kernel::Segment_2 right(Kernel::Point_2(rhs.a.x, rhs.a.y),
+                                          Kernel::Point_2(rhs.b.x, rhs.b.y));
+            if (!CGAL::do_intersect(left, right)) continue;
+
+            const double rx = lhs.b.x - lhs.a.x;
+            const double ry = lhs.b.y - lhs.a.y;
+            const double sx = rhs.b.x - rhs.a.x;
+            const double sy = rhs.b.y - rhs.a.y;
+            const double denominator = rx * sy - ry * sx;
+            const double scale = std::max({1.0, std::abs(rx), std::abs(ry),
+                                           std::abs(sx), std::abs(sy)});
+            if (std::abs(denominator) <=
+                32.0 * std::numeric_limits<double>::epsilon() * scale * scale) {
+                const bool shared_endpoint =
+                    same_xy(lhs.a, rhs.a) || same_xy(lhs.a, rhs.b) ||
+                    same_xy(lhs.b, rhs.a) || same_xy(lhs.b, rhs.b);
+                const auto interior = [](const Kernel::Segment_2& segment,
+                                         const Kernel::Point_2& point) {
+                    return segment.has_on(point) && point != segment.source() &&
+                           point != segment.target();
+                };
+                if (!shared_endpoint || interior(left, right.source()) ||
+                    interior(left, right.target()) ||
+                    interior(right, left.source()) ||
+                    interior(right, left.target())) {
+                    throw Exception(DT_E_UNSUPPORTED,
+                                    "overlapping constraint segments are not supported");
+                }
+                continue;
+            }
+
+            const double qpx = rhs.a.x - lhs.a.x;
+            const double qpy = rhs.a.y - lhs.a.y;
+            double t = (qpx * sy - qpy * sx) / denominator;
+            double u = (qpx * ry - qpy * rx) / denominator;
+            t = std::clamp(t, 0.0, 1.0);
+            u = std::clamp(u, 0.0, 1.0);
+            const bool lhs_interior = t > endpoint_epsilon &&
+                                      t < 1.0 - endpoint_epsilon;
+            const bool rhs_interior = u > endpoint_epsilon &&
+                                      u < 1.0 - endpoint_epsilon;
+            if (!lhs_interior && !rhs_interior) continue;
+
+            dt_point3 point{lhs.a.x + t * rx, lhs.a.y + t * ry, 0.0};
+            const double lhs_z = lhs.a.z + t * (lhs.b.z - lhs.a.z);
+            const double rhs_z = rhs.a.z + u * (rhs.b.z - rhs.a.z);
+            if (std::abs(lhs_z - rhs_z) > z_tolerance) {
+                throw Exception(DT_E_INVALID_ARGUMENT,
+                                "crossing constraint Z values exceed tolerance");
+            }
+            point.z = 0.5 * (lhs_z + rhs_z);
+            if (!lhs_interior) point = t <= endpoint_epsilon ? lhs.a : lhs.b;
+            if (!rhs_interior) point = u <= endpoint_epsilon ? rhs.a : rhs.b;
+            const auto base = base_z.find({point.x, point.y});
+            if (base != base_z.end()) {
+                if (std::abs(base->second - point.z) > z_tolerance) {
+                    throw Exception(DT_E_INVALID_ARGUMENT,
+                                    "crossing Z conflicts with a base point");
+                }
+                point.z = base->second;
+            }
+            if (lhs_interior) cuts[i].push_back({t, point});
+            if (rhs_interior) cuts[j].push_back({u, point});
+        }
+    }
+
+    std::vector<std::vector<std::vector<SegmentCut>>> grouped(result.size());
+    for (size_t ci = 0; ci < result.size(); ++ci) {
+        const size_t n = result[ci].points.size();
+        grouped[ci].resize(n - 1 +
+            ((result[ci].flags & DT_CONSTRAINT_CLOSED) ? 1 : 0));
+    }
+    for (size_t i = 0; i < segments.size(); ++i)
+        grouped[segments[i].constraint_index][segments[i].segment_index] =
+            std::move(cuts[i]);
+
+    for (size_t ci = 0; ci < result.size(); ++ci) {
+        const auto original = result[ci].points;
+        const size_t n = original.size();
+        const bool closed = (result[ci].flags & DT_CONSTRAINT_CLOSED) != 0;
+        std::vector<dt_point3> noded;
+        noded.reserve(n);
+        const size_t segment_count = n - 1 + (closed ? 1 : 0);
+        for (size_t si = 0; si < segment_count; ++si) {
+            if (si == 0) noded.push_back(original[0]);
+            auto& segment_cuts = grouped[ci][si];
+            std::sort(segment_cuts.begin(), segment_cuts.end(),
+                      [](const SegmentCut& a, const SegmentCut& b) {
+                          return a.t < b.t;
+                      });
+            for (const auto& cut : segment_cuts) {
+                if (!same_xy(noded.back(), cut.point)) noded.push_back(cut.point);
+            }
+            const auto& end = original[(si + 1) % n];
+            if (!closed || si + 1 < segment_count) {
+                if (!same_xy(noded.back(), end)) noded.push_back(end);
+            }
+        }
+        result[ci].points = std::move(noded);
+    }
+    return result;
 }
 
 void assign_constraint_geometry(CdtConstraint& constraint, uint32_t flags,
@@ -258,6 +430,155 @@ void read_value(std::istream& stream, T& value, const char* message) {
     if (!(stream >> value)) throw Exception(DT_E_CORRUPTED_DATA, message);
 }
 
+constexpr size_t kCdtBinaryHeaderSize = 4096;
+constexpr size_t kCdtBinaryCrsOffset = 256;
+constexpr size_t kCdtBinaryDirectoryRecordSize = 64;
+constexpr uint32_t kCdtBinaryVersion = 1;
+constexpr uint32_t kCdtBinaryEndian = 0x01020304U;
+constexpr char kCdtBinaryMagic[8] = {'D', 'C', 'D', 'T', 'B', '1', '\0', '\0'};
+
+template <class T>
+void binary_store(std::array<unsigned char, kCdtBinaryHeaderSize>& header,
+                  size_t offset, const T& value) {
+    if (offset > header.size() || sizeof(T) > header.size() - offset)
+        throw Exception(DT_E_INTERNAL, "DCDTB header overflow");
+    std::memcpy(header.data() + offset, &value, sizeof(T));
+}
+
+template <class T>
+T binary_load(const std::array<unsigned char, kCdtBinaryHeaderSize>& header,
+              size_t offset) {
+    if (offset > header.size() || sizeof(T) > header.size() - offset)
+        throw Exception(DT_E_CORRUPTED_DATA, "invalid DCDTB header");
+    T value{};
+    std::memcpy(&value, header.data() + offset, sizeof(T));
+    return value;
+}
+
+uint64_t checked_add(uint64_t a, uint64_t b, const char* message) {
+    if (b > std::numeric_limits<uint64_t>::max() - a)
+        throw Exception(DT_E_LIMIT_EXCEEDED, message);
+    return a + b;
+}
+
+uint64_t checked_mul(uint64_t a, uint64_t b, const char* message) {
+    if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a)
+        throw Exception(DT_E_LIMIT_EXCEEDED, message);
+    return a * b;
+}
+
+uint64_t fnv_update(uint64_t hash, const void* data, size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+struct BinaryCdtMetadata {
+    uint64_t file_size = 0;
+    uint64_t base_count = 0;
+    uint64_t constraint_count = 0;
+    uint64_t next_constraint_id = 1;
+    uint64_t base_offset = 0;
+    uint64_t directory_offset = 0;
+    uint64_t constraint_points_offset = 0;
+    uint64_t crs_length = 0;
+    uint64_t payload_hash = 0;
+    uint64_t total_constraint_points = 0;
+    std::string crs;
+};
+
+BinaryCdtMetadata read_binary_metadata(std::ifstream& input) {
+    std::array<unsigned char, kCdtBinaryHeaderSize> header{};
+    input.read(reinterpret_cast<char*>(header.data()),
+               static_cast<std::streamsize>(header.size()));
+    if (!input) throw Exception(DT_E_CORRUPTED_DATA, "truncated DCDTB header");
+    if (std::memcmp(header.data(), kCdtBinaryMagic, sizeof(kCdtBinaryMagic)) != 0 ||
+        binary_load<uint32_t>(header, 8) != kCdtBinaryVersion ||
+        binary_load<uint32_t>(header, 12) != kCdtBinaryEndian ||
+        binary_load<uint64_t>(header, 16) != kCdtBinaryHeaderSize) {
+        throw Exception(DT_E_CORRUPTED_DATA, "unsupported DCDTB header");
+    }
+    BinaryCdtMetadata metadata;
+    metadata.file_size = binary_load<uint64_t>(header, 24);
+    metadata.base_count = binary_load<uint64_t>(header, 32);
+    metadata.constraint_count = binary_load<uint64_t>(header, 40);
+    metadata.next_constraint_id = binary_load<uint64_t>(header, 48);
+    metadata.base_offset = binary_load<uint64_t>(header, 56);
+    metadata.directory_offset = binary_load<uint64_t>(header, 64);
+    metadata.constraint_points_offset = binary_load<uint64_t>(header, 72);
+    metadata.crs_length = binary_load<uint64_t>(header, 80);
+    metadata.payload_hash = binary_load<uint64_t>(header, 88);
+    metadata.total_constraint_points = binary_load<uint64_t>(header, 96);
+    if (metadata.base_count > kMaxLoadPoints ||
+        metadata.constraint_count > kMaxLoadConstraints ||
+        metadata.total_constraint_points > kMaxLoadConstraintPoints ||
+        metadata.crs_length > kCdtBinaryHeaderSize - kCdtBinaryCrsOffset ||
+        metadata.base_offset != kCdtBinaryHeaderSize) {
+        throw Exception(DT_E_CORRUPTED_DATA, "invalid DCDTB metadata limits");
+    }
+    const uint64_t base_bytes = checked_mul(metadata.base_count,
+                                            sizeof(dt_point3),
+                                            "DCDTB base point array is too large");
+    const uint64_t directory_bytes = checked_mul(
+        metadata.constraint_count, kCdtBinaryDirectoryRecordSize,
+        "DCDTB directory is too large");
+    const uint64_t constraint_bytes = checked_mul(
+        metadata.total_constraint_points, sizeof(dt_point3),
+        "DCDTB constraint point array is too large");
+    if (metadata.directory_offset != metadata.base_offset + base_bytes ||
+        metadata.constraint_points_offset !=
+            metadata.directory_offset + directory_bytes ||
+        metadata.file_size != metadata.constraint_points_offset +
+                                  constraint_bytes) {
+        throw Exception(DT_E_CORRUPTED_DATA, "invalid DCDTB section offsets");
+    }
+    input.seekg(0, std::ios::end);
+    const auto actual_size = input.tellg();
+    if (actual_size < 0 || static_cast<uint64_t>(actual_size) != metadata.file_size)
+        throw Exception(DT_E_CORRUPTED_DATA, "DCDTB file size mismatch");
+    metadata.crs.assign(
+        reinterpret_cast<const char*>(header.data() + kCdtBinaryCrsOffset),
+        static_cast<size_t>(metadata.crs_length));
+    return metadata;
+}
+
+dt_cdt_binary_index_entry read_binary_directory_entry(std::ifstream& input) {
+    std::array<unsigned char, kCdtBinaryDirectoryRecordSize> record{};
+    input.read(reinterpret_cast<char*>(record.data()),
+               static_cast<std::streamsize>(record.size()));
+    if (!input)
+        throw Exception(DT_E_CORRUPTED_DATA, "truncated DCDTB directory");
+    dt_cdt_binary_index_entry entry{};
+    entry.struct_size = sizeof(entry);
+    std::memcpy(&entry.id, record.data(), sizeof(entry.id));
+    std::memcpy(&entry.kind, record.data() + 8, sizeof(entry.kind));
+    std::memcpy(&entry.flags, record.data() + 12, sizeof(entry.flags));
+    std::memcpy(&entry.point_count, record.data() + 16,
+                sizeof(entry.point_count));
+    std::memcpy(&entry.point_offset, record.data() + 24,
+                sizeof(entry.point_offset));
+    std::memcpy(&entry.bounds, record.data() + 32, sizeof(entry.bounds));
+    if (entry.id == 0 || !valid_constraint_kind(entry.kind) ||
+        (entry.flags & ~DT_CONSTRAINT_CLOSED) != 0 ||
+        entry.point_count < ((entry.flags & DT_CONSTRAINT_CLOSED) ? 3u : 2u) ||
+        entry.point_count > kMaxLoadConstraintPoints ||
+        !finite_value(entry.bounds.xmin) || !finite_value(entry.bounds.ymin) ||
+        !finite_value(entry.bounds.xmax) || !finite_value(entry.bounds.ymax) ||
+        entry.bounds.xmin > entry.bounds.xmax ||
+        entry.bounds.ymin > entry.bounds.ymax) {
+        throw Exception(DT_E_CORRUPTED_DATA, "invalid DCDTB directory entry");
+    }
+    return entry;
+}
+
+bool bounds_intersect(const dt_bounds2& a, const dt_bounds2& b) {
+    return a.xmin <= b.xmax && a.xmax >= b.xmin &&
+           a.ymin <= b.ymax && a.ymax >= b.ymin;
+}
+
 } // namespace
 
 struct CdtContext::State {
@@ -269,22 +590,39 @@ struct CdtContext::State {
     uint64_t generation = 0;
     uint64_t constrained_edge_count = 0;
     uint64_t domain_triangle_count = 0;
+    dt_vertex_id next_vertex_id = 1;
     bool has_outer_boundary = false;
     dt_bounds2 bounds{};
     std::string crs_wkt;
 };
 
-CdtContext::CdtContext() : state_(std::make_unique<State>()) {}
+CdtContext::CdtContext(const dt_cdt_options* options)
+    : state_(std::make_unique<State>()) {
+    if (options) {
+        if (!valid_crossing_policy(options->crossing_policy) ||
+            !finite_value(options->crossing_z_tolerance) ||
+            options->crossing_z_tolerance < 0.0) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "invalid CDT crossing policy options");
+        }
+        crossing_policy_ = options->crossing_policy;
+        crossing_z_tolerance_ = options->crossing_z_tolerance;
+    }
+}
 CdtContext::~CdtContext() = default;
 
 std::unique_ptr<CdtContext::State> CdtContext::make_state(
     const std::vector<dt_point3>& base_points,
     const std::vector<CdtConstraint>& constraints,
     dt_constraint_id next_constraint_id, uint64_t generation,
-    const std::string& crs_wkt) {
+    const std::string& crs_wkt, int32_t crossing_policy,
+    double crossing_z_tolerance) {
     auto next = std::make_unique<State>();
     next->base_points = base_points;
-    next->constraints = constraints;
+    next->constraints = crossing_policy == DT_CDT_CROSSING_SPLIT_COMPATIBLE_Z
+        ? node_constraint_crossings(base_points, constraints,
+                                    crossing_z_tolerance)
+        : constraints;
     next->next_constraint_id = next_constraint_id;
     next->generation = generation;
     next->crs_wkt = crs_wkt;
@@ -311,7 +649,7 @@ std::unique_ptr<CdtContext::State> CdtContext::make_state(
     for (const auto& point : base_points) register_point(point, true);
     bool has_hole = false;
     std::set<dt_constraint_id> constraint_ids;
-    for (const auto& constraint : constraints) {
+    for (const auto& constraint : next->constraints) {
         if (constraint.id == 0 || !constraint_ids.insert(constraint.id).second) {
             throw Exception(DT_E_CORRUPTED_DATA,
                             "invalid or duplicate CDT constraint id");
@@ -360,7 +698,7 @@ std::unique_ptr<CdtContext::State> CdtContext::make_state(
     }
 
     try {
-        for (const auto& constraint : constraints) {
+        for (const auto& constraint : next->constraints) {
             const size_t count = constraint.points.size();
             const size_t segment_count =
                 count - 1 + ((constraint.flags & DT_CONSTRAINT_CLOSED) ? 1 : 0);
@@ -379,7 +717,7 @@ std::unique_ptr<CdtContext::State> CdtContext::make_state(
     }
 
     std::vector<Kernel::Segment_2> domain_segments;
-    for (const auto& constraint : constraints) {
+    for (const auto& constraint : next->constraints) {
         if (constraint.kind == DT_CONSTRAINT_BREAKLINE) continue;
         const size_t count = constraint.points.size();
         for (size_t i = 0; i < count; ++i) {
@@ -420,6 +758,79 @@ std::unique_ptr<CdtContext::State> CdtContext::make_state(
             next->bounds.ymin = std::min(next->bounds.ymin, item.first.second);
             next->bounds.xmax = std::max(next->bounds.xmax, item.first.first);
             next->bounds.ymax = std::max(next->bounds.ymax, item.first.second);
+        }
+    }
+    next->next_vertex_id = next_vertex_id;
+    return next;
+}
+
+std::unique_ptr<CdtContext::State> CdtContext::make_local_add_state(
+    const State& current, const CdtConstraint& constraint,
+    uint64_t generation) {
+    const bool closed = (constraint.flags & DT_CONSTRAINT_CLOSED) != 0;
+    if (constraint.points.size() < (closed ? 3u : 2u)) {
+        throw Exception(DT_E_INVALID_ARGUMENT,
+                        "constraint has too few distinct points");
+    }
+    for (size_t i = 1; i < constraint.points.size(); ++i) {
+        if (same_xy(constraint.points[i - 1], constraint.points[i])) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "constraint contains a zero-length segment");
+        }
+    }
+    auto next = std::make_unique<State>(current);
+    const bool had_vertices = current.triangulation.number_of_vertices() != 0;
+    next->generation = generation;
+    for (const auto& point : constraint.points) {
+        validate_point(point);
+        const auto handle = next->triangulation.insert(
+            Kernel::Point_2(point.x, point.y));
+        if (handle->info().id == 0) {
+            handle->info() = VertexInfo{next->next_vertex_id++, point.z};
+        } else if (!compatible_z(handle->info().z, point.z)) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "shared constraint point has inconsistent Z");
+        }
+    }
+    try {
+        const size_t count = constraint.points.size();
+        const size_t segment_count = count - 1 +
+            ((constraint.flags & DT_CONSTRAINT_CLOSED) ? 1 : 0);
+        for (size_t i = 0; i < segment_count; ++i) {
+            const auto& a = constraint.points[i % count];
+            const auto& b = constraint.points[(i + 1) % count];
+            const auto va = next->triangulation.insert(Kernel::Point_2(a.x, a.y));
+            const auto vb = next->triangulation.insert(Kernel::Point_2(b.x, b.y));
+            next->triangulation.insert_constraint(va, vb);
+        }
+    } catch (const Cdt::Intersection_of_constraints_exception&) {
+        throw Exception(DT_E_UNSUPPORTED,
+                        "intersecting constraint segments are not supported; "
+                        "enable the split crossing policy or pre-node them");
+    }
+    next->constraints.push_back(constraint);
+    next->constrained_edge_count = 0;
+    for (auto edge = next->triangulation.constrained_edges_begin();
+         edge != next->triangulation.constrained_edges_end(); ++edge)
+        ++next->constrained_edge_count;
+    next->domain_triangle_count = 0;
+    if (next->triangulation.dimension() == 2) {
+        mark_domains(*next);
+        for (auto face = next->triangulation.finite_faces_begin();
+             face != next->triangulation.finite_faces_end(); ++face) {
+            if (domain_face(*next, face)) ++next->domain_triangle_count;
+        }
+    }
+    bool first = !had_vertices;
+    for (const auto& point : constraint.points) {
+        if (first) {
+            next->bounds = {point.x, point.y, point.x, point.y};
+            first = false;
+        } else {
+            next->bounds.xmin = std::min(next->bounds.xmin, point.x);
+            next->bounds.ymin = std::min(next->bounds.ymin, point.y);
+            next->bounds.xmax = std::max(next->bounds.xmax, point.x);
+            next->bounds.ymax = std::max(next->bounds.ymax, point.y);
         }
     }
     return next;
@@ -480,7 +891,10 @@ std::unique_ptr<EditData> CdtContext::make_edit_data(
 
 void CdtContext::clear() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    state_ = make_state({}, {}, 1, state_->generation + 1, state_->crs_wkt);
+    state_ = make_state({}, {}, 1, state_->generation + 1, state_->crs_wkt,
+                        crossing_policy_, crossing_z_tolerance_);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
 }
 
 void CdtContext::build(const dt_point3* points, uint64_t count) {
@@ -494,8 +908,11 @@ void CdtContext::build(const dt_point3* points, uint64_t count) {
     if (count > 0) copied.assign(points, points + count);
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto next = make_state(copied, {}, 1, state_->generation + 1,
-                           state_->crs_wkt);
+                           state_->crs_wkt, crossing_policy_,
+                           crossing_z_tolerance_);
     state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
 }
 
 void CdtContext::build_from_tin(std::vector<dt_point3> points,
@@ -504,8 +921,11 @@ void CdtContext::build_from_tin(std::vector<dt_point3> points,
         throw Exception(DT_E_LIMIT_EXCEEDED, "too many CDT base points");
     }
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    auto next = make_state(points, {}, 1, state_->generation + 1, crs_wkt);
+    auto next = make_state(points, {}, 1, state_->generation + 1, crs_wkt,
+                           crossing_policy_, crossing_z_tolerance_);
     state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
 }
 
 dt_constraint_id CdtContext::add_constraint(int32_t kind, uint32_t flags,
@@ -519,16 +939,36 @@ dt_constraint_id CdtContext::add_constraint(int32_t kind, uint32_t flags,
     assign_constraint_geometry(constraint, flags, points, count);
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (state_->constraints.size() >= kMaxLoadConstraints) {
+        throw Exception(DT_E_LIMIT_EXCEEDED, "too many CDT constraints");
+    }
     constraint.id = state_->next_constraint_id;
     if (constraint.id == 0 || constraint.id ==
                                   std::numeric_limits<dt_constraint_id>::max()) {
         throw Exception(DT_E_LIMIT_EXCEEDED, "constraint id space exhausted");
     }
-    auto constraints = state_->constraints;
-    constraints.push_back(constraint);
-    auto next = make_state(state_->base_points, constraints, constraint.id + 1,
-                           state_->generation + 1, state_->crs_wkt);
+    std::unique_ptr<State> next;
+    if (kind == DT_CONSTRAINT_BREAKLINE &&
+        crossing_policy_ == DT_CDT_CROSSING_REJECT) {
+        next = make_local_add_state(*state_, constraint,
+                                    state_->generation + 1);
+        next->next_constraint_id = constraint.id + 1;
+    } else {
+        auto constraints = state_->constraints;
+        constraints.push_back(constraint);
+        next = make_state(state_->base_points, constraints, constraint.id + 1,
+                          state_->generation + 1, state_->crs_wkt,
+                          crossing_policy_, crossing_z_tolerance_);
+    }
     state_.swap(next);
+    if (kind == DT_CONSTRAINT_BREAKLINE &&
+        crossing_policy_ == DT_CDT_CROSSING_REJECT) {
+        ++local_topology_edit_count_;
+        last_edit_mode_ = DT_CDT_EDIT_MODE_LOCAL_TOPOLOGY;
+    } else {
+        ++full_rebuild_count_;
+        last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
+    }
     return constraint.id;
 }
 
@@ -549,9 +989,12 @@ std::unique_ptr<EditData> CdtContext::update_constraint(
 
     auto next = make_state(state_->base_points, constraints,
                            state_->next_constraint_id, state_->generation + 1,
-                           state_->crs_wkt);
+                           state_->crs_wkt, crossing_policy_,
+                           crossing_z_tolerance_);
     auto effect = capture_effect ? make_edit_data(*state_, *next) : nullptr;
     state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
     return effect;
 }
 
@@ -635,9 +1078,12 @@ std::unique_ptr<EditData> CdtContext::remove_constraint_vertex(
                         static_cast<size_t>(point_index));
     auto next = make_state(state_->base_points, constraints,
                            state_->next_constraint_id, state_->generation + 1,
-                           state_->crs_wkt);
+                           state_->crs_wkt, crossing_policy_,
+                           crossing_z_tolerance_);
     auto effect = capture_effect ? make_edit_data(*state_, *next) : nullptr;
     state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
     return effect;
 }
 
@@ -723,9 +1169,12 @@ std::unique_ptr<EditData> CdtContext::apply_constraint_edits(
 
     auto next = make_state(state_->base_points, constraints,
                            next_constraint_id, state_->generation + 1,
-                           state_->crs_wkt);
+                           state_->crs_wkt, crossing_policy_,
+                           crossing_z_tolerance_);
     auto effect = capture_effect ? make_edit_data(*state_, *next) : nullptr;
     state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
     result_ids = std::move(ids);
     return effect;
 }
@@ -743,8 +1192,32 @@ void CdtContext::remove_constraint(dt_constraint_id id) {
     constraints.erase(found);
     auto next = make_state(state_->base_points, constraints,
                            state_->next_constraint_id, state_->generation + 1,
-                           state_->crs_wkt);
+                           state_->crs_wkt, crossing_policy_,
+                           crossing_z_tolerance_);
     state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
+}
+
+void CdtContext::set_crossing_policy(int32_t policy, double z_tolerance) {
+    if (!valid_crossing_policy(policy) || !finite_value(z_tolerance) ||
+        z_tolerance < 0.0) {
+        throw Exception(DT_E_INVALID_ARGUMENT, "invalid CDT crossing policy");
+    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    crossing_policy_ = policy;
+    crossing_z_tolerance_ = z_tolerance;
+}
+
+dt_cdt_edit_metrics CdtContext::edit_metrics() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    dt_cdt_edit_metrics result{};
+    result.struct_size = sizeof(result);
+    result.last_edit_mode = last_edit_mode_;
+    result.local_topology_edit_count = local_topology_edit_count_;
+    result.full_rebuild_count = full_rebuild_count_;
+    result.generation = state_->generation;
+    return result;
 }
 
 dt_cdt_statistics CdtContext::statistics() const {
@@ -1037,9 +1510,286 @@ dt_bounds2 CdtContext::load_text(const char* utf8_file_name) {
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto next = make_state(points, constraints, next_constraint_id,
-                           state_->generation + 1, crs);
+                           state_->generation + 1, crs, crossing_policy_,
+                           crossing_z_tolerance_);
     const auto bounds = next->bounds;
     state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
+    return bounds;
+}
+
+void CdtContext::save_binary(const char* utf8_file_name) const {
+    require_file_name(utf8_file_name);
+    const uint32_t endian = kCdtBinaryEndian;
+    if (*reinterpret_cast<const unsigned char*>(&endian) != 0x04 ||
+        sizeof(dt_point3) != sizeof(double) * 3 ||
+        !std::numeric_limits<double>::is_iec559) {
+        throw Exception(DT_E_UNSUPPORTED,
+                        "DCDTB requires little-endian IEEE-754 doubles");
+    }
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (state_->crs_wkt.size() > kCdtBinaryHeaderSize - kCdtBinaryCrsOffset)
+        throw Exception(DT_E_LIMIT_EXCEEDED, "DCDTB CRS is too large");
+
+    uint64_t total_constraint_points = 0;
+    for (const auto& constraint : state_->constraints) {
+        total_constraint_points = checked_add(
+            total_constraint_points, constraint.points.size(),
+            "DCDTB constraint point count is too large");
+    }
+    const uint64_t base_bytes = checked_mul(state_->base_points.size(),
+                                            sizeof(dt_point3),
+                                            "DCDTB base points are too large");
+    const uint64_t directory_bytes = checked_mul(
+        state_->constraints.size(), kCdtBinaryDirectoryRecordSize,
+        "DCDTB directory is too large");
+    const uint64_t constraint_bytes = checked_mul(
+        total_constraint_points, sizeof(dt_point3),
+        "DCDTB constraint points are too large");
+    const uint64_t base_offset = kCdtBinaryHeaderSize;
+    const uint64_t directory_offset = checked_add(
+        base_offset, base_bytes, "DCDTB file is too large");
+    const uint64_t constraint_points_offset = checked_add(
+        directory_offset, directory_bytes, "DCDTB file is too large");
+    const uint64_t file_size = checked_add(
+        constraint_points_offset, constraint_bytes, "DCDTB file is too large");
+
+    std::ofstream output(std::filesystem::u8path(utf8_file_name),
+                         std::ios::binary | std::ios::trunc);
+    if (!output) throw Exception(DT_E_IO, "cannot create DCDTB file");
+    std::array<unsigned char, kCdtBinaryHeaderSize> header{};
+    output.write(reinterpret_cast<const char*>(header.data()),
+                 static_cast<std::streamsize>(header.size()));
+    uint64_t hash = 1469598103934665603ULL;
+    auto write_payload = [&](const void* data, size_t size) {
+        output.write(static_cast<const char*>(data),
+                     static_cast<std::streamsize>(size));
+        if (!output) throw Exception(DT_E_IO, "failed to write DCDTB payload");
+        hash = fnv_update(hash, data, size);
+    };
+    if (!state_->base_points.empty()) {
+        write_payload(state_->base_points.data(),
+                      state_->base_points.size() * sizeof(dt_point3));
+    }
+    uint64_t point_offset = constraint_points_offset;
+    for (const auto& constraint : state_->constraints) {
+        std::array<unsigned char, kCdtBinaryDirectoryRecordSize> record{};
+        std::memcpy(record.data(), &constraint.id, sizeof(constraint.id));
+        std::memcpy(record.data() + 8, &constraint.kind,
+                    sizeof(constraint.kind));
+        std::memcpy(record.data() + 12, &constraint.flags,
+                    sizeof(constraint.flags));
+        const uint64_t count = constraint.points.size();
+        std::memcpy(record.data() + 16, &count, sizeof(count));
+        std::memcpy(record.data() + 24, &point_offset, sizeof(point_offset));
+        dt_bounds2 bounds{constraint.points.front().x,
+                          constraint.points.front().y,
+                          constraint.points.front().x,
+                          constraint.points.front().y};
+        for (const auto& point : constraint.points) {
+            bounds.xmin = std::min(bounds.xmin, point.x);
+            bounds.ymin = std::min(bounds.ymin, point.y);
+            bounds.xmax = std::max(bounds.xmax, point.x);
+            bounds.ymax = std::max(bounds.ymax, point.y);
+        }
+        std::memcpy(record.data() + 32, &bounds, sizeof(bounds));
+        write_payload(record.data(), record.size());
+        point_offset = checked_add(
+            point_offset, checked_mul(count, sizeof(dt_point3),
+                                      "DCDTB point offset overflow"),
+            "DCDTB point offset overflow");
+    }
+    for (const auto& constraint : state_->constraints) {
+        write_payload(constraint.points.data(),
+                      constraint.points.size() * sizeof(dt_point3));
+    }
+    const auto written_size = output.tellp();
+    if (written_size < 0 || static_cast<uint64_t>(written_size) != file_size)
+        throw Exception(DT_E_IO, "DCDTB output size mismatch");
+
+    std::memcpy(header.data(), kCdtBinaryMagic, sizeof(kCdtBinaryMagic));
+    binary_store(header, 8, kCdtBinaryVersion);
+    binary_store(header, 12, kCdtBinaryEndian);
+    binary_store(header, 16, static_cast<uint64_t>(kCdtBinaryHeaderSize));
+    binary_store(header, 24, file_size);
+    binary_store(header, 32, static_cast<uint64_t>(state_->base_points.size()));
+    binary_store(header, 40, static_cast<uint64_t>(state_->constraints.size()));
+    binary_store(header, 48, state_->next_constraint_id);
+    binary_store(header, 56, base_offset);
+    binary_store(header, 64, directory_offset);
+    binary_store(header, 72, constraint_points_offset);
+    binary_store(header, 80, static_cast<uint64_t>(state_->crs_wkt.size()));
+    binary_store(header, 88, hash);
+    binary_store(header, 96, total_constraint_points);
+    binary_store(header, 104, crossing_policy_);
+    binary_store(header, 112, crossing_z_tolerance_);
+    std::memcpy(header.data() + kCdtBinaryCrsOffset, state_->crs_wkt.data(),
+                state_->crs_wkt.size());
+    output.seekp(0);
+    output.write(reinterpret_cast<const char*>(header.data()),
+                 static_cast<std::streamsize>(header.size()));
+    output.flush();
+    if (!output) throw Exception(DT_E_IO, "failed to finalize DCDTB file");
+}
+
+void CdtContext::verify_binary_file(const char* utf8_file_name) {
+    require_file_name(utf8_file_name);
+    std::ifstream input(std::filesystem::u8path(utf8_file_name),
+                        std::ios::binary);
+    if (!input) throw Exception(DT_E_IO, "cannot open DCDTB file");
+    const auto metadata = read_binary_metadata(input);
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(metadata.base_offset));
+    uint64_t hash = 1469598103934665603ULL;
+    std::array<unsigned char, 1024 * 1024> buffer{};
+    uint64_t remaining = metadata.file_size - metadata.base_offset;
+    while (remaining != 0) {
+        const size_t count = static_cast<size_t>(
+            std::min<uint64_t>(remaining, buffer.size()));
+        input.read(reinterpret_cast<char*>(buffer.data()),
+                   static_cast<std::streamsize>(count));
+        if (!input) throw Exception(DT_E_CORRUPTED_DATA,
+                                    "truncated DCDTB payload");
+        hash = fnv_update(hash, buffer.data(), count);
+        remaining -= count;
+    }
+    if (hash != metadata.payload_hash)
+        throw Exception(DT_E_CORRUPTED_DATA, "DCDTB payload checksum mismatch");
+}
+
+std::vector<dt_cdt_binary_index_entry> CdtContext::query_binary_index(
+    const char* utf8_file_name, const dt_bounds2& bounds) {
+    require_file_name(utf8_file_name);
+    validate_bounds(bounds);
+    std::ifstream input(std::filesystem::u8path(utf8_file_name),
+                        std::ios::binary);
+    if (!input) throw Exception(DT_E_IO, "cannot open DCDTB file");
+    const auto metadata = read_binary_metadata(input);
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(metadata.directory_offset));
+    std::vector<dt_cdt_binary_index_entry> result;
+    for (uint64_t i = 0; i < metadata.constraint_count; ++i) {
+        const auto entry = read_binary_directory_entry(input);
+        const uint64_t bytes = checked_mul(entry.point_count, sizeof(dt_point3),
+                                           "DCDTB entry is too large");
+        if (entry.point_offset < metadata.constraint_points_offset ||
+            entry.point_offset > metadata.file_size ||
+            bytes > metadata.file_size - entry.point_offset)
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "DCDTB entry point offset is invalid");
+        if (bounds_intersect(entry.bounds, bounds)) result.push_back(entry);
+    }
+    return result;
+}
+
+CdtConstraint CdtContext::read_binary_constraint(
+    const char* utf8_file_name, dt_constraint_id id) {
+    if (id == 0) throw Exception(DT_E_INVALID_ARGUMENT,
+                                 "constraint id is zero");
+    require_file_name(utf8_file_name);
+    std::ifstream input(std::filesystem::u8path(utf8_file_name),
+                        std::ios::binary);
+    if (!input) throw Exception(DT_E_IO, "cannot open DCDTB file");
+    const auto metadata = read_binary_metadata(input);
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(metadata.directory_offset));
+    dt_cdt_binary_index_entry selected{};
+    bool found = false;
+    for (uint64_t i = 0; i < metadata.constraint_count; ++i) {
+        const auto entry = read_binary_directory_entry(input);
+        if (entry.id == id) {
+            selected = entry;
+            found = true;
+            break;
+        }
+    }
+    if (!found) throw Exception(DT_E_NOT_FOUND,
+                                "binary constraint id was not found");
+    const uint64_t bytes = checked_mul(selected.point_count, sizeof(dt_point3),
+                                       "DCDTB entry is too large");
+    if (selected.point_offset < metadata.constraint_points_offset ||
+        selected.point_offset > metadata.file_size ||
+        bytes > metadata.file_size - selected.point_offset)
+        throw Exception(DT_E_CORRUPTED_DATA,
+                        "DCDTB entry point offset is invalid");
+    CdtConstraint result;
+    result.id = selected.id;
+    result.kind = selected.kind;
+    result.flags = selected.flags;
+    result.points.resize(static_cast<size_t>(selected.point_count));
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(selected.point_offset));
+    input.read(reinterpret_cast<char*>(result.points.data()),
+               static_cast<std::streamsize>(bytes));
+    if (!input) throw Exception(DT_E_CORRUPTED_DATA,
+                                "truncated DCDTB constraint points");
+    for (const auto& point : result.points) validate_point(point);
+    return result;
+}
+
+dt_bounds2 CdtContext::load_binary(const char* utf8_file_name) {
+    verify_binary_file(utf8_file_name);
+    std::ifstream input(std::filesystem::u8path(utf8_file_name),
+                        std::ios::binary);
+    if (!input) throw Exception(DT_E_IO, "cannot open DCDTB file");
+    const auto metadata = read_binary_metadata(input);
+    std::vector<dt_point3> points(static_cast<size_t>(metadata.base_count));
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(metadata.base_offset));
+    input.read(reinterpret_cast<char*>(points.data()),
+               static_cast<std::streamsize>(points.size() * sizeof(dt_point3)));
+    if (!input && !points.empty())
+        throw Exception(DT_E_CORRUPTED_DATA, "truncated DCDTB base points");
+    for (const auto& point : points) validate_point(point);
+
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(metadata.directory_offset));
+    std::vector<dt_cdt_binary_index_entry> entries;
+    entries.reserve(static_cast<size_t>(metadata.constraint_count));
+    for (uint64_t i = 0; i < metadata.constraint_count; ++i)
+        entries.push_back(read_binary_directory_entry(input));
+    std::vector<CdtConstraint> constraints;
+    constraints.reserve(entries.size());
+    uint64_t expected_offset = metadata.constraint_points_offset;
+    dt_constraint_id maximum_id = 0;
+    for (const auto& entry : entries) {
+        const uint64_t bytes = checked_mul(entry.point_count, sizeof(dt_point3),
+                                           "DCDTB entry is too large");
+        if (entry.point_offset != expected_offset ||
+            bytes > metadata.file_size - entry.point_offset)
+            throw Exception(DT_E_CORRUPTED_DATA,
+                            "DCDTB directory is not sequential");
+        CdtConstraint constraint;
+        constraint.id = entry.id;
+        constraint.kind = entry.kind;
+        constraint.flags = entry.flags;
+        maximum_id = std::max(maximum_id, entry.id);
+        constraint.points.resize(static_cast<size_t>(entry.point_count));
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(entry.point_offset));
+        input.read(reinterpret_cast<char*>(constraint.points.data()),
+                   static_cast<std::streamsize>(bytes));
+        if (!input) throw Exception(DT_E_CORRUPTED_DATA,
+                                    "truncated DCDTB constraint points");
+        for (const auto& point : constraint.points) validate_point(point);
+        constraints.push_back(std::move(constraint));
+        expected_offset = checked_add(expected_offset, bytes,
+                                      "DCDTB point offset overflow");
+    }
+    if (metadata.next_constraint_id == 0 ||
+        metadata.next_constraint_id <= maximum_id) {
+        throw Exception(DT_E_CORRUPTED_DATA,
+                        "DCDTB next constraint id is invalid");
+    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto next = make_state(points, constraints, metadata.next_constraint_id,
+                           state_->generation + 1, metadata.crs,
+                           crossing_policy_, crossing_z_tolerance_);
+    const auto bounds = next->bounds;
+    state_.swap(next);
+    ++full_rebuild_count_;
+    last_edit_mode_ = DT_CDT_EDIT_MODE_FULL_REBUILD;
     return bounds;
 }
 

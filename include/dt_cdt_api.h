@@ -32,11 +32,45 @@ enum dt_cdt_constraint_edit_operation {
     DT_CDT_EDIT_REMOVE = 3
 };
 
+enum dt_cdt_crossing_policy {
+    DT_CDT_CROSSING_REJECT = 0,
+    DT_CDT_CROSSING_SPLIT_COMPATIBLE_Z = 1
+};
+
+enum dt_cdt_edit_mode {
+    DT_CDT_EDIT_MODE_NONE = 0,
+    DT_CDT_EDIT_MODE_LOCAL_TOPOLOGY = 1,
+    DT_CDT_EDIT_MODE_FULL_REBUILD = 2
+};
+
 typedef struct dt_cdt_options {
     uint32_t struct_size;
     uint32_t flags;
-    uint64_t reserved[6];
+    int32_t crossing_policy;
+    uint32_t reserved0;
+    double crossing_z_tolerance;
+    uint64_t reserved[4];
 } dt_cdt_options;
+
+typedef struct dt_cdt_edit_metrics {
+    uint32_t struct_size;
+    int32_t last_edit_mode;
+    uint64_t local_topology_edit_count;
+    uint64_t full_rebuild_count;
+    uint64_t generation;
+    uint64_t reserved[3];
+} dt_cdt_edit_metrics;
+
+typedef struct dt_cdt_binary_index_entry {
+    uint32_t struct_size;
+    int32_t kind;
+    uint32_t flags;
+    uint32_t reserved;
+    dt_constraint_id id;
+    uint64_t point_count;
+    uint64_t point_offset;
+    dt_bounds2 bounds;
+} dt_cdt_binary_index_entry;
 
 typedef struct dt_cdt_statistics {
     uint32_t struct_size;
@@ -141,6 +175,14 @@ DT_API dt_status DT_CALL dt_cdt_apply_constraint_edits(
 DT_API dt_status DT_CALL dt_cdt_remove_constraint(
     dt_cdt_handle cdt, dt_constraint_id constraint_id);
 
+/* Changes how proper segment crossings are handled by subsequent edits.
+   SPLIT inserts a shared vertex only when the two interpolated Z values differ
+   by no more than z_tolerance. Collinear overlap is always rejected. */
+DT_API dt_status DT_CALL dt_cdt_set_crossing_policy(
+    dt_cdt_handle cdt, int32_t policy, double z_tolerance);
+DT_API dt_status DT_CALL dt_cdt_get_edit_metrics(
+    dt_cdt_handle cdt, dt_cdt_edit_metrics* output_metrics);
+
 DT_API dt_status DT_CALL dt_cdt_get_statistics(
     dt_cdt_handle cdt, dt_cdt_statistics* output_statistics);
 /* constraint_index is in [0, constraint_count). */
@@ -191,6 +233,24 @@ DT_API dt_status DT_CALL dt_cdt_save_text(
     dt_cdt_handle cdt, const char* utf8_file_name);
 DT_API dt_status DT_CALL dt_cdt_load_text(
     dt_cdt_handle cdt, const char* utf8_file_name, dt_bounds2* output_bounds);
+
+/* DCDTB 1 is a little-endian binary exchange format. Its fixed-size directory
+   supports window queries without constructing the triangulation. point_offset
+   in index entries is an absolute byte offset in the file. */
+DT_API dt_status DT_CALL dt_cdt_save_binary(
+    dt_cdt_handle cdt, const char* utf8_file_name);
+DT_API dt_status DT_CALL dt_cdt_load_binary(
+    dt_cdt_handle cdt, const char* utf8_file_name, dt_bounds2* output_bounds);
+DT_API dt_status DT_CALL dt_cdt_verify_binary_file(
+    const char* utf8_file_name);
+DT_API dt_status DT_CALL dt_cdt_query_binary_index(
+    const char* utf8_file_name, const dt_bounds2* bounds,
+    dt_cdt_binary_index_entry* output_entries, uint64_t entry_capacity,
+    uint64_t* required_count);
+DT_API dt_status DT_CALL dt_cdt_read_binary_constraint(
+    const char* utf8_file_name, dt_constraint_id constraint_id,
+    dt_point3* output_points, uint64_t point_capacity,
+    uint64_t* required_count, dt_constraint_info* output_info);
 
 #ifdef __cplusplus
 }

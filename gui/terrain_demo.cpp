@@ -380,7 +380,11 @@ class DemoApp {
 public:
     DemoApp() {
         dt_create(nullptr, &mesh_);
-        dt_cdt_create(nullptr, &cdt_);
+        dt_cdt_options cdt_options{};
+        cdt_options.struct_size = sizeof(cdt_options);
+        cdt_options.crossing_policy = DT_CDT_CROSSING_SPLIT_COMPATIBLE_Z;
+        cdt_options.crossing_z_tolerance = 1e-3;
+        dt_cdt_create(&cdt_options, &cdt_);
         if (dt_gdal_initialize() == DT_OK) {
             gdal_available_ = true;
             int32_t available = 0;
@@ -832,9 +836,9 @@ private:
                     L"当前等高线重投影到 EPSG…");
         AppendMenuW(exchange_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(exchange_menu, MF_STRING, ID_IMPORT_CDT,
-                    L"打开约束网 DCDT…");
+                    L"打开约束网 DCDT / DCDTB…");
         AppendMenuW(exchange_menu, MF_STRING, ID_EXPORT_CDT,
-                    L"保存约束网 DCDT…");
+                    L"保存约束网 DCDT / DCDTB…");
 
         HMENU cdt_edit_menu = CreatePopupMenu();
         AppendMenuW(cdt_edit_menu, MF_STRING, ID_CDT_DRAW_BREAKLINE,
@@ -6171,13 +6175,16 @@ private:
     void import_cdt_file() {
         const auto file = choose_file(
             false, L"terrain.dcdt",
-            L"DCDT 约束网 (*.dcdt;*.txt)\0*.dcdt;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"约束网 (*.dcdt;*.dcdtb;*.txt)\0*.dcdt;*.dcdtb;*.txt\0DCDTB 二进制 (*.dcdtb)\0*.dcdtb\0DCDT 文本 (*.dcdt;*.txt)\0*.dcdt;*.txt\0所有文件 (*.*)\0*.*\0",
             L"dcdt");
         if (file.empty()) return;
         set_wait_cursor(true);
         const auto begin = std::chrono::steady_clock::now();
-        const dt_status status = dt_cdt_load_text(
-            cdt_, wide_to_utf8(file.c_str()).c_str(), nullptr);
+        const auto utf8 = wide_to_utf8(file.c_str());
+        const bool binary = lower_extension(file) == L".dcdtb";
+        const dt_status status = binary
+            ? dt_cdt_load_binary(cdt_, utf8.c_str(), nullptr)
+            : dt_cdt_load_text(cdt_, utf8.c_str(), nullptr);
         const auto end = std::chrono::steady_clock::now();
         set_wait_cursor(false);
         if (status == DT_OK) clear_analysis_for_source(ProfileSource::Cdt);
@@ -6207,12 +6214,14 @@ private:
             return;
         }
         const auto file = choose_file(
-            true, L"terrain.dcdt",
-            L"DCDT 约束网 (*.dcdt;*.txt)\0*.dcdt;*.txt\0所有文件 (*.*)\0*.*\0",
-            L"dcdt");
+            true, L"terrain.dcdtb",
+            L"DCDTB 二进制 (*.dcdtb)\0*.dcdtb\0DCDT 文本 (*.dcdt;*.txt)\0*.dcdt;*.txt\0所有文件 (*.*)\0*.*\0",
+            L"dcdtb");
         if (file.empty()) return;
-        const dt_status status =
-            dt_cdt_save_text(cdt_, wide_to_utf8(file.c_str()).c_str());
+        const auto utf8 = wide_to_utf8(file.c_str());
+        const dt_status status = lower_extension(file) == L".dcdtb"
+            ? dt_cdt_save_binary(cdt_, utf8.c_str())
+            : dt_cdt_save_text(cdt_, utf8.c_str());
         action_text_ = status == DT_OK ? L"已保存约束网：" + file
                                        : L"约束网保存失败：" + last_error_text();
     }

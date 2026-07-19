@@ -48,8 +48,9 @@ struct dt_contour_set_t {
 };
 
 struct dt_cdt_t {
-    std::shared_ptr<dt::CdtContext> context =
-        std::make_shared<dt::CdtContext>();
+    explicit dt_cdt_t(const dt_cdt_options* options)
+        : context(std::make_shared<dt::CdtContext>(options)) {}
+    std::shared_ptr<dt::CdtContext> context;
 };
 
 struct dt_cdt_query_result_t {
@@ -2276,7 +2277,7 @@ dt_status DT_CALL dt_cdt_create(const dt_cdt_options* options,
             throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_cdt is null");
         }
         if (options) validate_options(options, "dt_cdt_options");
-        *output_cdt = new dt_cdt_t();
+        *output_cdt = new dt_cdt_t(options);
     });
 }
 
@@ -2383,6 +2384,25 @@ dt_status DT_CALL dt_cdt_remove_constraint(dt_cdt_handle cdt,
                                             dt_constraint_id constraint_id) {
     return guarded(
         [&] { require_cdt(cdt).remove_constraint(constraint_id); });
+}
+
+dt_status DT_CALL dt_cdt_set_crossing_policy(
+    dt_cdt_handle cdt, int32_t policy, double z_tolerance) {
+    return guarded([&] {
+        require_cdt(cdt).set_crossing_policy(policy, z_tolerance);
+    });
+}
+
+dt_status DT_CALL dt_cdt_get_edit_metrics(
+    dt_cdt_handle cdt, dt_cdt_edit_metrics* output_metrics) {
+    if (output_metrics) *output_metrics = {};
+    return guarded([&] {
+        if (!output_metrics) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_metrics is null");
+        }
+        *output_metrics = require_cdt(cdt).edit_metrics();
+    });
 }
 
 dt_status DT_CALL dt_cdt_get_statistics(
@@ -2570,6 +2590,88 @@ dt_status DT_CALL dt_cdt_load_text(dt_cdt_handle cdt,
     return guarded([&] {
         const auto bounds = require_cdt(cdt).load_text(utf8_file_name);
         if (output_bounds) *output_bounds = bounds;
+    });
+}
+
+dt_status DT_CALL dt_cdt_save_binary(dt_cdt_handle cdt,
+                                     const char* utf8_file_name) {
+    return guarded([&] {
+        require_cdt(cdt).save_binary(utf8_file_name);
+    });
+}
+
+dt_status DT_CALL dt_cdt_load_binary(dt_cdt_handle cdt,
+                                     const char* utf8_file_name,
+                                     dt_bounds2* output_bounds) {
+    return guarded([&] {
+        const auto bounds = require_cdt(cdt).load_binary(utf8_file_name);
+        if (output_bounds) *output_bounds = bounds;
+    });
+}
+
+dt_status DT_CALL dt_cdt_verify_binary_file(const char* utf8_file_name) {
+    return guarded([&] {
+        dt::CdtContext::verify_binary_file(utf8_file_name);
+    });
+}
+
+dt_status DT_CALL dt_cdt_query_binary_index(
+    const char* utf8_file_name, const dt_bounds2* bounds,
+    dt_cdt_binary_index_entry* output_entries, uint64_t entry_capacity,
+    uint64_t* required_count) {
+    if (required_count) *required_count = 0;
+    return guarded([&] {
+        if (!bounds) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "bounds is null");
+        }
+        const auto entries = dt::CdtContext::query_binary_index(
+            utf8_file_name, *bounds);
+        if (required_count) *required_count = entries.size();
+        if (!output_entries) {
+            if (entry_capacity != 0) {
+                throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                    "output_entries is null");
+            }
+            return;
+        }
+        if (entry_capacity < entries.size()) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "binary index output buffer is too small");
+        }
+        std::copy(entries.begin(), entries.end(), output_entries);
+    });
+}
+
+dt_status DT_CALL dt_cdt_read_binary_constraint(
+    const char* utf8_file_name, dt_constraint_id constraint_id,
+    dt_point3* output_points, uint64_t point_capacity,
+    uint64_t* required_count, dt_constraint_info* output_info) {
+    if (required_count) *required_count = 0;
+    if (output_info) *output_info = {};
+    return guarded([&] {
+        const auto constraint = dt::CdtContext::read_binary_constraint(
+            utf8_file_name, constraint_id);
+        if (required_count) *required_count = constraint.points.size();
+        if (output_info) {
+            output_info->struct_size = sizeof(*output_info);
+            output_info->flags = constraint.flags;
+            output_info->id = constraint.id;
+            output_info->kind = constraint.kind;
+            output_info->point_count = constraint.points.size();
+        }
+        if (!output_points) {
+            if (point_capacity != 0) {
+                throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                    "output_points is null");
+            }
+            return;
+        }
+        if (point_capacity < constraint.points.size()) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "binary constraint point buffer is too small");
+        }
+        std::copy(constraint.points.begin(), constraint.points.end(),
+                  output_points);
     });
 }
 

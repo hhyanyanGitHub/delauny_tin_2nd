@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.55.0"
+VERSION = "0.70.0"
 TODAY = date(2026, 7, 19).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.55.0：新增 CRS 规范化、等价判断、批量坐标转换，以及 TIN、GRID、等高线的显式 GDAL/PROJ 重投影；v0.40 Direct3D 分块地形、GPU 拾取和贴地漫游及全部旧 DLL 接口保持兼容。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.70.0：新增 CDT 无交叉断裂线局部拓扑插入、可配置交叉自动节点化，以及带范围目录和校验的 DCDTB 二进制交换；v0.55 CRS 重投影、v0.40 Direct3D 三维显示及全部旧 DLL 接口保持兼容。", "gold")
 
 
 def build_developer_manual():
@@ -496,7 +496,7 @@ def build_developer_manual():
         "TIN→GRID、GRID→TIN、TIN/GRID→等高线，以及等高线→TIN/GRID 近似重建。",
         "耗时转换和 GRID 概览的异步任务、进度、等待、协作取消和结果提取。",
         "TIN/GRID/等高线 CRS WKT 元数据，以及可选 GeoTIFF/COG/GeoPackage 交换。",
-        "独立 CDT 句柄、断裂线、外边界、孔洞、域内查询、约束增删与 DCDT 文本往返。",
+        "独立 CDT 句柄、断裂线、外边界、孔洞、局部新增、交叉节点化，以及 DCDT/DCDTB 往返。",
         "保持约束 ID 和类型的原子几何更新；可选返回更新前后的完整域差异。",
         "约束顶点引用查询、共享顶点默认保护和显式单约束脱离删除。",
         "原子批量约束事务，一次提交多条新增、更新和删除并统一回滚。",
@@ -518,7 +518,7 @@ def build_developer_manual():
         [2200, 7160],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
     )
-    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.24 单项约束编辑仍采用候选网全量重建；批量事务把 N 次重建降为 1 次，但尚未达到百万点实时局部 CDT 编辑。GUI 多边形土方针对水平基准面并使用固定预算数值积分；双 GRID 接口要求节点对齐，错位表面可先显式重采样。所有土方结果均需结合项目规范复核后用于工程结算。", "gold")
+    m.callout("适用边界", "GRID→TIN 和等高线→TIN 都重建普通 Delaunay；严格折线、边界和孔洞应使用独立 dt_cdt_handle。v0.70 新增无交叉断裂线局部拓扑路径；边界、改形、删除、自动节点化和批量事务仍完整构建原子候选网。GUI 多边形土方针对水平基准面并使用固定预算数值积分；双 GRID 接口要求节点对齐，错位表面可先显式重采样。所有土方结果均需结合项目规范复核后用于工程结算。", "gold")
 
     m.h1("2 架构与数据模型")
     m.h2("2.1 分层结构")
@@ -681,6 +681,7 @@ dt_release_query_result(result);""")
             ("dt_grid_save/load_binary", "DGRIDB 1", "大 GRID 映射加载、持久概览和原子保存。"),
             ("dt_contours_save/load_text", "DCONTOUR 1", "等高折线文本往返。"),
             ("dt_cdt_save/load_text", "DCDT 1", "散点、约束和 CRS 文本往返。"),
+            ("dt_cdt_save/load_binary", "DCDTB 1", "带范围目录、偏移和全载荷校验的约束网二进制。"),
         ],
         [3200, 1800, 4360],
         [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
@@ -832,7 +833,17 @@ dt_cdt_destroy(cdt);""")
     m.para("dt_cdt_get_constraint_vertex_usage() 报告指定点被多少条约束、多少个点序列位置引用，以及是否也是基础地形点。dt_cdt_remove_constraint_vertex() 默认拒绝共享顶点；显式传 DT_CDT_REMOVE_VERTEX_ALLOW_SHARED_DETACH 时只从目标约束脱离，其他约束和基础点保持不变。删除后仍统一校验最小点数和拓扑，失败时 generation 不变。")
     m.para("dt_cdt_apply_constraint_edits() 按数组顺序组合 ADD、UPDATE 和 REMOVE。ADD 分配新稳定 ID，UPDATE 保留原类型，REMOVE 不携带几何。任一参数、ID 或最终拓扑失败时整批回滚且不消耗 ID；成功时 generation 只增加一次。output_constraint_ids 和整批 output_effect 均可为空。")
     m.para("dt_cdt_sample_height_xy() 只在有效域内插值；外边界以外和孔洞内部返回 DT_E_NOT_FOUND。dt_grid_from_cdt() 将这些位置写为 NoData，dt_contours_from_cdt() 只遍历域内三角形并继承 CRS。更新和顶点删除的 output_effect 均可为 nullptr。")
-    m.callout("性能与交叉", "当前单项约束编辑仍完整重建候选 CDT；批量事务只重建一次。100,000 基础点添加 12 条断裂线的本机对比为逐条 3.259 s、批量 0.528 s，约 6.17 倍。请求 output_effect 还会计算完整域差异。未分段交叉仍须先加入共享顶点。", "gold")
+    m.callout("性能与交叉", "拒绝交叉模式下新增普通断裂线复制原子候选后直接局部插入 CGAL 拓扑，不从全部基础点重建；边界、改形、删除和自动节点化仍完整重建。SPLIT_COMPATIBLE_Z 用 R-tree 筛选相交段，并仅在两线插值 Z 满足显式容差时写入共享交点；共线重叠始终拒绝。dt_cdt_get_edit_metrics() 可核实实际路径。", "gold")
+    m.code("""dt_cdt_options options{};
+options.struct_size = sizeof(options);
+options.crossing_policy = DT_CDT_CROSSING_SPLIT_COMPATIBLE_Z;
+options.crossing_z_tolerance = 0.001;
+dt_cdt_create(&options, &cdt);
+
+dt_cdt_save_binary(cdt, "terrain.dcdtb");
+dt_bounds2 window{500000, 3000000, 501000, 3001000};
+uint64_t count = 0;
+dt_cdt_query_binary_index("terrain.dcdtb", &window, nullptr, 0, &count);""")
 
     m.h2("4.9 坡度、坡向与地形法向")
     m.para("v0.16 由普通 TIN、约束 CDT 和仿射 GRID 共用 dt_surface_analysis 结果结构。三个入口分别是 dt_analyze_tin_surface_xy()、dt_cdt_analyze_surface_xy() 和 dt_grid_analyze_surface_xy()；查询 Z 被忽略，成功结果给出插值 Z、世界 XY 梯度、坡度角、下坡坡向、向上单位法向和实际支撑点。接口只写调用方结构，不分配跨 DLL 内存。")
@@ -1397,8 +1408,9 @@ TRIANGLES 2
     m.para("DCONTOUR 1 由 LINES 计数和若干 LINE 记录组成。每条 LINE 保存等高值、闭合标志、点数及 XYZ 顶点。逐线视图中的点数组只在等高线句柄释放前有效。")
     m.h2("6.7 GeoTIFF、COG 与 GeoPackage")
     m.para("启用 DT_WITH_GDAL 后，dt_grid_load/save_gdal_raster 读写 GDAL 单波段高程栅格；dt_contours_load/save_gdal_vector 读写等高线矢量层。普通 GeoTIFF 逐行写入；COG 按驱动要求通过临时数据集 CreateCopy；GeoPackage 输出 LineStringZ 和 elevation/closed 字段。")
-    m.h2("6.8 DCDT 约束网文本")
-    m.para("DCDT 1 保存 CRS、基础 XYZ 点和约束记录。每条约束包含稳定 ID、类型、闭合标志、点数和 XYZ；加载时完整重建 CDT 并重新标记域，失败不会覆盖原对象。")
+    m.h2("6.8 DCDT / DCDTB 约束网")
+    m.para("DCDT 1 保存 CRS、基础 XYZ 点和约束记录。每条约束包含稳定 ID、类型、闭合标志、点数和 XYZ；加载时完整重建 CDT 并重新标记域，失败不会覆盖原对象。DCDTB 1 增加固定 64 字节约束目录、XY 包围盒、点载荷绝对偏移及 FNV-1a 全载荷校验，适合大约束网。")
+    m.para("dt_cdt_query_binary_index() 只扫描目录即可按窗口列出约束；dt_cdt_read_binary_constraint() 按稳定 ID 直接读取一条折线，均不要求创建或构建 CDT。完整加载会先验证校验值，再原子替换目标句柄。")
 
     m.h1("7 错误、内存与线程")
     m.h2("7.1 状态码")
@@ -1550,7 +1562,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32 演示程序：二维使用 GDI，三维优先使用 Direct3D 11，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、大 GRID 非阻塞视口 LOD、任意多边形 GRID 裁剪/掩膜、错位设计 GRID 显式对齐、现状/设计双 GRID 挖填方、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.55 功能边界", "TIN、GRID 与等高线可显式重投影到目标 EPSG；GRID 自动推导北向上目标范围与分辨率，也可由 DLL 调用方指定精确输出仿射。批量点转换采用传统 GIS XY 轴序且失败不改写输出。三维 TIN 继续使用 v0.40 的 Direct3D 分块渲染与 GPU 拾取。", "gold")
+    m.callout("0.70 功能边界", "CDT 自动节点化只处理可表达为单一 2.5D 高程的交点；两线插值 Z 超过容差或共线重叠时拒绝。无交叉断裂线采用局部拓扑插入，但为了原子提交仍复制候选状态；边界和既有约束改形继续完整重建。TIN、GRID、等高线重投影与 Direct3D 三维显示保持 v0.55/v0.40 行为。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1587,7 +1599,7 @@ def build_gui_manual():
         "打开“图层”菜单，分别隐藏和显示 TIN、GRID、等高线，再用“全图”恢复联合范围。",
         "若当前为 GDAL 构建，导入 GeoTIFF/DEM/IMG 或 GPKG/SHP 等常见数据；再分别把 TIN、GRID 或等高线显式重投影到目标 EPSG，程序会隐藏其他坐标系图层。",
         "执行‘数据交换→导出 GeoTIFF（DEFLATE）’和‘导出 GeoPackage 等高线’，再重新导入检查数据往返。",
-        "打开“数据交换→打开约束网 DCDT”，选择 sample_constraints.dcdt，观察孔洞和断裂线。",
+        "打开“数据交换→打开约束网 DCDT / DCDTB”，选择 sample_constraints.dcdt，观察孔洞和断裂线。",
         "打开“约束编辑→绘制断裂线”，在画布逐点单击，按 Enter 完成；用 Backspace 撤点、Esc 取消。",
         "选择“移动约束顶点（两次单击）”，第一次单击白色约束顶点使其变黄，第二次单击目标位置；观察红色旧面、黄色边界和绿色新增面/边。",
         "选择“删除约束顶点（单击）”并拾取白色折点；共享顶点确认后只从当前约束脱离。",
@@ -1991,7 +2003,7 @@ def build_gui_manual():
     )
     m.callout("图层安全", "导入失败时原图层保持不变。GDAL 栅格像元中心与 GRID 节点自动完成半像元换算；当前 GUI 不执行坐标重投影。", "blue")
     m.h2("8.5 DCDT 约束网")
-    m.para("选择“数据交换→打开约束网 DCDT”可加载基础点、外边界、孔洞、断裂线和 CRS。域内网为紫色，外边界青色，孔洞洋红，断裂线橙色。sample_constraints.dcdt 可直接验证；“保存约束网 DCDT”执行完整文本往返。")
+    m.para("选择“数据交换→打开约束网 DCDT / DCDTB”可加载基础点、外边界、孔洞、断裂线和 CRS。域内网为紫色，外边界青色，孔洞洋红，断裂线橙色。sample_constraints.dcdt 可直接验证；保存时按扩展名选择 DCDT 可读文本或带范围目录与校验的 DCDTB 二进制，默认使用 .dcdtb。")
     m.h2("8.6 批量事务、交互绘制、移动与安全删除")
     for step in (
         "先打开 DCDT，或执行‘地形转换→从当前 TIN 创建约束网’。",
@@ -2001,7 +2013,7 @@ def build_gui_manual():
         "断裂线至少 2 点，外边界和孔洞至少 3 点；边界由程序自动闭合。",
         "选择‘移动约束顶点（两次单击）’后，第一次在白色约束顶点 14 像素范围内单击；选中点变为黄色。",
         "第二次在目标位置单击即可提交移动；按 Esc 取消已选顶点。成功后红色表示旧面，黄色表示影响边界，绿色表示新增面/边。",
-        "若移动造成未分段交叉等非法拓扑，原约束保持不变，选中状态保留，可换一个目标位置重试或按 Esc 取消。",
+        "若移动造成插值 Z 超容差、共线重叠等非法拓扑，原约束保持不变，选中状态保留，可换一个目标位置重试或按 Esc 取消。",
         "选择‘删除约束顶点（单击）’并单击白色折点；普通点直接删除并显示红/黄/绿影响。",
         "共享顶点会显示引用约束数量并请求确认；确认后只从当前约束脱离，其他约束不变。基础地形点也始终保留。",
         "删除后不足最小点数或产生非法拓扑时操作被拒绝，原约束和 generation 保持不变。",
@@ -2009,7 +2021,7 @@ def build_gui_manual():
         "约束改变后重新生成 GRID/等高线；程序会自动释放旧派生图层。",
     ):
         m.number(step)
-    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。当前单项约束编辑仍完整重建候选 CDT，批量事务只重建一次；移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
+    m.callout("高程与性能", "草图和移动目标的 Z 优先由 CDT/TIN 表面插值。GUI 默认以 0.001 当前高程单位容差自动节点化交叉；无交叉普通断裂线走局部 CGAL 拓扑插入，边界、移动、删除和批量事务仍完整构建原子候选。移动/删除顶点还请求完整差异用于影响显示。查询、插入和删除工具栏按钮仍只操作普通 TIN。", "gold")
     m.h2("8.7 往返验证")
     for step in (
         "保存当前网格。",
@@ -2058,8 +2070,8 @@ def build_gui_manual():
         ("DCDT 孔洞仍有线框", "确认显示的是紫色 CDT 域内网；底下叠加的普通 TIN 可通过图层菜单隐藏。"),
         ("无法选中约束", "删除时应靠近青、洋红或橙色约束线；移动时应靠近白色约束顶点。两者拾取范围均约 14 像素。"),
         ("外边界删除失败", "仍有孔洞依赖外边界；先删除孔洞约束，再删除外边界。"),
-        ("约束提交失败", "检查点数、连续重合点和未分段交叉；失败时草图保留，可 Backspace 调整。"),
-        ("约束顶点移动失败", "目标位置可能造成未分段交叉或非法边界；原约束不会改变，可再次单击其他位置，或按 Esc 取消。"),
+        ("约束提交失败", "检查点数、连续重合点、交点高差和共线重叠；失败时草图保留，可 Backspace 调整。"),
+        ("约束顶点移动失败", "目标位置可能造成交点高差超限、共线重叠或非法边界；原约束不会改变，可再次单击其他位置，或按 Esc 取消。"),
         ("共享顶点无法删除", "这是默认保护；GUI 会询问是否只从当前约束脱离。取消时所有约束不变，确认后其他约束仍保留该点。"),
         ("约束顶点删除失败", "删除后可能少于最小点数或产生非法拓扑；原约束和基础地形点均不会被部分删除。"),
         ("批量示例被拒绝", "为避免与已有线交叉，GUI 只在当前约束为空时生成 12 条平行断裂线；可重新从 TIN 创建约束网后再试。"),

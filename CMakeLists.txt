@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.55.0
+    VERSION 0.70.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -157,6 +157,16 @@ if(DT_BUILD_TESTS)
         DT_WITH_GDAL=$<BOOL:${DT_WITH_GDAL}>)
     target_link_libraries(dterrain_crs_tests PRIVATE dterrain)
     add_test(NAME dterrain_crs_tests COMMAND dterrain_crs_tests)
+
+    add_executable(dterrain_cdt_v070_tests tests/test_cdt_v070.cpp)
+    target_compile_features(dterrain_cdt_v070_tests PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_cdt_v070_tests PRIVATE dterrain)
+    add_test(NAME dterrain_cdt_v070_tests COMMAND dterrain_cdt_v070_tests)
+    if(MSVC)
+        target_compile_options(dterrain_cdt_v070_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(dterrain_cdt_v070_tests PRIVATE -UNDEBUG)
+    endif()
 
     add_executable(dterrain_viewer3d_tests tests/test_viewer3d.cpp)
     target_compile_features(dterrain_viewer3d_tests PRIVATE cxx_std_17)

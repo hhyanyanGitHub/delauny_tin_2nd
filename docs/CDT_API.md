@@ -1,6 +1,6 @@
 # 约束 Delaunay API
 
-本文说明 dterrain 0.12 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
+本文说明 dterrain 0.70 的 `dt_cdt_api.h`。约束网使用独立 `dt_cdt_handle`，不会
 改变普通 `dt_handle`、旧 12 接口或 TIN/GRID/等高线 API 的行为。
 
 ## 数据模型
@@ -40,8 +40,13 @@ dt_cdt_destroy(cdt);
 首点作为末点传入；库会规范化为“不重复首点”的内部形式。连续重复 XY、基础点
 重复 XY 或同一 XY 的高程冲突会被拒绝。
 
-当前交叉约束必须预先在交点处分段，并把交点作为共享顶点传入。未分段的交叉返回
-`DT_E_UNSUPPORTED`，原句柄保持不变。
+默认交叉策略保持兼容：未分段的交叉返回 `DT_E_UNSUPPORTED`，原句柄保持不变。
+创建时填写 `dt_cdt_options.crossing_policy`，或随后调用
+`dt_cdt_set_crossing_policy()`，可启用
+`DT_CDT_CROSSING_SPLIT_COMPATIBLE_Z`。库使用 R-tree 筛选候选线段，计算 XY 交点并
+分别沿两条线性插值 Z；差值不超过 `crossing_z_tolerance` 时，将统一交点加入相关
+约束点序列。超过容差返回 `DT_E_INVALID_ARGUMENT` 并原子回滚。共线重叠始终返回
+`DT_E_UNSUPPORTED`。
 
 `dt_cdt_update_constraint()` 原子替换指定约束的点序列和闭合标志，约束类型及
 `dt_constraint_id` 保持不变。更新失败时约束点、generation 和全部拓扑均不改变。
@@ -70,9 +75,10 @@ XY 被多条约束共同引用，函数返回 `DT_E_UNSUPPORTED`，原约束、g
 交叉等规则。候选状态校验失败时操作原子回滚。`output_effect` 与约束更新接口相同，
 可选返回完整的新旧域差异。
 
-v0.11 的单项添加、更新、顶点删除或整条删除仍会在候选状态中完整重建 CDT，成功后原子替换。
-这适合研究、文件交换和中等规模约束编辑；百万级实时局部约束编辑将在后续版本
-增加。
+v0.70 在拒绝交叉模式下为新增普通断裂线提供局部拓扑路径：复制当前候选状态后只向
+现有 CGAL CDT 插入新点和新约束边，不从全部基础点重新 Delaunay。边界新增、几何更新、
+顶点/整条删除、批量事务和自动节点化仍完整重建候选网，以保持域屏障和原子语义。
+`dt_cdt_get_edit_metrics()` 报告最后路径、局部更新次数、完整重建次数和 generation。
 
 ### 原子批量约束事务
 
@@ -164,7 +170,7 @@ dt_grid_destroy(grid);
 先用 `dt_cdt_get_constraint_info()` 按索引取得 ID、类型、标志和点数，再用
 `dt_cdt_copy_constraint_points()` 复制 XYZ。复制接口支持先传空缓冲区查询所需点数。
 
-## 文本与 CRS
+## 文本、二进制索引与 CRS
 
 `dt_cdt_save_text()`、`dt_cdt_load_text()` 使用 `DCDT 1` 文本，保存基础散点、
 约束 ID/类型/闭合标志、折线点和 CRS WKT。加载先完整解析并构建候选网，任何错误
@@ -172,6 +178,25 @@ dt_grid_destroy(grid);
 
 CRS 仅作为 UTF-8 WKT 元数据保存，不参与重投影。使用
 `dt_cdt_set_crs_wkt()`/`dt_cdt_get_crs_wkt()` 访问。
+
+`dt_cdt_save_binary()`、`dt_cdt_load_binary()` 使用小端 `DCDTB 1`。文件包括 4 KiB
+头、基础点数组、固定 64 字节约束目录和连续折线点数组；目录记录稳定 ID、类型、标志、
+点数、绝对偏移及 XY 包围盒。全部载荷带 FNV-1a 校验，完整加载前会先验证；也可调用
+`dt_cdt_verify_binary_file()` 主动检查。
+
+窗口浏览无需加载基础点或构建三角网：先调用 `dt_cdt_query_binary_index()` 传空缓冲
+取得记录数，再分配 `dt_cdt_binary_index_entry` 数组读取与窗口相交的目录项。选中 ID 后，
+`dt_cdt_read_binary_constraint()` 同样使用两次调用模式直接读取一条 XYZ 折线。
+
+```cpp
+dt_cdt_save_binary(cdt, "terrain.dcdtb");
+dt_bounds2 window{500000, 3000000, 501000, 3001000};
+uint64_t count = 0;
+dt_cdt_query_binary_index("terrain.dcdtb", &window, nullptr, 0, &count);
+std::vector<dt_cdt_binary_index_entry> index(count);
+dt_cdt_query_binary_index("terrain.dcdtb", &window,
+                          index.data(), index.size(), &count);
+```
 
 ## 资源释放
 

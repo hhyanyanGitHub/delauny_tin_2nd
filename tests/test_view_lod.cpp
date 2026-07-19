@@ -319,6 +319,93 @@ void test_spatial_tile_cache_reuse_and_eviction() {
     dt_grid_destroy(validation_grid);
 }
 
+void test_progressive_cross_lod_publication() {
+    dt_grid_handle grid = create_identity_grid(64, 32);
+    dt_grid_view_cache_options cache_options{};
+    cache_options.struct_size = sizeof(cache_options);
+    cache_options.tile_width = 16;
+    cache_options.tile_height = 16;
+    cache_options.worker_count = 2;
+    cache_options.maximum_bytes = 8ULL * 1024ULL * 1024ULL;
+    cache_options.maximum_tiles = 64;
+    dt_grid_view_cache_handle cache = nullptr;
+    require_ok(dt_grid_view_cache_create(grid, &cache_options, &cache));
+
+    dt_grid_view_request_options request{};
+    request.struct_size = sizeof(request);
+    request.world_bounds = {0.0, 0.0, 63.0, 31.0};
+    request.output_width = 32;
+    request.output_height = 16;
+    request.overview_method = DT_GRID_OVERVIEW_NEAREST;
+    dt_grid_progressive_view_options progressive{};
+    progressive.struct_size = sizeof(progressive);
+    progressive.initial_lod_multiplier = 4;
+    progressive.maximum_frame_count = 3;
+
+    dt_task_handle task = nullptr;
+    require_ok(dt_grid_read_view_progressive_async(
+        cache, &request, &progressive, &task));
+    uint64_t sequence = 0;
+    std::vector<uint64_t> scales;
+    const double* first_values = nullptr;
+    double first_value = 0.0;
+    while (scales.size() < 3) {
+        int32_t available = 0;
+        require_ok(dt_task_wait_for_grid_view_frame(
+            task, sequence, UINT32_MAX, &available));
+        assert(available == 1);
+        dt_grid_progressive_view_frame frame{};
+        frame.struct_size = sizeof(frame);
+        require_ok(dt_task_get_grid_view_frame(task, sequence, &frame));
+        assert(frame.sequence == sequence + 1);
+        assert(frame.view.width == 32 && frame.view.height == 16);
+        assert(frame.view.source_window.width == 64);
+        assert(frame.view.source_window.height == 32);
+        if (sequence == 0) {
+            assert((frame.flags & DT_GRID_PROGRESSIVE_FRAME_FIRST) != 0);
+            assert((frame.flags & DT_GRID_PROGRESSIVE_FRAME_FINAL) == 0);
+            first_values = frame.view.values;
+            first_value = first_values[0];
+        }
+        scales.push_back(frame.view.lod_scale);
+        sequence = frame.sequence;
+    }
+    assert((scales == std::vector<uint64_t>{4, 2, 1}));
+    assert(first_values && first_values[0] == first_value);
+    int32_t completed = 0;
+    require_ok(dt_task_wait(task, UINT32_MAX, &completed));
+    assert(completed == 1);
+    dt_grid_progressive_view_frame missing{};
+    missing.struct_size = sizeof(missing);
+    assert(dt_task_get_grid_view_frame(task, sequence, &missing) ==
+           DT_E_NOT_FOUND);
+    dt_grid_view_result final_view{};
+    final_view.struct_size = sizeof(final_view);
+    require_ok(dt_task_get_grid_view_result(task, &final_view));
+    assert(final_view.lod_scale == 1);
+    assert(final_view.values[0] == 65.0);
+    assert(final_view.values[31] == 127.0);
+    assert(first_values[0] == first_value);
+    dt_task_destroy(task);
+
+    progressive.initial_lod_multiplier = 3;
+    task = reinterpret_cast<dt_task_handle>(1);
+    assert(dt_grid_read_view_progressive_async(
+               cache, &request, &progressive, &task) ==
+           DT_E_INVALID_ARGUMENT);
+    assert(task == nullptr);
+    progressive.initial_lod_multiplier = 4;
+    request.output_width = 100000;
+    request.output_height = 100000;
+    task = reinterpret_cast<dt_task_handle>(1);
+    assert(dt_grid_read_view_progressive_async(
+               cache, &request, &progressive, &task) ==
+           DT_E_LIMIT_EXCEEDED);
+    assert(task == nullptr);
+    dt_grid_view_cache_destroy(cache);
+    dt_grid_destroy(grid);
+}
+
 void test_spatial_tile_cache_inflight_coalescing() {
     dt_grid_handle grid = create_identity_grid(512, 512);
     dt_grid_view_cache_options cache_options{};
@@ -801,6 +888,8 @@ int main(int argc, char** argv) {
     static_assert(sizeof(dt_grid_view_options) == 64);
     static_assert(sizeof(dt_grid_window) == 64);
     static_assert(sizeof(dt_grid_view_request_options) == 96);
+    static_assert(sizeof(dt_grid_progressive_view_options) == 64);
+    static_assert(sizeof(dt_grid_progressive_view_frame) == 312);
     static_assert(sizeof(dt_grid_view_cache_options) == 64);
     static_assert(sizeof(dt_grid_view_cache_statistics) == 96);
     static_assert(sizeof(dt_grid_view_disk_cache_options) == 64);
@@ -810,6 +899,7 @@ int main(int argc, char** argv) {
     test_rotated_sheared_and_validation();
     test_unified_async_view_request();
     test_spatial_tile_cache_reuse_and_eviction();
+    test_progressive_cross_lod_publication();
     test_spatial_tile_cache_inflight_coalescing();
     test_persistent_tile_package_roundtrip_and_validation();
     test_persistent_tile_package_corruption_and_capacity();

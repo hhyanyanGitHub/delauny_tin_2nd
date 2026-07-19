@@ -36,7 +36,10 @@ public:
 
     CachedGridView read_view(const dt_grid_view_request_options& options,
                              const ProgressCallback& progress,
-                             const CancelCallback& cancelled);
+                             const CancelCallback& cancelled,
+                             uint64_t forced_lod_scale = 0);
+    uint64_t recommended_lod_scale(
+        const dt_grid_view_request_options& options) const;
     dt_grid_view_cache_statistics statistics() const;
     dt_grid_view_disk_cache_statistics disk_statistics() const;
     dt_grid_view_cache_compact_result compact();

@@ -56,6 +56,12 @@ struct dt_cdt_query_result_t {
     dt::CdtQueryData data;
 };
 
+struct dt_grid_progressive_frame_storage {
+    dt::CachedGridView view;
+    uint64_t sequence = 0;
+    uint32_t flags = 0;
+};
+
 struct dt_task_t {
     std::mutex mutex;
     std::condition_variable completed;
@@ -83,6 +89,9 @@ struct dt_task_t {
     uint64_t view_tile_count = 0;
     uint64_t view_reused_tile_count = 0;
     bool view_result_ready = false;
+    std::vector<std::shared_ptr<dt_grid_progressive_frame_storage>>
+        progressive_view_frames;
+    std::shared_ptr<dt_grid_progressive_frame_storage> final_view_frame;
 };
 
 namespace {
@@ -227,6 +236,40 @@ void finish_task(dt_task_t& task, int32_t state, dt_status status,
         task.result_status = status;
         task.error = error ? error : "";
         if (state == DT_TASK_SUCCEEDED) task.progress.store(1.0);
+    }
+    task.completed.notify_all();
+}
+
+dt_grid_view_result make_grid_view_result(const dt::CachedGridView& view) {
+    dt_grid_view_result result{};
+    result.struct_size = sizeof(result);
+    result.flags = view.flags;
+    result.source_window = view.source_window;
+    result.width = view.width;
+    result.height = view.height;
+    result.row_stride = view.width;
+    result.values = view.values.data();
+    result.overview = view.overview;
+    result.verification = view.verification;
+    result.lod_scale = view.lod_scale;
+    result.tile_count = view.tile_count;
+    result.reused_tile_count = view.reused_tile_count;
+    return result;
+}
+
+void publish_grid_view_frame(dt_task_t& task, dt::CachedGridView&& view,
+                             uint32_t flags) {
+    auto frame = std::make_shared<dt_grid_progressive_frame_storage>();
+    frame->view = std::move(view);
+    frame->flags = flags;
+    {
+        std::lock_guard<std::mutex> lock(task.mutex);
+        frame->sequence = task.progressive_view_frames.size() + 1U;
+        task.progressive_view_frames.push_back(frame);
+        if ((flags & DT_GRID_PROGRESSIVE_FRAME_FINAL) != 0) {
+            task.final_view_frame = frame;
+            task.view_result_ready = true;
+        }
     }
     task.completed.notify_all();
 }
@@ -1333,6 +1376,143 @@ dt_status DT_CALL dt_grid_read_view_cached_async(
     });
 }
 
+dt_status DT_CALL dt_grid_read_view_progressive_async(
+    dt_grid_view_cache_handle cache,
+    const dt_grid_view_request_options* request_options,
+    const dt_grid_progressive_view_options* progressive_options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(request_options, "dt_grid_view_request_options");
+        validate_options(progressive_options,
+                         "dt_grid_progressive_view_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        constexpr uint32_t kKnownRequestFlags =
+            DT_GRID_VIEW_REQUEST_STRICT_NODATA |
+            DT_GRID_VIEW_REQUEST_USE_PYRAMID |
+            DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE |
+            DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS;
+        if ((request_options->flags & ~kKnownRequestFlags) != 0) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "unknown GRID view request flags");
+        }
+        if (progressive_options->flags != 0) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "unknown progressive GRID view flags");
+        }
+        const uint32_t multiplier =
+            progressive_options->initial_lod_multiplier == 0
+                ? 4U
+                : progressive_options->initial_lod_multiplier;
+        if ((multiplier & (multiplier - 1U)) != 0 || multiplier > 1024U) {
+            throw dt::Exception(
+                DT_E_INVALID_ARGUMENT,
+                "initial progressive LOD multiplier must be a power of two no greater than 1024");
+        }
+        const uint32_t maximum_frames =
+            progressive_options->maximum_frame_count == 0
+                ? 3U
+                : progressive_options->maximum_frame_count;
+        if (maximum_frames == 0 || maximum_frames > 8U) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "progressive frame count must be from 1 to 8");
+        }
+        constexpr uint64_t kMaximumRetainedFrameBytes =
+            512ULL * 1024ULL * 1024ULL;
+        if (request_options->output_width == 0 ||
+            request_options->output_height == 0 ||
+            request_options->output_width >
+                std::numeric_limits<uint64_t>::max() /
+                    request_options->output_height) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "progressive GRID view output size is invalid");
+        }
+        const uint64_t output_values = request_options->output_width *
+                                       request_options->output_height;
+        if (output_values > kMaximumRetainedFrameBytes /
+                                sizeof(double) / maximum_frames) {
+            throw dt::Exception(
+                DT_E_LIMIT_EXCEEDED,
+                "progressive GRID view retained frames exceed 512 MiB");
+        }
+        const auto shared_cache = require_grid_view_cache_shared(cache);
+        const auto copied_request = *request_options;
+        const uint64_t target_scale =
+            shared_cache->recommended_lod_scale(copied_request);
+        if (target_scale >
+            std::numeric_limits<uint64_t>::max() / multiplier) {
+            throw dt::Exception(DT_E_LIMIT_EXCEEDED,
+                                "initial progressive LOD scale is too large");
+        }
+        std::vector<uint64_t> scales;
+        uint64_t scale = target_scale * multiplier;
+        while (scale > target_scale && scales.size() + 1U < maximum_frames) {
+            scales.push_back(scale);
+            scale = std::max(target_scale, scale / 2U);
+        }
+        scales.push_back(target_scale);
+
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID_VIEW,
+            [shared_cache, copied_request,
+             scales = std::move(scales)](dt_task_t& task) {
+                dt_grid_verify_result verified{};
+                bool verification_ready = false;
+                const uint32_t persistent_result_flags =
+                    ((copied_request.flags &
+                      DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE) != 0
+                         ? static_cast<uint32_t>(
+                               DT_GRID_VIEW_RESULT_PREFETCH_REQUESTED)
+                         : 0U) |
+                    ((copied_request.flags &
+                      DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS) != 0
+                         ? static_cast<uint32_t>(
+                               DT_GRID_VIEW_RESULT_SOURCE_VERIFIED)
+                         : 0U);
+                for (size_t index = 0; index < scales.size(); ++index) {
+                    dt_grid_view_request_options pass = copied_request;
+                    if (index != 0) {
+                        pass.flags &=
+                            ~(DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE |
+                              DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS);
+                    }
+                    auto result = shared_cache->read_view(
+                        pass,
+                        [&](double value) {
+                            task.progress.store(
+                                (static_cast<double>(index) + value) /
+                                static_cast<double>(scales.size()));
+                        },
+                        [&] { return task.cancellation_requested.load(); },
+                        scales[index]);
+                    if (index == 0 &&
+                        (result.flags &
+                         DT_GRID_VIEW_RESULT_SOURCE_VERIFIED) != 0) {
+                        verified = result.verification;
+                        verification_ready = true;
+                    }
+                    if (index != 0) {
+                        result.flags |= persistent_result_flags;
+                        if (verification_ready) result.verification = verified;
+                    }
+                    uint32_t frame_flags = index == 0
+                        ? static_cast<uint32_t>(
+                              DT_GRID_PROGRESSIVE_FRAME_FIRST)
+                        : 0U;
+                    if (index + 1U == scales.size())
+                        frame_flags |= DT_GRID_PROGRESSIVE_FRAME_FINAL;
+                    publish_grid_view_frame(task, std::move(result),
+                                            frame_flags);
+                    task.progress.store(
+                        static_cast<double>(index + 1U) /
+                        static_cast<double>(scales.size()));
+                }
+            });
+    });
+}
+
 dt_status DT_CALL dt_grid_view_cache_get_statistics(
     dt_grid_view_cache_handle cache,
     dt_grid_view_cache_statistics* output_statistics) {
@@ -1557,6 +1737,11 @@ dt_status DT_CALL dt_task_get_grid_view_result(
                 DT_E_NOT_FOUND,
                 "task has no completed GRID view result");
         }
+        if (required.final_view_frame) {
+            *output_result = make_grid_view_result(
+                required.final_view_frame->view);
+            return;
+        }
         dt_grid_view_result result{};
         result.struct_size = sizeof(result);
         result.flags = required.view_result_flags;
@@ -1571,6 +1756,79 @@ dt_status DT_CALL dt_task_get_grid_view_result(
         result.tile_count = required.view_tile_count;
         result.reused_tile_count = required.view_reused_tile_count;
         *output_result = result;
+    });
+}
+
+dt_status DT_CALL dt_task_get_grid_view_frame(
+    dt_task_handle task, uint64_t after_sequence,
+    dt_grid_progressive_view_frame* output_frame) {
+    if (output_frame) *output_frame = {};
+    return guarded([&] {
+        if (!output_frame) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_frame is null");
+        }
+        auto& required = require_task(task);
+        std::lock_guard<std::mutex> lock(required.mutex);
+        if (required.result_kind != DT_TASK_RESULT_GRID_VIEW) {
+            throw dt::Exception(DT_E_NOT_FOUND,
+                                "task does not produce GRID view frames");
+        }
+        const auto found = std::find_if(
+            required.progressive_view_frames.begin(),
+            required.progressive_view_frames.end(),
+            [&](const auto& frame) {
+                return frame->sequence > after_sequence;
+            });
+        if (found == required.progressive_view_frames.end()) {
+            throw dt::Exception(DT_E_NOT_FOUND,
+                                "task has no newer GRID view frame");
+        }
+        dt_grid_progressive_view_frame frame{};
+        frame.struct_size = sizeof(frame);
+        frame.flags = (*found)->flags;
+        frame.sequence = (*found)->sequence;
+        frame.published_frame_count =
+            required.progressive_view_frames.size();
+        frame.view = make_grid_view_result((*found)->view);
+        *output_frame = frame;
+    });
+}
+
+dt_status DT_CALL dt_task_wait_for_grid_view_frame(
+    dt_task_handle task, uint64_t after_sequence,
+    uint32_t timeout_milliseconds, int32_t* frame_available) {
+    if (frame_available) *frame_available = 0;
+    return guarded([&] {
+        if (!frame_available) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "frame_available is null");
+        }
+        auto& required = require_task(task);
+        std::unique_lock<std::mutex> lock(required.mutex);
+        if (required.result_kind != DT_TASK_RESULT_GRID_VIEW) {
+            throw dt::Exception(DT_E_NOT_FOUND,
+                                "task does not produce GRID view frames");
+        }
+        const auto has_frame = [&] {
+            return (!required.progressive_view_frames.empty() &&
+                    required.progressive_view_frames.back()->sequence >
+                        after_sequence) ||
+                   task_finished(required.state);
+        };
+        if (timeout_milliseconds == UINT32_MAX) {
+            required.completed.wait(lock, has_frame);
+        } else {
+            required.completed.wait_for(
+                lock, std::chrono::milliseconds(timeout_milliseconds),
+                has_frame);
+        }
+        *frame_available =
+            !required.progressive_view_frames.empty() &&
+                    required.progressive_view_frames.back()->sequence >
+                        after_sequence
+                ? 1
+                : 0;
     });
 }
 

@@ -69,6 +69,16 @@ enum dt_grid_view_cache_compact_flags {
     DT_GRID_VIEW_COMPACT_DROPPED_CORRUPTION = 1u << 1
 };
 
+enum dt_grid_progressive_view_flags {
+    /* Reserved for future scheduling policies. Must currently be zero. */
+    DT_GRID_PROGRESSIVE_VIEW_DEFAULT = 0
+};
+
+enum dt_grid_progressive_frame_flags {
+    DT_GRID_PROGRESSIVE_FRAME_FIRST = 1u << 0,
+    DT_GRID_PROGRESSIVE_FRAME_FINAL = 1u << 1
+};
+
 typedef struct dt_task_info {
     uint32_t struct_size;
     int32_t state;
@@ -131,6 +141,28 @@ typedef struct dt_grid_view_result {
     /* Ready-cache hits plus joins of already queued/loading tiles. */
     uint64_t reused_tile_count;
 } dt_grid_view_result;
+
+/* Cross-LOD publication policy. initial_lod_multiplier must be a power of two.
+   Zero selects 4. maximum_frame_count zero selects 3 and is capped at 8. The
+   exact target LOD is always the final frame. */
+typedef struct dt_grid_progressive_view_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t initial_lod_multiplier;
+    uint32_t maximum_frame_count;
+    uint64_t reserved[6];
+} dt_grid_progressive_view_options;
+
+/* Borrowed immutable frame. A successful getter keeps values valid until
+   dt_task_destroy(task), including while finer frames are being published. */
+typedef struct dt_grid_progressive_view_frame {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t sequence;
+    uint64_t published_frame_count;
+    dt_grid_view_result view;
+    uint64_t reserved[4];
+} dt_grid_progressive_view_frame;
 
 typedef struct dt_grid_view_cache_options {
     uint32_t struct_size;
@@ -270,6 +302,14 @@ DT_API dt_status DT_CALL dt_grid_read_view_cached_async(
     dt_grid_view_cache_handle cache,
     const dt_grid_view_request_options* options,
     dt_task_handle* output_task);
+/* Publishes immutable coarse-to-fine frames on one task. Existing task APIs
+   remain valid; dt_task_get_grid_view_result() returns the final frame after
+   successful completion. */
+DT_API dt_status DT_CALL dt_grid_read_view_progressive_async(
+    dt_grid_view_cache_handle cache,
+    const dt_grid_view_request_options* request_options,
+    const dt_grid_progressive_view_options* progressive_options,
+    dt_task_handle* output_task);
 DT_API dt_status DT_CALL dt_grid_view_cache_get_statistics(
     dt_grid_view_cache_handle cache,
     dt_grid_view_cache_statistics* output_statistics);
@@ -307,6 +347,16 @@ DT_API dt_status DT_CALL dt_task_get_grid_verification_result(
     dt_task_handle task, dt_grid_verify_result* output_result);
 DT_API dt_status DT_CALL dt_task_get_grid_view_result(
     dt_task_handle task, dt_grid_view_result* output_result);
+/* Returns the oldest published frame whose sequence is greater than
+   after_sequence. DT_E_NOT_FOUND means no such frame is currently available. */
+DT_API dt_status DT_CALL dt_task_get_grid_view_frame(
+    dt_task_handle task, uint64_t after_sequence,
+    dt_grid_progressive_view_frame* output_frame);
+/* Waits until a newer progressive frame is available or the task reaches a
+   terminal state. UINT32_MAX waits indefinitely. */
+DT_API dt_status DT_CALL dt_task_wait_for_grid_view_frame(
+    dt_task_handle task, uint64_t after_sequence,
+    uint32_t timeout_milliseconds, int32_t* frame_available);
 DT_API dt_status DT_CALL dt_task_get_error(
     dt_task_handle task, char* buffer, size_t buffer_size,
     size_t* required_size);

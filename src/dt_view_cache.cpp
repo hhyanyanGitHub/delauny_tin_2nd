@@ -433,7 +433,8 @@ struct GridViewCache::Impl {
 
     CachedGridView read_view(const dt_grid_view_request_options& request,
                              const ProgressCallback& progress,
-                             const CancelCallback& cancelled) {
+                             const CancelCallback& cancelled,
+                             uint64_t forced_lod_scale) {
         constexpr uint32_t known_flags =
             DT_GRID_VIEW_REQUEST_STRICT_NODATA |
             DT_GRID_VIEW_REQUEST_USE_PYRAMID |
@@ -511,7 +512,19 @@ struct GridViewCache::Impl {
                 result.source_window.height / result.height);
             while (scale <= ratio / 2U) scale *= 2U;
         }
+        if (forced_lod_scale != 0) {
+            if ((forced_lod_scale & (forced_lod_scale - 1U)) != 0) {
+                throw Exception(DT_E_INVALID_ARGUMENT,
+                                "forced GRID view LOD scale is not a power of two");
+            }
+            scale = forced_lod_scale;
+        }
         result.lod_scale = scale;
+        if (scale > std::numeric_limits<uint64_t>::max() / tile_width ||
+            scale > std::numeric_limits<uint64_t>::max() / tile_height) {
+            throw Exception(DT_E_LIMIT_EXCEEDED,
+                            "GRID view LOD scale exceeds tile geometry limits");
+        }
         const uint64_t source_columns_per_tile =
             static_cast<uint64_t>(tile_width) * scale;
         const uint64_t source_rows_per_tile =
@@ -711,6 +724,34 @@ struct GridViewCache::Impl {
         return result;
     }
 
+    uint64_t recommended_lod_scale(
+        const dt_grid_view_request_options& request) const {
+        if (request.output_width == 0 || request.output_height == 0) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "GRID view output dimensions must be positive");
+        }
+        const uint32_t method = request.overview_method == 0
+            ? static_cast<uint32_t>(DT_GRID_OVERVIEW_AVERAGE)
+            : static_cast<uint32_t>(request.overview_method);
+        if (method == DT_GRID_OVERVIEW_NEAREST) return 1;
+        dt_grid_view_options view{};
+        view.struct_size = sizeof(view);
+        view.world_bounds = request.world_bounds;
+        view.padding_nodes = request.padding_nodes;
+        const auto window = source->view_window(view);
+        if (request.output_width > window.width ||
+            request.output_height > window.height) {
+            throw Exception(DT_E_INVALID_ARGUMENT,
+                            "aggregate GRID view cannot upsample");
+        }
+        const uint64_t ratio = std::min(
+            window.width / request.output_width,
+            window.height / request.output_height);
+        uint64_t scale = 1;
+        while (scale <= ratio / 2U) scale *= 2U;
+        return scale;
+    }
+
     dt_grid_view_cache_statistics statistics() const {
         std::lock_guard<std::mutex> lock(mutex);
         dt_grid_view_cache_statistics result{};
@@ -774,8 +815,14 @@ GridViewCache::~GridViewCache() = default;
 
 CachedGridView GridViewCache::read_view(
     const dt_grid_view_request_options& options,
-    const ProgressCallback& progress, const CancelCallback& cancelled) {
-    return impl_->read_view(options, progress, cancelled);
+    const ProgressCallback& progress, const CancelCallback& cancelled,
+    uint64_t forced_lod_scale) {
+    return impl_->read_view(options, progress, cancelled, forced_lod_scale);
+}
+
+uint64_t GridViewCache::recommended_lod_scale(
+    const dt_grid_view_request_options& options) const {
+    return impl_->recommended_lod_scale(options);
 }
 
 dt_grid_view_cache_statistics GridViewCache::statistics() const {

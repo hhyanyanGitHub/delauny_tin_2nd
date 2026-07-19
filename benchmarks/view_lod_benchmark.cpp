@@ -171,6 +171,42 @@ int main(int argc, char** argv) {
     pan_request.world_bounds.xmax += 128.0;
     const double cached_pan_seconds =
         cached_read(pan_request, pan_reused, pan_checksum);
+    dt_grid_progressive_view_options progressive_options{};
+    progressive_options.struct_size = sizeof(progressive_options);
+    progressive_options.initial_lod_multiplier = 4;
+    progressive_options.maximum_frame_count = 3;
+    dt_task_handle progressive_task = nullptr;
+    const auto progressive_begin = std::chrono::steady_clock::now();
+    require_ok(dt_grid_read_view_progressive_async(
+                   cache, &request, &progressive_options, &progressive_task),
+               "submit progressive view");
+    std::vector<double> progressive_frame_seconds;
+    std::vector<uint64_t> progressive_scales;
+    uint64_t progressive_sequence = 0;
+    while (progressive_scales.size() < 3) {
+        int32_t available = 0;
+        require_ok(dt_task_wait_for_grid_view_frame(
+                       progressive_task, progressive_sequence, UINT32_MAX,
+                       &available),
+                   "wait progressive frame");
+        if (!available) break;
+        dt_grid_progressive_view_frame frame{};
+        frame.struct_size = sizeof(frame);
+        require_ok(dt_task_get_grid_view_frame(
+                       progressive_task, progressive_sequence, &frame),
+                   "get progressive frame");
+        progressive_sequence = frame.sequence;
+        progressive_scales.push_back(frame.view.lod_scale);
+        progressive_frame_seconds.push_back(std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - progressive_begin).count());
+    }
+    int32_t progressive_completed = 0;
+    require_ok(dt_task_wait(progressive_task, UINT32_MAX,
+                            &progressive_completed),
+               "wait progressive view");
+    const double progressive_total_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - progressive_begin).count();
+    dt_task_destroy(progressive_task);
     dt_grid_view_cache_statistics cache_statistics{};
     cache_statistics.struct_size = sizeof(cache_statistics);
     require_ok(dt_grid_view_cache_get_statistics(cache, &cache_statistics),
@@ -256,6 +292,16 @@ int main(int argc, char** argv) {
               << cache_statistics.coalesced_tile_count
               << " cached_repeat_error="
               << std::abs(cold_checksum - warm_checksum)
+              << " progressive_first_seconds="
+              << (progressive_frame_seconds.empty()
+                      ? 0.0
+                      : progressive_frame_seconds.front())
+              << " progressive_total_seconds=" << progressive_total_seconds
+              << " progressive_frames=" << progressive_scales.size()
+              << " progressive_first_scale="
+              << (progressive_scales.empty() ? 0 : progressive_scales.front())
+              << " progressive_final_scale="
+              << (progressive_scales.empty() ? 0 : progressive_scales.back())
               << " package_seed_seconds=" << package_seed_seconds
               << " package_disk_seconds=" << package_disk_seconds
               << " package_disk_reused=" << package_disk_reused

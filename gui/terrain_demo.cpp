@@ -598,6 +598,8 @@ private:
         dt_grid_window window{};
         uint64_t output_width = 0;
         uint64_t output_height = 0;
+        uint64_t last_frame_sequence = 0;
+        bool final_frame_consumed = false;
         GridTheme theme = GridTheme::Elevation;
     } grid_preview_request_;
     GridPreviewRequest failed_grid_preview_request_;
@@ -2646,6 +2648,66 @@ private:
         bool cache_updated = false;
         bool request_failed = false;
         if (grid_preview_request_.task) {
+            auto publish_view = [&](const GridPreviewRequest& request,
+                                    const dt_grid_view_result& view) {
+                if (request.source != (terrain_grid_ ? terrain_grid_ : grid_) ||
+                    request.theme != grid_theme_ ||
+                    view.width != request.output_width ||
+                    view.height != request.output_height ||
+                    view.source_window.column != request.window.column ||
+                    view.source_window.row != request.window.row ||
+                    view.source_window.width != request.window.width ||
+                    view.source_window.height != request.window.height) {
+                    return false;
+                }
+                grid_preview_.resize(static_cast<size_t>(
+                    view.width * view.height));
+                for (uint64_t row = 0; row < view.height; ++row) {
+                    for (uint64_t column = 0; column < view.width; ++column) {
+                        const double value = view.values[static_cast<size_t>(
+                            row * view.row_stride + column)];
+                        grid_preview_[static_cast<size_t>(
+                            row * view.width + column)] =
+                            is_grid_nodata(request.source_info, value)
+                                ? 0x00191f24U
+                                : terrain_pixel(value);
+                    }
+                }
+                grid_preview_width_ = static_cast<uint32_t>(view.width);
+                grid_preview_height_ = static_cast<uint32_t>(view.height);
+                grid_preview_column_ = request.window.column;
+                grid_preview_row_ = request.window.row;
+                grid_preview_source_width_ = request.window.width;
+                grid_preview_source_height_ = request.window.height;
+                grid_preview_source_ = request.source;
+                grid_preview_view_valid_ = true;
+                grid_preview_used_pyramid_ =
+                    (view.overview.flags & DT_GRID_OVERVIEW_USED_PYRAMID) != 0;
+                grid_preview_used_tile_cache_ =
+                    (view.flags & DT_GRID_VIEW_RESULT_USED_TILE_CACHE) != 0;
+                grid_preview_used_disk_cache_ =
+                    (view.flags & DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) != 0;
+                grid_preview_lod_scale_ = view.lod_scale;
+                grid_preview_tile_count_ = view.tile_count;
+                grid_preview_reused_tile_count_ = view.reused_tile_count;
+                grid_preview_theme_ = request.theme;
+                failed_grid_preview_request_ = {};
+                return true;
+            };
+
+            dt_grid_progressive_view_frame frame{};
+            frame.struct_size = sizeof(frame);
+            if (dt_task_get_grid_view_frame(
+                    grid_preview_request_.task,
+                    grid_preview_request_.last_frame_sequence,
+                    &frame) == DT_OK) {
+                grid_preview_request_.last_frame_sequence = frame.sequence;
+                grid_preview_request_.final_frame_consumed =
+                    (frame.flags & DT_GRID_PROGRESSIVE_FRAME_FINAL) != 0;
+                cache_updated = publish_view(grid_preview_request_, frame.view) ||
+                                cache_updated;
+            }
+
             int32_t completed = 0;
             if (dt_task_wait(grid_preview_request_.task, 0, &completed) == DT_OK &&
                 completed) {
@@ -2654,60 +2716,13 @@ private:
                 info.struct_size = sizeof(info);
                 dt_task_get_info(request.task, &info);
                 if (info.state == DT_TASK_SUCCEEDED &&
-                    request.source == (terrain_grid_ ? terrain_grid_ : grid_) &&
-                    request.theme == grid_theme_) {
+                    request.last_frame_sequence == 0) {
                     dt_grid_view_result view{};
                     view.struct_size = sizeof(view);
-                    if (dt_task_get_grid_view_result(request.task, &view) ==
-                            DT_OK &&
-                        view.width == request.output_width &&
-                        view.height == request.output_height &&
-                        view.source_window.column == request.window.column &&
-                        view.source_window.row == request.window.row &&
-                        view.source_window.width == request.window.width &&
-                        view.source_window.height == request.window.height) {
-                        grid_preview_.resize(static_cast<size_t>(
-                            view.width * view.height));
-                        for (uint64_t row = 0; row < view.height; ++row) {
-                            for (uint64_t column = 0; column < view.width;
-                                 ++column) {
-                                const double value = view.values[
-                                    static_cast<size_t>(row * view.row_stride +
-                                                        column)];
-                                grid_preview_[static_cast<size_t>(
-                                    row * view.width + column)] =
-                                    is_grid_nodata(request.source_info, value)
-                                        ? 0x00191f24U
-                                        : terrain_pixel(value);
-                            }
-                        }
-                        grid_preview_width_ =
-                            static_cast<uint32_t>(view.width);
-                        grid_preview_height_ =
-                            static_cast<uint32_t>(view.height);
-                        grid_preview_column_ = request.window.column;
-                        grid_preview_row_ = request.window.row;
-                        grid_preview_source_width_ = request.window.width;
-                        grid_preview_source_height_ = request.window.height;
-                        grid_preview_source_ = request.source;
-                        grid_preview_view_valid_ = true;
-                        grid_preview_used_pyramid_ =
-                            (view.overview.flags &
-                             DT_GRID_OVERVIEW_USED_PYRAMID) != 0;
-                        grid_preview_used_tile_cache_ =
-                            (view.flags &
-                             DT_GRID_VIEW_RESULT_USED_TILE_CACHE) != 0;
-                        grid_preview_used_disk_cache_ =
-                            (view.flags &
-                             DT_GRID_VIEW_RESULT_DISK_CACHE_HIT) != 0;
-                        grid_preview_lod_scale_ = view.lod_scale;
-                        grid_preview_tile_count_ = view.tile_count;
-                        grid_preview_reused_tile_count_ =
-                            view.reused_tile_count;
-                        grid_preview_theme_ = request.theme;
-                        failed_grid_preview_request_ = {};
-                        cache_updated = true;
-                    }
+                    if (dt_task_get_grid_view_result(request.task, &view) == DT_OK)
+                        cache_updated = publish_view(request, view) ||
+                                        cache_updated;
+                    request.final_frame_consumed = true;
                 } else if (info.state == DT_TASK_FAILED) {
                     char error[512]{};
                     if (dt_task_get_error(request.task, error, sizeof(error),
@@ -2718,8 +2733,12 @@ private:
                     failed_grid_preview_request_.task = nullptr;
                     request_failed = true;
                 }
-                dt_task_destroy(request.task);
-                grid_preview_request_ = {};
+                if (info.state != DT_TASK_SUCCEEDED ||
+                    grid_preview_request_.final_frame_consumed ||
+                    request.final_frame_consumed) {
+                    dt_task_destroy(request.task);
+                    grid_preview_request_ = {};
+                }
             }
         }
 
@@ -2959,8 +2978,12 @@ private:
         }
         if (!ensure_grid_view_cache(source_grid)) return false;
         dt_task_handle task = nullptr;
-        if (dt_grid_read_view_cached_async(grid_view_cache_, &request, &task) !=
-            DT_OK) {
+        dt_grid_progressive_view_options progressive{};
+        progressive.struct_size = sizeof(progressive);
+        progressive.initial_lod_multiplier = 4;
+        progressive.maximum_frame_count = 3;
+        if (dt_grid_read_view_progressive_async(
+                grid_view_cache_, &request, &progressive, &task) != DT_OK) {
             return false;
         }
         grid_preview_request_.task = task;

@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.36.0"
+VERSION = "0.37.0"
 TODAY = date(2026, 7, 19).isoformat()
 
 BLUE = "2E74B5"
@@ -437,14 +437,14 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.36.0：新增 DGTILE 在线校验压缩、空间回收、Windows 跨进程单写保护和 GUI 维护入口；v0.35 持久旁车及全部旧接口保持兼容。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.37.0：新增粗到细的跨层级渐进视口帧、序列等待/读取和 GUI 连续发布；v0.36 DGTILE 在线压缩、跨进程单写保护及全部旧接口保持兼容。", "gold")
 
 
 def build_developer_manual():
     m = Manual(
         "dterrain 动态地形三角网 DLL\n开发与使用手册",
         "DLL 开发与使用手册",
-        "面向测绘地形建模的 TIN、GRID、等高线转换、DGRIDB 映射/流式金字塔/按需校验、DGTILE 持久显示瓦片与统一异步视口、动态编辑与空间查询",
+        "面向测绘地形建模的 TIN、GRID、等高线转换、DGRIDB 映射/流式金字塔/按需校验、DGTILE 持久瓦片与跨层级渐进视口、动态编辑与空间查询",
         "C/C++ 集成人员、算法研究人员、测试与运维人员",
     )
     m.cover("DEVELOPER REFERENCE")
@@ -466,6 +466,7 @@ def build_developer_manual():
             "非阻塞 GRID 视口：重点阅读第 4.17 节。",
             "DGRIDB 视口按需校验：重点阅读第 4.18 节。",
             "跨会话显示缓存：重点阅读第 4.22～4.23 节。",
+            "粗到细渐进视口：重点阅读第 4.24 节。",
         ],
     )
 
@@ -489,6 +490,7 @@ def build_developer_manual():
         "DGRIDB 二进制 GRID 支持写时复制映射、持久全幅概览、2× 多级金字塔、视口预取、4 MiB 块校验、原子保存以及 CRS/NoData 往返。",
         "二维空间瓦片目录按视口中心优先生产，跨请求共享完成或在途瓦片，并以字节/数量双限额执行 LRU 淘汰。",
         "DGTILE 稀疏旁车按需保存已浏览瓦片，支持跨会话复用、在线校验压缩、空间回收和 Windows 跨进程单写保护。",
+        "同一异步任务按粗到细发布不可变 GRID 视口帧，支持序列等待、协作取消、最终结果兼容和 GUI 连续换图。",
         "DTIN 二进制保存加载，以及 DTMESH 可读文本三角网交换。",
         "双精度 GRID、仿射节点坐标、NoData、窗口读写和 DGRID 文本往返。",
         "TIN→GRID、GRID→TIN、TIN/GRID→等高线，以及等高线→TIN/GRID 近似重建。",
@@ -1272,6 +1274,33 @@ dt_status s = dt_grid_view_cache_compact(cache, &compact);
     m.callout("结果与错误码", "结果结构固定 96 字节。历史同键记录被回收；当前坏负载被省略，后续视口从源 GRID 重建。磁盘统计新增 stored_record_count 和 reclaimable_bytes，后者是不读负载即可确定的历史记录空间。普通内存缓存返回 DT_E_NOT_FOUND，只读包返回 DT_E_UNSUPPORTED。压缩可能使达到容量上限的包恢复追加能力。", "blue")
     m.callout("提交安全", "临时文件与原包位于同一目录。提交前失败会删除临时文件并继续使用原包；DGTILE 只是显示缓存，即使坏负载被丢弃也不影响正式高程、分析或导出。", "gold")
 
+    m.h2("4.24 跨层级渐进视口")
+    m.para("v0.37 的 dt_grid_read_view_progressive_async() 继续返回普通 dt_task_handle，但在任务运行期间按粗到细发布完整、不可变的 GRID 视口帧。默认尺度序列是目标 LOD 的 4 倍、2 倍和目标层；所有层复用同一个二维瓦片目录、中心优先队列、在途合并、LRU 与可选 DGTILE 后端。")
+    m.code("""dt_grid_progressive_view_options p{};
+p.struct_size = sizeof(p);
+p.initial_lod_multiplier = 4; // 2 的幂，0 选择 4
+p.maximum_frame_count = 3;    // 1..8，0 选择 3
+
+dt_task_handle task = nullptr;
+dt_grid_read_view_progressive_async(cache, &request, &p, &task);
+uint64_t sequence = 0;
+for (;;) {
+    int32_t available = 0;
+    dt_task_wait_for_grid_view_frame(task, sequence, 25, &available);
+    if (!available) continue;
+    dt_grid_progressive_view_frame frame{};
+    frame.struct_size = sizeof(frame);
+    if (dt_task_get_grid_view_frame(task, sequence, &frame) != DT_OK) continue;
+    sequence = frame.sequence;
+    upload_preview(frame.view.values, frame.view.width,
+                   frame.view.height, frame.view.row_stride);
+    if (frame.flags & DT_GRID_PROGRESSIVE_FRAME_FINAL) break;
+}
+dt_task_destroy(task);""")
+    m.callout("帧与内存", "sequence 从 1 单调递增，getter 返回第一个大于 after_sequence 的帧。每帧 values 在任务销毁前都有效，后台细化不会使旧指针悬空。为此任务会保留最多 8 个显示缓冲，全部帧像素总量上限 512 MiB；输出应限制在屏幕级尺寸，并及时取消和销毁过期任务。", "gold")
+    m.callout("兼容与取消", "结果种类仍为 DT_TASK_RESULT_GRID_VIEW；成功后旧的 dt_task_get_grid_view_result() 返回最终帧。预取和 DGRIDB 窗口块校验只在首层执行一次并传播摘要；取消不发布半帧，已发布帧仍是完整历史画面。", "blue")
+    m.callout("本机基准", "4096×2048、1024×768→512×512：默认 s4/s2/s1 三层首帧约 5.18 ms，最终约 13.86 ms；同轮单层冷缓存约 7.24 ms。渐进模式用更多总工作量换取更早首个可用画面。", "blue")
+
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
     legacy_rows = [
@@ -1472,7 +1501,7 @@ def build_gui_manual():
     m = Manual(
         "dterrain GUI 演示程序\n操作手册与入门教程",
         "GUI 操作入门教程",
-        "从 XYZ 散点导入到动态编辑、DGRIDB 映射/金字塔大 GRID、DGTILE 跨会话瓦片缓存与统一异步视口、任意多边形 GRID 裁剪、错位设计 GRID 显式对齐、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
+        "从 XYZ 散点导入到动态编辑、DGRIDB 映射/金字塔大 GRID、DGTILE 跨会话瓦片与粗到细渐进视口、任意多边形 GRID 裁剪、错位设计 GRID 显式对齐、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
         "首次使用者、演示人员、算法验证与测绘研究人员",
     )
     m.cover("QUICK START GUIDE")
@@ -1500,7 +1529,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、大 GRID 非阻塞视口 LOD、任意多边形 GRID 裁剪/掩膜、错位设计 GRID 显式对齐、现状/设计双 GRID 挖填方、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.36 功能边界", "当前程序可导入/导出 DGRIDB，自动维护同名 .dgridb.dgtile，并可从数据交换菜单在线压缩旁车。缩放、拉框、适屏和平移结束后由 DLL 的二维瓦片目录按视口中心优先调度，相邻、并发和跨会话请求可复用瓦片；GUI 保留旧画面直到完整结果成功发布。完整 GRID 仍用于分析、转换与导出；GPU LOD 尚未接入。", "gold")
+    m.callout("0.37 功能边界", "当前程序可导入/导出 DGRIDB，自动维护和在线压缩同名 .dgridb.dgtile。缩放、拉框、适屏和平移结束后，DLL 默认按 s4→s2→目标 LOD 发布不可变帧，GUI 每 25 ms 至多显示一层；相邻、并发和跨会话请求复用瓦片。完整 GRID 仍用于分析、转换与导出；GPU LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1649,7 +1678,7 @@ def build_gui_manual():
     m.callout("全图与显隐", "“全图”按所有可见二维图层的联合范围适屏。状态栏 T/G/C/D 分别表示普通 TIN、GRID、等高线和约束 Delaunay。", "blue")
 
     m.h2("4.4 大 GRID 的视口自适应 LOD 预览")
-    m.para("打开 DGRIDB/DGRID/GeoTIFF、执行 TIN→GRID 或生成地形专题图后，程序取得稳定高程范围，再把当前二维世界视口映射为最小源节点窗口，并在后台生成最长边不超过 512 节点的内存概览。DGRIDB 的首次全图概览直接来自文件内缓存；局部缩放优先选择仍覆盖输出尺寸的最低分辨率持久金字塔层。滚轮缩放、拉框放大、全图适屏和拖动平移结束时提交新请求；计算期间复用旧图，成功后一次替换。状态栏先显示“异步LOD 42%”，完成后显示“金字塔LOD 4096×2048→512×256”或“局部LOD”。")
+    m.para("打开 DGRIDB/DGRID/GeoTIFF、执行 TIN→GRID 或生成地形专题图后，程序取得稳定高程范围，再把当前二维世界视口映射为最小源节点窗口，并在后台生成最长边不超过 512 节点的内存概览。DGRIDB 的首次全图概览直接来自文件内缓存；局部缩放优先选择仍覆盖输出尺寸的最低分辨率持久金字塔层。滚轮缩放、拉框放大、全图适屏和拖动平移结束时提交新请求；计算期间先保留旧图，再按默认 s4、s2、目标层连续替换。状态栏中的 sN 会随帧逐步变细，最终显示目标 LOD。")
     m.table(
         ["当前显示", "概览方法", "原因"],
         [
@@ -1663,6 +1692,7 @@ def build_gui_manual():
     m.callout("仿射与边缘", "视口裁剪使用完整六参数仿射逆变换，支持旋转、剪切和负像素高。程序在局部窗口四周增加 2 个源节点，减少缩放与平移后的边缘缝隙；GRID 的青色轮廓始终按完整范围绘制。", "gold")
     m.callout("数据完整性", "LOD 只服务二维着色缓存；色带使用完整源统计保持缩放前后稳定。保存 DGRID/GeoTIFF、GRID→TIN、裁剪、分析和从 GRID 生成等高线仍使用完整 GRID。即使源 GRID 有数千万节点，也不会因为屏幕预览而丢值。", "blue")
     m.callout("请求替换与退出", "新视口会请求取消旧任务，已退休任务在后台完成汇合后统一释放；队列设置小上限，快速连续操作不会无限积压。只有请求仍匹配当前 GRID、主题和视口时才能发布结果；切换图层、专题主题或关闭程序都会取消相关任务。", "blue")
+    m.callout("渐进发布", "每个 25 ms 轮询周期最多消费一个完整帧，因此即使三层已在后台快速完成，也会依次显示粗、中、细画面。未完成层不会发布；任务成功且最终帧已显示后才释放帧内存。分析、等高线、转换和导出不使用这些近似显示帧。", "blue")
     m.callout("DGTILE 跨会话复用与维护", "打开或成功导出 terrain.dgridb 后，程序自动使用 terrain.dgridb.dgtile。首次浏览按需写入，重新启动并打开同一 DGRIDB 后可直接读取热点瓦片；实际命中时状态栏显示‘（磁盘）’。选择‘数据交换→压缩当前 DGTILE 显示缓存’可原子回收重复记录并审计坏块；旁车不可用时自动回退内存缓存，删除旁车不会丢失地形。", "blue")
     m.callout("按需块校验缓存", "DGRIDB 声明块校验能力时，异步 LOD 会先验证当前窗口相交的 4 MiB 原始节点块；首次浏览为冷校验，再次浏览命中当前句柄缓存。损坏时不发布新位图，保留上一幅有效画面并抑制相同失败请求重复提交。此机制不校验持久概览/金字塔载荷，也不替代菜单中的全文件审计。", "gold")
     m.callout("本机参考", "8192×4096 GRID 在 1024×768 局部视口生成 512×512 概览约 0.00264 s；同尺寸输出从全幅生成约 0.0128 s，约快 4.85×。视口裁剪查询本身约 15 μs。实际速度由缩放级别、CPU 和内存带宽决定。", "gray")
@@ -2056,7 +2086,7 @@ def build_gui_manual():
         m.bullet(text)
     m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID → 流式导出并重开 DGRIDB，观察映射/内置概览/金字塔/按需块校验缓存 → 连续缩放并观察异步进度与瓦片LOD → 关闭并重开同一 DGRIDB，观察复用计数后的‘（磁盘）’ → 水平平移约一个瓦片宽度，观察多数瓦片继续复用 → 主动验证 DGRIDB 全部数据块 → 等高线 → 圈定多边形并作紧凑 GRID 裁剪/掩膜 → 打开错位设计 GRID → 双线性显式对齐 → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付 2D/3D 浏览、DGRIDB 映射/金字塔/异步视口、二维瓦片目录、DGTILE 跨会话缓存/在线压缩/跨进程单写保护，以及 GRID 裁剪、重采样、双表面土方、地形专题、局部坡面、剖面、量测、格式交换和约束编辑。后续重点是显式重投影、跨级渐进发布、DGTILE 自动清理、局部 CDT 更新、GPU 分块渲染与贴地碰撞。")
+    m.para("当前已交付 2D/3D 浏览、DGRIDB 映射/金字塔、二维瓦片目录、DGTILE 跨会话缓存/在线压缩/跨进程单写保护、跨级渐进视口，以及 GRID 裁剪、重采样、双表面土方、地形专题、局部坡面、剖面、量测、格式交换和约束编辑。后续重点是 GPU 分块渲染/拾取/贴地碰撞、显式重投影、DGTILE 自动清理和局部 CDT 更新。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

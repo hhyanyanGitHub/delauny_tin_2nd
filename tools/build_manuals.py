@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.85.0"
+VERSION = "1.0.0"
 TODAY = date(2026, 7, 19).isoformat()
 
 BLUE = "2E74B5"
@@ -437,7 +437,7 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.85.0：新增 TIN/CDT 多环精确边界裁剪、双 GRID 2.5D 平移配准、配准后重采样和带 RMSE 标准误差停止条件的自适应误差评估；v0.70 CDT/DCDTB、v0.55 CRS 重投影及全部旧 DLL 接口保持兼容。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 1.0.0：提供可安装 CMake SDK、统一 C/C++ 入口、RAII 包装、DLL 导出门禁、独立下游集成验证和目标规模发布验收；v0.85 精确裁剪/配准、v0.70 CDT/DCDTB、v0.55 CRS 重投影及全部旧 DLL 接口保持兼容。", "gold")
 
 
 def build_developer_manual():
@@ -1529,6 +1529,17 @@ ctest --test-dir build --output-on-failure""")
     ):
         m.bullet(text)
 
+    m.h2("9.3 v1.0 SDK 安装后验收")
+    m.para("v1.0 不再只验证源码树内链接。安装规则提供 dterrain::dterrain CMake 目标、统一 dterrain.h、C++17 dterrain.hpp、示例源码和版本配置；tests/sdk_consumer 在独立构建目录中只通过 find_package(dterrain 1 CONFIG REQUIRED) 消费安装树。")
+    m.code("""$env:VCPKG_ROOT = "E:/dev/vcpkg"
+./tools/run_release_acceptance.ps1
+
+# 自定义低负载试跑
+./tools/run_release_acceptance.ps1 `
+  -StressPoints 100000 -StressGridSide 2048 -SkipGdal""")
+    m.callout("自动门禁", "脚本依次执行核心/GDAL Release、两轮 16 项 CTest、31 个关键 DLL 导出检查、安装后消费工程、百万点 TIN 与 4096² GRID/DGRIDB 压力流程，并从同一安装规则生成 ZIP SDK。压力数值是机器基线而非跨硬件承诺。", "blue")
+    m.callout("二进制兼容", "跨 DLL 边界继续只使用 C ABI、固定宽度整数、POD 结构和不透明句柄。所有可扩展结构应先清零并填写 struct_size；C++ RAII 只在调用方头文件层工作，不改变 DLL ABI。", "gold")
+
     m.h1("10 常见问题")
     faq = [
         ("DLL 无法加载", "检查 dterrain.dll、libgmp-10.dll、libwinpthread-1.dll 是否同目录，并确认 x64/x86 一致。"),
@@ -2081,6 +2092,9 @@ def build_gui_manual():
         m.bullet(text)
     m.h2("9.2 16 GB 内存参考")
     m.para("项目实测 1,000 万随机均匀点约生成 2,000 万个有限三角形，峰值工作集约 4.55 GB，建网约 50.44 秒。实际数据分布、硬件、文件解析和同时运行的软件会影响结果，应预留额外内存。")
+    m.h2("9.3 v1.0 SDK 演示包")
+    m.para("正式 ZIP 的 bin 目录放置 GUI、dterrain.dll 与匹配运行时；sample_data 提供四类最小数据。先完成 XYZ→TIN、TIN/GRID/等高线互转、DCDT 约束、保存重开和 3D 漫游，再换用真实项目数据。SDK 根目录的 docs/SDK.md 说明现有 CMake 工程如何 find_package 集成。")
+    m.callout("版本核对", "v1.0 DLL 的 dt_get_version() 返回 1.0.0。不要混用不同工具链的导入库；MinGW SDK 应配 MinGW 调用程序，MSVC 工程应重新用 MSVC/vcpkg 构建对应导入库。", "gold")
 
     m.h1("10 常见问题与恢复")
     faq = [

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.85.0
+    VERSION 1.0.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -10,6 +10,7 @@ if(POLICY CMP0167)
 endif()
 
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 option(DT_BUILD_TESTS "Build automated tests" ON)
 option(DT_BUILD_EXAMPLES "Build example programs" ON)
@@ -295,6 +296,14 @@ if(DT_BUILD_TESTS)
     else()
         target_compile_options(dterrain_grid_verification_tests PRIVATE -UNDEBUG)
     endif()
+
+    add_executable(dterrain_export_tests tests/test_sdk_exports.cpp)
+    target_compile_features(dterrain_export_tests PRIVATE cxx_std_17)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(dterrain_export_tests PRIVATE dl)
+    endif()
+    add_test(NAME dterrain_export_tests
+        COMMAND dterrain_export_tests $<TARGET_FILE:dterrain>)
 endif()
 
 if(DT_BUILD_EXAMPLES)
@@ -305,6 +314,10 @@ if(DT_BUILD_EXAMPLES)
     add_executable(dterrain_conversion examples/terrain_conversion.cpp)
     target_compile_features(dterrain_conversion PRIVATE cxx_std_17)
     target_link_libraries(dterrain_conversion PRIVATE dterrain)
+
+    add_executable(dterrain_sdk_quickstart examples/sdk_quickstart.cpp)
+    target_compile_features(dterrain_sdk_quickstart PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_sdk_quickstart PRIVATE dterrain)
 
     if(DT_WITH_GDAL)
         add_executable(dterrain_gdal_exchange examples/gdal_exchange.cpp)
@@ -345,6 +358,9 @@ if(DT_BUILD_BENCHMARKS)
         benchmarks/grid_binary_benchmark.cpp)
     target_compile_features(dterrain_grid_binary_benchmark PRIVATE cxx_std_17)
     target_link_libraries(dterrain_grid_binary_benchmark PRIVATE dterrain)
+    add_executable(dterrain_stress_suite benchmarks/stress_suite.cpp)
+    target_compile_features(dterrain_stress_suite PRIVATE cxx_std_17)
+    target_link_libraries(dterrain_stress_suite PRIVATE dterrain)
 endif()
 
 if(DT_BUILD_GUI AND WIN32)
@@ -362,17 +378,49 @@ if(DT_BUILD_GUI AND WIN32)
 endif()
 
 install(TARGETS dterrain
+    EXPORT dterrainTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES include/dt_api.h include/dt_cdt_api.h include/dt_terrain_api.h include/dt_task_api.h
-              include/dt_gdal_api.h include/dt_legacy.hpp
+              include/dt_gdal_api.h include/dt_legacy.hpp include/dterrain.h
+              include/dterrain.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+configure_package_config_file(
+    cmake/dterrainConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/dterrainConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/dterrain")
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/dterrainConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+install(EXPORT dterrainTargets
+    FILE dterrainTargets.cmake
+    NAMESPACE dterrain::
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/dterrain")
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/dterrainConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/dterrainConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/dterrain")
 install(FILES README.md DESTINATION .)
+install(FILES CHANGELOG.md DESTINATION .)
 install(DIRECTORY docs DESTINATION .)
+install(FILES examples/sdk_quickstart.cpp examples/console_demo.cpp
+              examples/terrain_conversion.cpp examples/gdal_exchange.cpp
+    DESTINATION examples)
 install(FILES examples/sample_points.xyz examples/sample_grid.dgrid
               examples/sample_contours.dcontour examples/sample_constraints.dcdt
     DESTINATION sample_data)
 if(TARGET dterrain_demo)
     install(TARGETS dterrain_demo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
+
+set(CPACK_PACKAGE_NAME "dterrain-sdk")
+set(CPACK_PACKAGE_VENDOR "dterrain project")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_FILE_NAME
+    "dterrain-sdk-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_GENERATOR "ZIP")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+include(CPack)

@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-mingw-release",
+      "displayName": "Windows MinGW Release",
+      "generator": "MinGW Makefiles",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-mingw-dynamic",
+        "VCPKG_MANIFEST_MODE": "OFF",
+        "DT_BUILD_TESTS": "ON",
+        "DT_BUILD_EXAMPLES": "ON",
+        "DT_BUILD_GUI": "ON"
+      }
+    },
+    {
+      "name": "windows-mingw-gdal-release",
+      "inherits": "windows-mingw-release",
+      "displayName": "Windows MinGW + GDAL Release",
+      "cacheVariables": {
+        "DT_WITH_GDAL": "ON"
+      }
+    },
+    {
+      "name": "windows-mingw-stress",
+      "inherits": "windows-mingw-release",
+      "displayName": "Windows MinGW Stress/Benchmark",
+      "cacheVariables": {
+        "DT_BUILD_BENCHMARKS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "release", "configurePreset": "windows-mingw-release", "jobs": 4},
+    {"name": "gdal-release", "configurePreset": "windows-mingw-gdal-release", "jobs": 4},
+    {"name": "stress", "configurePreset": "windows-mingw-stress", "jobs": 4}
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "configurePreset": "windows-mingw-release",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "gdal-release",
+      "configurePreset": "windows-mingw-gdal-release",
+      "output": {"outputOnFailure": true}
+    }
+  ]
+}

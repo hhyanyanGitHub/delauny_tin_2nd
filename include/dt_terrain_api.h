@@ -89,7 +89,10 @@ enum dt_grid_overview_result_flags {
        methods set this flag; nearest-neighbor statistics cover output samples
        only and leave it clear. */
     DT_GRID_OVERVIEW_EXACT_SOURCE_STATISTICS = 1u << 0,
-    DT_GRID_OVERVIEW_USED_PYRAMID = 1u << 1
+    DT_GRID_OVERVIEW_USED_PYRAMID = 1u << 1,
+    /* Values were assembled from a reusable, power-of-two spatial tile LOD.
+       Statistics describe the returned display samples, not all source nodes. */
+    DT_GRID_OVERVIEW_USED_TILE_CACHE = 1u << 2
 };
 
 enum dt_grid_view_window_flags {

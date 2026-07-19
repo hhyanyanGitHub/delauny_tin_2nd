@@ -20,7 +20,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "manuals"
-VERSION = "0.33.0"
+VERSION = "0.34.0"
 TODAY = date(2026, 7, 19).isoformat()
 
 BLUE = "2E74B5"
@@ -437,14 +437,14 @@ def add_document_control(m: Manual, scope, navigation):
     m.h2("阅读导航")
     for item in navigation:
         m.bullet(item)
-    m.callout("版本边界", "本手册对应 dterrain 0.33.0：新增统一异步视口流水线，在一个可取消任务中完成世界窗口映射、预取、可选块校验和 LOD，并返回统一结果；v0.32 流式金字塔保存及旧同步/异步接口保持兼容。", "gold")
+    m.callout("版本边界", "本手册对应 dterrain 0.34.0：新增二维空间瓦片目录、视口中心优先调度、跨请求在途合并和容量受控 LRU 淘汰；v0.33 统一异步视口流水线及旧同步/异步接口保持兼容。", "gold")
 
 
 def build_developer_manual():
     m = Manual(
         "dterrain 动态地形三角网 DLL\n开发与使用手册",
         "DLL 开发与使用手册",
-        "面向测绘地形建模的 TIN、GRID、等高线转换、DGRIDB 映射/流式金字塔/按需校验、统一异步视口流水线、动态编辑与空间查询",
+        "面向测绘地形建模的 TIN、GRID、等高线转换、DGRIDB 映射/流式金字塔/按需校验、二维瓦片缓存与统一异步视口、动态编辑与空间查询",
         "C/C++ 集成人员、算法研究人员、测试与运维人员",
     )
     m.cover("DEVELOPER REFERENCE")
@@ -486,6 +486,7 @@ def build_developer_manual():
         "GRID 指定窗口支持同步 caller-owned 或异步 task-owned 概览，具备平均、最近邻、最小值、最大值、NoData、确定性并行、进度与取消。",
         "世界 XY 视口经完整六参数仿射反算与多边形裁剪得到最小 GRID 节点窗口，可直接组合窗口概览生成局部 LOD。",
         "DGRIDB 二进制 GRID 支持写时复制映射、持久全幅概览、2× 多级金字塔、视口预取、4 MiB 块校验、原子保存以及 CRS/NoData 往返。",
+        "二维空间瓦片目录按视口中心优先生产，跨请求共享完成或在途瓦片，并以字节/数量双限额执行 LRU 淘汰。",
         "DTIN 二进制保存加载，以及 DTMESH 可读文本三角网交换。",
         "双精度 GRID、仿射节点坐标、NoData、窗口读写和 DGRID 文本往返。",
         "TIN→GRID、GRID→TIN、TIN/GRID→等高线，以及等高线→TIN/GRID 近似重建。",
@@ -1207,6 +1208,36 @@ dt_task_destroy(task);""")
     m.callout("GUI 集成", "演示程序仍用同步窗口查询建立轻量去重键，但后台统一任务会重新计算并返回实际窗口，发布前再次核对。上一帧保留、25 ms 轮询、最多三个退休任务、过期取消和同键失败抑制保持不变。", "blue")
     m.callout("本机基准", "4096×4096、1024×768 源窗口到 512×512：同步局部 LOD 约 2.28 ms，统一任务提交 54.3 μs、后台完成 2.65 ms，与同步结果抽样校验和误差为 0。", "gold")
 
+    m.h2("4.21 二维空间瓦片缓存与跨请求合并")
+    m.para("v0.34 的 dt_grid_view_cache_handle 在统一视口任务之上增加可复用显示缓存。目录键包含 GRID generation、2 次幂 LOD、二维瓦片坐标、概览方法和影响数值的 NoData/金字塔策略。dt_grid_read_view_cached_async() 仍返回 DT_TASK_RESULT_GRID_VIEW，并继续用 dt_task_get_grid_view_result() 取得任务自有像素。缓存路径明确设置 DT_GRID_OVERVIEW_USED_TILE_CACHE，不替代精确分析。")
+    m.code("""dt_grid_view_cache_options cache_options{};
+cache_options.struct_size = sizeof(cache_options);
+cache_options.tile_width = cache_options.tile_height = 128;
+cache_options.worker_count = 4;
+cache_options.maximum_bytes = 128ULL * 1024ULL * 1024ULL;
+cache_options.maximum_tiles = 4096;
+
+dt_grid_view_cache_handle cache = nullptr;
+dt_grid_view_cache_create(grid, &cache_options, &cache);
+
+dt_task_handle task = nullptr;
+dt_grid_read_view_cached_async(cache, &request, &task);
+dt_task_wait(task, UINT32_MAX, &completed);
+dt_grid_view_result view{};
+view.struct_size = sizeof(view);
+dt_task_get_grid_view_result(task, &view);
+// view.lod_scale / tile_count / reused_tile_count
+dt_task_destroy(task);
+
+dt_grid_view_cache_statistics stats{};
+stats.struct_size = sizeof(stats);
+dt_grid_view_cache_get_statistics(cache, &stats);
+dt_grid_view_cache_destroy(cache);""")
+    m.callout("调度与合并", "每个视口按瓦片中心到视口中心的距离排序；共享优先队列允许新视口的中心瓦片越过旧视口边缘瓦片。相同键若已排队或加载，后来的任务只增加需求计数并等待同一结果，不重复聚合。单个订阅者取消不会中断仍被其他请求需要的瓦片。", "blue")
+    m.callout("容量与生命周期", "默认 128×128、128 MiB、4096 项、最多 8 个自动生产线程；完成项同时按字节和数量 LRU 淘汰。活动任务以 shared_ptr 借用瓦片和缓存实现，所以目录项或公开缓存句柄删除后，已提交任务仍安全。GRID generation 改变后自动使用新键。", "gold")
+    m.callout("结果语义", "缓存 LOD 是交互显示近似。USED_TILE_CACHE 表示该路径，CACHE_HIT 和 CACHE_COALESCED 分别表示命中完成项和加入在途项；overview 统计只覆盖返回像素，不设置 EXACT_SOURCE_STATISTICS。体积、坡度、等高线、转换和导出继续使用完整 GRID。", "gold")
+    m.callout("本机基准", "8192×4096、1024×768→512×512：冷缓存约 6.64 ms，热缓存约 3.30 ms，48/48 瓦片复用、约 2.01×；平移 128 个源节点后复用 42 个瓦片并约 5.00 ms。", "blue")
+
     m.h1("5 原 12 个接口兼容层")
     m.para("include/dt_legacy.hpp 提供原需求中的 12 个 C++ 接口。它们使用 DLL 内部的全局默认上下文，适合保持既有调用代码不变。新系统优先使用 dt_api.h，以获得多上下文、明确状态码和结果句柄。")
     legacy_rows = [
@@ -1318,6 +1349,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
             ("dt_edit_result", "插入/删除接口", "dt_release_edit_result"),
             ("dt_query_result", "dt_query_triangles", "dt_release_query_result"),
             ("dt_grid_handle", "GRID 创建/加载/转换", "dt_grid_destroy"),
+            ("dt_grid_view_cache_handle", "dt_grid_view_cache_create", "dt_grid_view_cache_destroy"),
             ("dt_contour_handle", "等高线生成/加载", "dt_contours_destroy"),
             ("dt_task_handle", "异步转换启动", "dt_task_destroy"),
             ("dt_cdt_handle", "dt_cdt_create", "dt_cdt_destroy"),
@@ -1366,7 +1398,7 @@ dt_get_last_error(message, sizeof(message), &required);""")
     m.h2("9.1 自动化测试")
     m.code("""cmake --build build --config Release --parallel 4
 ctest --test-dir build --output-on-failure""")
-    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。局部坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向；全幅测试覆盖坡度、坡向、阴影、CRS、旋转仿射、NoData、串并行一致和取消。土方、重采样、裁剪、窗口概览与世界视口测试分别锁定 ABI、解析结果、并行确定性、取消和非法参数；v0.30 覆盖异步概览同步等价、任务持有源生命周期、借用结果、取消及非法尺寸失败。v0.31 新增冷块、缓存命中、跨块窗口、异步生命周期/取消、概览前校验和定点损坏失败缓存测试。v0.32 新增流式金字塔数值、映射修改后同路径覆盖、覆盖后重映射能力和另存回归。v0.33 新增统一视口任务的源窗口一致性、预取/校验/金字塔标志、进度、借用结果、无交集失败及定点损坏不发布测试。v0.29 二进制测试继续覆盖仿射、NoData、CRS、v0.28 无扩展兼容、多级金字塔选择、预取、块校验、载荷延迟损坏检测、写时复制失效、损坏头和截断拒绝。剖面、多边形量测和 GDAL 构建另有数学与真实文件往返测试。")
+    m.para("测试覆盖生命周期、普通 TIN 动态编辑、DTIN/DTMESH/XYZ、TIN/GRID/等高线、等高线反向重建与高程冲突回滚、异步任务，以及 CDT 空网清理、外边界、孔洞、断裂线、交叉失败原子性、TIN→CDT、域内采样、CDT→GRID/等高线、共享顶点保护、批量新增/更新/删除、整批失败回滚和 DCDT 往返。局部坡面测试用解析平面验证 TIN/CDT 的 Z、世界梯度、坡度、坡向和法向；全幅测试覆盖坡度、坡向、阴影、CRS、旋转仿射、NoData、串并行一致和取消。土方、重采样、裁剪、窗口概览与世界视口测试分别锁定 ABI、解析结果、并行确定性、取消和非法参数；v0.30 覆盖异步概览同步等价、任务持有源生命周期、借用结果、取消及非法尺寸失败。v0.31 新增冷块、缓存命中、跨块窗口、异步生命周期/取消、概览前校验和定点损坏失败缓存测试。v0.32 新增流式金字塔数值、映射修改后同路径覆盖、覆盖后重映射能力和另存回归。v0.33 新增统一视口任务的源窗口一致性、预取/校验/金字塔标志、进度、借用结果、无交集失败及定点损坏不发布测试。v0.34 新增二维瓦片命中、容量淘汰、缓存保留源生命周期和 1024 瓦片并发在途合并测试。v0.29 二进制测试继续覆盖仿射、NoData、CRS、v0.28 无扩展兼容、多级金字塔选择、预取、块校验、载荷延迟损坏检测、写时复制失效、损坏头和截断拒绝。剖面、多边形量测和 GDAL 构建另有数学与真实文件往返测试。")
     m.h2("9.2 集成验收清单")
     for text in (
         "DLL、导入库、头文件和运行库均为相同架构。",
@@ -1406,7 +1438,7 @@ def build_gui_manual():
     m = Manual(
         "dterrain GUI 演示程序\n操作手册与入门教程",
         "GUI 操作入门教程",
-        "从 XYZ 散点导入到动态编辑、DGRIDB 映射/金字塔大 GRID、统一异步视口流水线与按需块校验、任意多边形 GRID 裁剪、错位设计 GRID 显式对齐、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
+        "从 XYZ 散点导入到动态编辑、DGRIDB 映射/金字塔大 GRID、二维瓦片缓存与统一异步视口、任意多边形 GRID 裁剪、错位设计 GRID 显式对齐、现状/设计双表面土方、全幅地形专题图、局部坡面、剖面与多边形量测、TIN/GRID/等高线转换、约束 Delaunay、三维漫游与数据保存",
         "首次使用者、演示人员、算法验证与测绘研究人员",
     )
     m.cover("QUICK START GUIDE")
@@ -1434,7 +1466,7 @@ def build_gui_manual():
 
     m.h1("1 程序概览")
     m.para("dterrain_demo.exe 是一个原生 Win32/GDI 演示程序，用于直观验证 dterrain.dll 的批量建网、范围查询、最近点查询、大 GRID 非阻塞视口 LOD、任意多边形 GRID 裁剪/掩膜、错位设计 GRID 显式对齐、现状/设计双 GRID 挖填方、全幅坡度/坡向/阴影专题图、单点坡度/坡向与法向、任意地形剖面、多边形面积/土方量测、动态插入删除、编辑影响显示、文件交换和三维地形漫游。它不依赖 Qt 等 GUI 框架。")
-    m.callout("0.33 功能边界", "当前程序可导入/导出 DGRIDB；导出时流式生成金字塔。缩放、拉框、适屏和平移结束后由一个 DLL 异步任务统一完成世界窗口映射、预取、相交块校验和金字塔/精确 LOD，GUI 保留旧画面直到完整结果成功发布。完整 GRID 仍用于分析、转换与导出；空间瓦片目录、跨请求优先级合并和 GPU LOD 尚未接入。", "gold")
+    m.callout("0.34 功能边界", "当前程序可导入/导出 DGRIDB；导出时流式生成金字塔。缩放、拉框、适屏和平移结束后由 DLL 的二维瓦片目录按视口中心优先调度，相邻和并发请求共享完成或在途瓦片；GUI 保留旧画面直到完整结果成功发布。完整 GRID 仍用于分析、转换与导出；磁盘瓦片包和 GPU LOD 尚未接入。", "gold")
     m.h2("1.1 运行文件")
     m.table(
         ["文件", "作用"],
@@ -1983,9 +2015,9 @@ def build_gui_manual():
         "准备原始 XYZ 备份，清空和导入会改变当前内存网格。",
     ):
         m.bullet(text)
-    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID → 流式导出并重开 DGRIDB，观察映射/内置概览/金字塔/按需块校验缓存 → 连续缩放并观察异步进度、冷块验证、缓存复用和最终金字塔LOD → 主动验证 DGRIDB 全部数据块 → 等高线 → 圈定多边形并作紧凑 GRID 裁剪/掩膜 → 打开错位设计 GRID → 双线性显式对齐 → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
+    m.callout("推荐演示路线", "导入示例 XYZ → TIN→GRID → 流式导出并重开 DGRIDB，观察映射/内置概览/金字塔/按需块校验缓存 → 连续缩放并观察异步进度与瓦片LOD → 停止后重复同一视口，观察复用数接近总瓦片数 → 水平平移约一个瓦片宽度，观察多数瓦片继续复用 → 主动验证 DGRIDB 全部数据块 → 等高线 → 圈定多边形并作紧凑 GRID 裁剪/掩膜 → 打开错位设计 GRID → 双线性显式对齐 → 双表面挖填方、差值图与 CSV → 全幅坡度/坡向/阴影专题图与导出 → 单击坡度/坡向与法向 → 任意 A—B 剖面与 CSV → 多边形水平基准土方与 CSV → GeoTIFF/COG 与 GeoPackage 往返 → 等高线反向生成 TIN/GRID → 从 TIN 创建 CDT → 批量添加断裂线 → 绘制/移动/安全删除顶点 → CDT→GRID/等高线 → T/G/C/D 显隐 → 3D 漫游。", "blue")
     m.h2("11.1 后续 GUI 升级")
-    m.para("当前已交付 2D/3D 浏览、DGRIDB 写时复制映射、持久全幅概览、2× 多级金字塔、流式金字塔保存、统一异步视口窗口映射/预取/校验/LOD、任意多边形节点级 GRID 裁剪/掩膜、同 CRS 错位 GRID 显式重采样、匹配现状/设计 GRID 的解析挖填方与差值图、可取消并行地形专题，以及 TIN/CDT/GRID 局部坡面、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是坐标系显式重投影、空间瓦片目录与跨请求优先级合并、局部 CDT 更新、网格单元解析边界裁剪、GPU 分块渲染与贴地碰撞。")
+    m.para("当前已交付 2D/3D 浏览、DGRIDB 写时复制映射、持久全幅概览、2× 多级金字塔、流式金字塔保存、统一异步视口窗口映射/预取/校验/LOD、二维空间瓦片目录、中心优先调度、跨请求在途合并和 LRU 淘汰、任意多边形节点级 GRID 裁剪/掩膜、同 CRS 错位 GRID 显式重采样、匹配现状/设计 GRID 的解析挖填方与差值图、可取消并行地形专题，以及 TIN/CDT/GRID 局部坡面、剖面、水平基准土方、格式转换、GDAL 交换及约束编辑。后续重点是坐标系显式重投影、磁盘瓦片包与跨级渐进发布、局部 CDT 更新、网格单元解析边界裁剪、GPU 分块渲染与贴地碰撞。")
 
     path = OUTPUT / "dterrain_GUI操作入门教程.docx"
     m.save(path)

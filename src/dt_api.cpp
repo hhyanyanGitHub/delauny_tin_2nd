@@ -4,6 +4,7 @@
 #include "dt_gdal_api.h"
 #include "dt_task_api.h"
 #include "dt_terrain_core.hpp"
+#include "dt_view_cache.hpp"
 #if DT_WITH_GDAL
 #include "dt_gdal_io.hpp"
 #endif
@@ -36,6 +37,10 @@ struct dt_query_result_t {
 
 struct dt_grid_t {
     std::shared_ptr<dt::Grid> grid;
+};
+
+struct dt_grid_view_cache_t {
+    std::shared_ptr<dt::GridViewCache> cache;
 };
 
 struct dt_contour_set_t {
@@ -74,6 +79,9 @@ struct dt_task_t {
     bool verification_result_ready = false;
     dt_grid_window view_window{};
     uint32_t view_result_flags = 0;
+    uint64_t view_lod_scale = 1;
+    uint64_t view_tile_count = 0;
+    uint64_t view_reused_tile_count = 0;
     bool view_result_ready = false;
 };
 
@@ -147,6 +155,15 @@ dt::Grid& require_grid(dt_grid_handle handle) {
 std::shared_ptr<dt::Grid> require_grid_shared(dt_grid_handle handle) {
     require_grid(handle);
     return handle->grid;
+}
+
+std::shared_ptr<dt::GridViewCache> require_grid_view_cache_shared(
+    dt_grid_view_cache_handle handle) {
+    if (!handle || !handle->cache) {
+        throw dt::Exception(DT_E_NOT_INITIALIZED,
+                            "invalid GRID view cache handle");
+    }
+    return handle->cache;
 }
 
 dt::ContourSet& require_contours(dt_contour_handle handle) {
@@ -1236,6 +1253,88 @@ dt_status DT_CALL dt_grid_read_view_async(
     });
 }
 
+dt_status DT_CALL dt_grid_view_cache_create(
+    dt_grid_handle grid, const dt_grid_view_cache_options* options,
+    dt_grid_view_cache_handle* output_cache) {
+    if (output_cache) *output_cache = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_view_cache_options");
+        if (!output_cache) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_cache is null");
+        }
+        auto handle = std::make_unique<dt_grid_view_cache_t>();
+        handle->cache = std::make_shared<dt::GridViewCache>(
+            require_grid_shared(grid), *options);
+        *output_cache = handle.release();
+    });
+}
+
+dt_status DT_CALL dt_grid_read_view_cached_async(
+    dt_grid_view_cache_handle cache,
+    const dt_grid_view_request_options* options,
+    dt_task_handle* output_task) {
+    if (output_task) *output_task = nullptr;
+    return guarded([&] {
+        validate_options(options, "dt_grid_view_request_options");
+        if (!output_task) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT, "output_task is null");
+        }
+        constexpr uint32_t kKnownFlags =
+            DT_GRID_VIEW_REQUEST_STRICT_NODATA |
+            DT_GRID_VIEW_REQUEST_USE_PYRAMID |
+            DT_GRID_VIEW_REQUEST_PREFETCH_SOURCE |
+            DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS;
+        if ((options->flags & ~kKnownFlags) != 0) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "unknown GRID view request flags");
+        }
+        const auto shared_cache = require_grid_view_cache_shared(cache);
+        const auto copied_options = *options;
+        *output_task = start_task(
+            DT_TASK_RESULT_GRID_VIEW,
+            [shared_cache, copied_options](dt_task_t& task) {
+                auto result = shared_cache->read_view(
+                    copied_options,
+                    [&](double value) { task.progress.store(value); },
+                    [&] { return task.cancellation_requested.load(); });
+                task.view_window = result.source_window;
+                task.overview_width = result.width;
+                task.overview_height = result.height;
+                task.overview_values = std::move(result.values);
+                task.overview_result = result.overview;
+                task.verification_result = result.verification;
+                task.view_result_flags = result.flags;
+                task.view_lod_scale = result.lod_scale;
+                task.view_tile_count = result.tile_count;
+                task.view_reused_tile_count = result.reused_tile_count;
+                task.view_result_ready = true;
+            });
+    });
+}
+
+dt_status DT_CALL dt_grid_view_cache_get_statistics(
+    dt_grid_view_cache_handle cache,
+    dt_grid_view_cache_statistics* output_statistics) {
+    if (output_statistics) *output_statistics = {};
+    return guarded([&] {
+        if (!output_statistics) {
+            throw dt::Exception(DT_E_INVALID_ARGUMENT,
+                                "output_statistics is null");
+        }
+        *output_statistics =
+            require_grid_view_cache_shared(cache)->statistics();
+    });
+}
+
+dt_status DT_CALL dt_grid_view_cache_clear(dt_grid_view_cache_handle cache) {
+    return guarded([&] { require_grid_view_cache_shared(cache)->clear(); });
+}
+
+void DT_CALL dt_grid_view_cache_destroy(dt_grid_view_cache_handle cache) {
+    delete cache;
+}
+
 dt_status DT_CALL dt_task_get_info(dt_task_handle task,
                                    dt_task_info* output_info) {
     return guarded([&] {
@@ -1421,6 +1520,9 @@ dt_status DT_CALL dt_task_get_grid_view_result(
         result.values = required.overview_values.data();
         result.overview = required.overview_result;
         result.verification = required.verification_result;
+        result.lod_scale = required.view_lod_scale;
+        result.tile_count = required.view_tile_count;
+        result.reused_tile_count = required.view_reused_tile_count;
         *output_result = result;
     });
 }

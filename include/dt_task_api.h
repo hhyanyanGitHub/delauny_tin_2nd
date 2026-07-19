@@ -38,7 +38,15 @@ enum dt_grid_view_request_flags {
 
 enum dt_grid_view_result_flags {
     DT_GRID_VIEW_RESULT_PREFETCH_REQUESTED = 1u << 0,
-    DT_GRID_VIEW_RESULT_SOURCE_VERIFIED = 1u << 1
+    DT_GRID_VIEW_RESULT_SOURCE_VERIFIED = 1u << 1,
+    DT_GRID_VIEW_RESULT_USED_TILE_CACHE = 1u << 2,
+    DT_GRID_VIEW_RESULT_CACHE_HIT = 1u << 3,
+    DT_GRID_VIEW_RESULT_CACHE_COALESCED = 1u << 4
+};
+
+enum dt_grid_view_cache_flags {
+    /* Reserved for future cache policies. Must currently be zero. */
+    DT_GRID_VIEW_CACHE_DEFAULT = 0
 };
 
 typedef struct dt_task_info {
@@ -53,7 +61,7 @@ typedef struct dt_task_info {
 
 typedef struct dt_task_t* dt_task_handle;
 
-/* Borrowed view of an asynchronously generated overview. values remains valid
+/* Borrowed view of an asynchronously generated overview. values remain valid
    until dt_task_destroy(task). row_stride is measured in doubles. */
 typedef struct dt_grid_overview_view {
     uint32_t struct_size;
@@ -96,8 +104,47 @@ typedef struct dt_grid_view_result {
     const double* values;
     dt_grid_overview_result overview;
     dt_grid_verify_result verification;
-    uint64_t reserved[3];
+    /* One for the exact v0.33 path; power-of-two source-node spacing for a
+       cached display LOD. */
+    uint64_t lod_scale;
+    uint64_t tile_count;
+    /* Ready-cache hits plus joins of already queued/loading tiles. */
+    uint64_t reused_tile_count;
 } dt_grid_view_result;
+
+typedef struct dt_grid_view_cache_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Output samples per spatial tile. Zero selects 128. */
+    uint32_t tile_width;
+    uint32_t tile_height;
+    /* Tile producer threads. Zero selects an automatic count, capped at 8. */
+    uint32_t worker_count;
+    uint32_t reserved0;
+    /* Zero selects 128 MiB. The cache may temporarily exceed this by tiles
+       still borrowed by active requests. */
+    uint64_t maximum_bytes;
+    /* Zero selects 4096 directory entries. */
+    uint64_t maximum_tiles;
+    uint64_t reserved[3];
+} dt_grid_view_cache_options;
+
+typedef struct dt_grid_view_cache_statistics {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t capacity_bytes;
+    uint64_t cached_bytes;
+    uint64_t cached_tile_count;
+    uint64_t in_flight_tile_count;
+    uint64_t request_count;
+    uint64_t hit_tile_count;
+    uint64_t miss_tile_count;
+    uint64_t coalesced_tile_count;
+    uint64_t eviction_count;
+    uint64_t reserved[2];
+} dt_grid_view_cache_statistics;
+
+typedef struct dt_grid_view_cache_t* dt_grid_view_cache_handle;
 
 DT_API dt_status DT_CALL dt_grid_from_tin_async(
     dt_handle tin, const dt_tin_to_grid_options* options,
@@ -140,6 +187,23 @@ DT_API dt_status DT_CALL dt_grid_verify_window_async(
 DT_API dt_status DT_CALL dt_grid_read_view_async(
     dt_grid_handle grid, const dt_grid_view_request_options* options,
     dt_task_handle* output_task);
+/* Creates a reusable 2-D spatial tile directory retaining the source GRID. */
+DT_API dt_status DT_CALL dt_grid_view_cache_create(
+    dt_grid_handle grid, const dt_grid_view_cache_options* options,
+    dt_grid_view_cache_handle* output_cache);
+/* Submits a display-oriented tiled LOD request. Tile producers are scheduled
+   from the viewport center outward and are shared by concurrent requests. */
+DT_API dt_status DT_CALL dt_grid_read_view_cached_async(
+    dt_grid_view_cache_handle cache,
+    const dt_grid_view_request_options* options,
+    dt_task_handle* output_task);
+DT_API dt_status DT_CALL dt_grid_view_cache_get_statistics(
+    dt_grid_view_cache_handle cache,
+    dt_grid_view_cache_statistics* output_statistics);
+DT_API dt_status DT_CALL dt_grid_view_cache_clear(
+    dt_grid_view_cache_handle cache);
+DT_API void DT_CALL dt_grid_view_cache_destroy(
+    dt_grid_view_cache_handle cache);
 
 DT_API dt_status DT_CALL dt_task_get_info(
     dt_task_handle task, dt_task_info* output_info);

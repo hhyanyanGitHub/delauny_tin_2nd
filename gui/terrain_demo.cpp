@@ -343,6 +343,7 @@ public:
     }
     ~DemoApp() {
         shutdown_grid_preview_tasks();
+        destroy_grid_view_cache();
         dt_cdt_destroy(cdt_);
         dt_contours_destroy(contours_);
         dt_grid_destroy(terrain_grid_);
@@ -578,7 +579,13 @@ private:
     dt_grid_handle grid_preview_source_ = nullptr;
     bool grid_preview_view_valid_ = false;
     bool grid_preview_used_pyramid_ = false;
+    bool grid_preview_used_tile_cache_ = false;
+    uint64_t grid_preview_lod_scale_ = 1;
+    uint64_t grid_preview_tile_count_ = 0;
+    uint64_t grid_preview_reused_tile_count_ = 0;
     GridTheme grid_preview_theme_ = GridTheme::Elevation;
+    dt_grid_view_cache_handle grid_view_cache_ = nullptr;
+    dt_grid_handle grid_view_cache_source_ = nullptr;
     struct GridPreviewRequest {
         dt_task_handle task = nullptr;
         dt_grid_handle source = nullptr;
@@ -930,6 +937,7 @@ private:
 
     void destroy_grid_layer() {
         cancel_grid_preview_tasks(false);
+        destroy_grid_view_cache();
         clear_analysis_for_source(ProfileSource::Grid);
         dt_grid_destroy(terrain_grid_);
         terrain_grid_ = nullptr;
@@ -948,6 +956,10 @@ private:
         grid_preview_source_ = nullptr;
         grid_preview_view_valid_ = false;
         grid_preview_used_pyramid_ = false;
+        grid_preview_used_tile_cache_ = false;
+        grid_preview_lod_scale_ = 1;
+        grid_preview_tile_count_ = 0;
+        grid_preview_reused_tile_count_ = 0;
         grid_preview_theme_ = GridTheme::Elevation;
     }
 
@@ -2538,6 +2550,33 @@ private:
                request.output_height == output_height && request.theme == theme;
     }
 
+    void destroy_grid_view_cache() {
+        dt_grid_view_cache_destroy(grid_view_cache_);
+        grid_view_cache_ = nullptr;
+        grid_view_cache_source_ = nullptr;
+    }
+
+    bool ensure_grid_view_cache(dt_grid_handle source) {
+        if (grid_view_cache_ && grid_view_cache_source_ == source) return true;
+        destroy_grid_view_cache();
+        dt_grid_view_cache_options options{};
+        options.struct_size = sizeof(options);
+        options.tile_width = 128;
+        options.tile_height = 128;
+        options.worker_count = terrain_worker_count_ == 0
+            ? 0
+            : std::min(terrain_worker_count_, 8U);
+        options.maximum_bytes = 128ULL * 1024ULL * 1024ULL;
+        options.maximum_tiles = 4096;
+        if (dt_grid_view_cache_create(source, &options, &grid_view_cache_) !=
+            DT_OK) {
+            grid_view_cache_ = nullptr;
+            return false;
+        }
+        grid_view_cache_source_ = source;
+        return true;
+    }
+
     void retire_grid_preview_request() {
         if (!grid_preview_request_.task) return;
         dt_task_request_cancel(grid_preview_request_.task);
@@ -2630,6 +2669,13 @@ private:
                         grid_preview_used_pyramid_ =
                             (view.overview.flags &
                              DT_GRID_OVERVIEW_USED_PYRAMID) != 0;
+                        grid_preview_used_tile_cache_ =
+                            (view.flags &
+                             DT_GRID_VIEW_RESULT_USED_TILE_CACHE) != 0;
+                        grid_preview_lod_scale_ = view.lod_scale;
+                        grid_preview_tile_count_ = view.tile_count;
+                        grid_preview_reused_tile_count_ =
+                            view.reused_tile_count;
                         grid_preview_theme_ = request.theme;
                         failed_grid_preview_request_ = {};
                         cache_updated = true;
@@ -2662,6 +2708,10 @@ private:
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
         grid_preview_used_pyramid_ = false;
+        grid_preview_used_tile_cache_ = false;
+        grid_preview_lod_scale_ = 1;
+        grid_preview_tile_count_ = 0;
+        grid_preview_reused_tile_count_ = 0;
         if (!grid_) return false;
         grid_info_ = {};
         grid_info_.struct_size = sizeof(grid_info_);
@@ -2691,6 +2741,10 @@ private:
         grid_preview_source_ = grid_;
         grid_preview_view_valid_ = false;
         grid_preview_theme_ = grid_theme_;
+        grid_preview_used_tile_cache_ = false;
+        grid_preview_lod_scale_ = 1;
+        grid_preview_tile_count_ = 0;
+        grid_preview_reused_tile_count_ = 0;
         if (result.valid_value_count == 0) {
             grid_zmin_ = 0.0;
             grid_zmax_ = 1.0;
@@ -2726,6 +2780,10 @@ private:
         grid_preview_.clear();
         grid_preview_width_ = grid_preview_height_ = 0;
         grid_preview_used_pyramid_ = false;
+        grid_preview_used_tile_cache_ = false;
+        grid_preview_lod_scale_ = 1;
+        grid_preview_tile_count_ = 0;
+        grid_preview_reused_tile_count_ = 0;
         if (info.width == 0 || info.height == 0) return false;
         grid_preview_width_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.width));
         grid_preview_height_ = static_cast<uint32_t>(std::min<uint64_t>(512, info.height));
@@ -2750,6 +2808,10 @@ private:
         grid_preview_source_ = terrain_grid_;
         grid_preview_view_valid_ = false;
         grid_preview_theme_ = grid_theme_;
+        grid_preview_used_tile_cache_ = false;
+        grid_preview_lod_scale_ = 1;
+        grid_preview_tile_count_ = 0;
+        grid_preview_reused_tile_count_ = 0;
         grid_preview_.resize(static_cast<size_t>(grid_preview_width_) *
                              grid_preview_height_);
         for (uint32_t row = 0; row < grid_preview_height_; ++row) {
@@ -2790,6 +2852,10 @@ private:
             grid_preview_source_ = source_grid;
             grid_preview_view_valid_ = true;
             grid_preview_used_pyramid_ = false;
+            grid_preview_used_tile_cache_ = false;
+            grid_preview_lod_scale_ = 1;
+            grid_preview_tile_count_ = 0;
+            grid_preview_reused_tile_count_ = 0;
             grid_preview_theme_ = grid_theme_;
             return true;
         }
@@ -2858,8 +2924,10 @@ private:
         if ((source_info.flags & DT_GRID_HAS_BLOCK_CHECKSUMS) != 0) {
             request.flags |= DT_GRID_VIEW_REQUEST_VERIFY_SOURCE_BLOCKS;
         }
+        if (!ensure_grid_view_cache(source_grid)) return false;
         dt_task_handle task = nullptr;
-        if (dt_grid_read_view_async(source_grid, &request, &task) != DT_OK) {
+        if (dt_grid_read_view_cached_async(grid_view_cache_, &request, &task) !=
+            DT_OK) {
             return false;
         }
         grid_preview_request_.task = task;
@@ -3765,11 +3833,18 @@ private:
             grid_preview_source_width_ != 0 &&
             (grid_preview_source_width_ < grid_info_.width ||
              grid_preview_source_height_ < grid_info_.height)) {
-            text << (grid_preview_used_pyramid_ ? L"金字塔LOD " : L"局部LOD ")
+            text << (grid_preview_used_tile_cache_ ? L"瓦片LOD " :
+                     grid_preview_used_pyramid_ ? L"金字塔LOD " : L"局部LOD ")
                  << grid_preview_source_width_ << L"×"
                  << grid_preview_source_height_ << L"→"
                  << grid_preview_width_ << L"×" << grid_preview_height_
-                 << L" | ";
+                 << L"";
+            if (grid_preview_used_tile_cache_) {
+                text << L" s" << grid_preview_lod_scale_ << L"，"
+                     << grid_preview_reused_tile_count_ << L"/"
+                     << grid_preview_tile_count_ << L"复用";
+            }
+            text << L" | ";
         }
         text << action_text_;
         DrawTextW(dc, text.str().c_str(), -1, &status,

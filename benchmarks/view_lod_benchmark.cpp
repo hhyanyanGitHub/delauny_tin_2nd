@@ -120,6 +120,58 @@ int main(int argc, char** argv) {
     for (uint64_t index = 0;
          index < async_view.width * async_view.height; index += 97)
         async_checksum += async_view.values[index];
+
+    dt_grid_view_cache_options cache_options{};
+    cache_options.struct_size = sizeof(cache_options);
+    cache_options.tile_width = 128;
+    cache_options.tile_height = 128;
+    cache_options.worker_count = 4;
+    cache_options.maximum_bytes = 64ULL * 1024ULL * 1024ULL;
+    dt_grid_view_cache_handle cache = nullptr;
+    require_ok(dt_grid_view_cache_create(grid, &cache_options, &cache),
+               "create view cache");
+    const auto cached_read = [&](const dt_grid_view_request_options& options,
+                                 uint64_t& reused, double& sampled_checksum) {
+        dt_task_handle cached_task = nullptr;
+        const auto begin = std::chrono::steady_clock::now();
+        require_ok(dt_grid_read_view_cached_async(cache, &options, &cached_task),
+                   "submit cached view");
+        int32_t cached_completed = 0;
+        require_ok(dt_task_wait(cached_task, UINT32_MAX, &cached_completed),
+                   "wait cached view");
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - begin).count();
+        dt_grid_view_result cached_view{};
+        cached_view.struct_size = sizeof(cached_view);
+        require_ok(dt_task_get_grid_view_result(cached_task, &cached_view),
+                   "get cached view");
+        reused = cached_view.reused_tile_count;
+        sampled_checksum = 0.0;
+        for (uint64_t index = 0;
+             index < cached_view.width * cached_view.height; index += 97)
+            sampled_checksum += cached_view.values[index];
+        dt_task_destroy(cached_task);
+        return seconds;
+    };
+    uint64_t cold_reused = 0;
+    uint64_t warm_reused = 0;
+    uint64_t pan_reused = 0;
+    double cold_checksum = 0.0;
+    double warm_checksum = 0.0;
+    double pan_checksum = 0.0;
+    const double cached_cold_seconds =
+        cached_read(request, cold_reused, cold_checksum);
+    const double cached_warm_seconds =
+        cached_read(request, warm_reused, warm_checksum);
+    dt_grid_view_request_options pan_request = request;
+    pan_request.world_bounds.xmin += 128.0;
+    pan_request.world_bounds.xmax += 128.0;
+    const double cached_pan_seconds =
+        cached_read(pan_request, pan_reused, pan_checksum);
+    dt_grid_view_cache_statistics cache_statistics{};
+    cache_statistics.struct_size = sizeof(cache_statistics);
+    require_ok(dt_grid_view_cache_get_statistics(cache, &cache_statistics),
+               "get view cache statistics");
     const double source_fraction =
         static_cast<double>(window.width * window.height) /
         static_cast<double>(width * height);
@@ -140,10 +192,26 @@ int main(int argc, char** argv) {
                      async_wait_end - async_submit_end).count()
               << " unified_checksum_error="
               << std::abs(checksum - async_checksum)
+              << " cached_cold_seconds=" << cached_cold_seconds
+              << " cached_warm_seconds=" << cached_warm_seconds
+              << " cached_pan_seconds=" << cached_pan_seconds
+              << " cached_warm_speedup="
+              << cached_cold_seconds / cached_warm_seconds
+              << " cached_warm_reused=" << warm_reused
+              << " cached_pan_reused=" << pan_reused
+              << " cache_hits=" << cache_statistics.hit_tile_count
+              << " cache_coalesced="
+              << cache_statistics.coalesced_tile_count
+              << " cached_repeat_error="
+              << std::abs(cold_checksum - warm_checksum)
               << " checksum=" << checksum << '\n';
     dt_task_destroy(task);
+    dt_grid_view_cache_destroy(cache);
     dt_grid_destroy(grid);
     return std::isfinite(checksum) &&
-                   std::abs(checksum - async_checksum) < 1e-9
+                   std::abs(checksum - async_checksum) < 1e-9 &&
+                   std::abs(cold_checksum - warm_checksum) < 1e-9 &&
+                   warm_reused != 0 && pan_reused != 0 &&
+                   std::isfinite(pan_checksum)
                ? 0 : 3;
 }

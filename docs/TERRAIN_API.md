@@ -238,6 +238,52 @@ dt_task_destroy(task);
 未请求校验时 LOD 使用全部进度范围。任务持有源 GRID，失败或取消不发布结果；成功结果
 类型为 `DT_TASK_RESULT_GRID_VIEW`，其中所有指针在 `dt_task_destroy()` 后失效。
 
+v0.34 在相同结果生命周期上增加可复用二维空间瓦片缓存：
+
+```cpp
+dt_grid_view_cache_options cache_options{};
+cache_options.struct_size = sizeof(cache_options);
+cache_options.tile_width = 128;
+cache_options.tile_height = 128;
+cache_options.worker_count = 4;
+cache_options.maximum_bytes = 128ULL * 1024ULL * 1024ULL;
+cache_options.maximum_tiles = 4096;
+
+dt_grid_view_cache_handle cache = nullptr;
+dt_grid_view_cache_create(grid, &cache_options, &cache);
+
+dt_task_handle task = nullptr;
+dt_grid_read_view_cached_async(cache, &request, &task);
+int32_t completed = 0;
+dt_task_wait(task, UINT32_MAX, &completed);
+
+dt_grid_view_result result{};
+result.struct_size = sizeof(result);
+if (dt_task_get_grid_view_result(task, &result) == DT_OK) {
+    // result.lod_scale：缓存 LOD 的 2 次幂源节点间距
+    // result.tile_count / reused_tile_count：总瓦片与复用瓦片数
+    // result.overview.flags 含 DT_GRID_OVERVIEW_USED_TILE_CACHE
+}
+dt_task_destroy(task);
+
+dt_grid_view_cache_statistics statistics{};
+statistics.struct_size = sizeof(statistics);
+dt_grid_view_cache_get_statistics(cache, &statistics);
+dt_grid_view_cache_clear(cache);   // 清理当前未被任务借用的完成项
+dt_grid_view_cache_destroy(cache);
+```
+
+默认瓦片为 128×128、容量 128 MiB/4096 项，自动生产线程最多 8；显式线程数最大 64，
+瓦片边长允许 16～1024。缓存任务从视口中心向外调度，目录中的相同排队/加载瓦片由并发
+请求共享。完成项同时按字节和数量执行 LRU 淘汰；活动任务借用期间可暂时超过容量，释放
+后立即收敛。缓存共享持有源 GRID，销毁公开 GRID 或缓存句柄不会破坏已经提交的任务。
+
+缓存路径使用固定 2 次幂空间 LOD 并对输出像素重采样，是交互显示近似，不应用于体积、
+坡度、等高线等精确分析。`DT_GRID_VIEW_RESULT_USED_TILE_CACHE` 标识该路径，命中已完成项
+或加入在途项分别设置 `CACHE_HIT`、`CACHE_COALESCED`。`overview` 统计只覆盖返回像素，
+设置 `DT_GRID_OVERVIEW_USED_TILE_CACHE` 且不设置 `EXACT_SOURCE_STATISTICS`。GRID 写入后
+generation 改变，新请求自动使用新目录键，不会读到旧代次瓦片。
+
 ## 世界视口到 GRID 行列窗口
 
 `dt_grid_get_view_window()` 为视口自适应 LOD 提供稳定的仿射几何入口：
@@ -629,6 +675,7 @@ O(width×height)，其中输出 GRID 占约 8×width×height 字节。
 |---|---|
 | `dt_handle` | `dt_destroy()` |
 | `dt_grid_handle` | `dt_grid_destroy()` |
+| `dt_grid_view_cache_handle` | `dt_grid_view_cache_destroy()` |
 | `dt_contour_handle` | `dt_contours_destroy()` |
 | `dt_task_handle` | `dt_task_destroy()` |
 | `dt_edit_result` | `dt_release_edit_result()` |

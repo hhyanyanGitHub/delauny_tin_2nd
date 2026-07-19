@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(dterrain
-    VERSION 0.33.0
+    VERSION 0.34.0
     DESCRIPTION "Dynamic 2.5D Delaunay terrain triangulation DLL"
     LANGUAGES CXX)
 
@@ -36,6 +36,7 @@ add_library(dterrain SHARED
     src/dt_core.cpp
     src/dt_grid_storage.cpp
     src/dt_terrain_core.cpp
+    src/dt_view_cache.cpp
     src/dt_legacy.cpp)
 
 target_compile_features(dterrain PUBLIC cxx_std_17)
